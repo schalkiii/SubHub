@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SubHub 代码 Review 报告 · Round O（第四轮）</title>
+<style>
+  :root { --bg:#0f1320; --panel:#171c2c; --panel2:#1d2335; --ink:#e6e9f2; --mut:#9aa3bd; --acc:#5b9dff; --ok:#3ddc97; --warn:#ffb454; --bad:#ff6b6b; --bd:#2a3147; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 "Segoe UI",system-ui,sans-serif; }
+  .wrap { max-width:1040px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:34px 0 12px; border-left:4px solid var(--acc); padding-left:10px; }
+  h3 { font-size:16px; margin:18px 0 6px; color:var(--acc); }
+  p { color:var(--ink); }
+  .sub { color:var(--mut); margin:0 0 20px; }
+  .card { background:var(--panel); border:1px solid var(--bd); border-radius:12px; padding:18px 20px; margin:14px 0; }
+  table { width:100%; border-collapse:collapse; margin:10px 0; font-size:14px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--bd); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; background:var(--panel2); }
+  code { background:#0c1020; border:1px solid var(--bd); border-radius:5px; padding:1px 6px; font:13px/1.5 "JetBrains Mono",Consolas,monospace; color:#cfe0ff; }
+  .tag { display:inline-block; font-size:12px; font-weight:700; padding:2px 9px; border-radius:999px; }
+  .hi { background:rgba(255,107,107,.16); color:var(--bad); }
+  .me { background:rgba(255,180,84,.16); color:var(--warn); }
+  .lo { background:rgba(91,157,255,.16); color:var(--acc); }
+  .ok { background:rgba(61,220,151,.16); color:var(--ok); }
+  ul { margin:8px 0; padding-left:20px; }
+  li { margin:5px 0; }
+  .kv { color:var(--mut); }
+  .pill { display:inline-block; margin:2px 4px 2px 0; padding:2px 8px; border:1px solid var(--bd); border-radius:6px; font-size:12px; color:var(--mut); }
+  .muted { color:var(--mut); }
+  .foot { margin-top:36px; color:var(--mut); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SubHub 代码 Review 报告 · Round O</h1>
+  <p class="sub">第四轮全面 review（2026-07-26）— 聚焦 webui 全貌、未触碰的 server handler（search / refresh / settings / 订阅 CRUD）、core speedtest 与 fingerprint 边界。本轮发现 Q1–Q6，全部实施为非破坏性修复。</p>
+
+  <div class="card">
+    <strong>累计改进（L → M → N → O）：</strong>
+    <span class="pill">T68–T73</span><span class="pill">N1–N9</span><span class="pill">P1–P8</span><span class="pill">Q1–Q6</span>
+    <div class="muted" style="margin-top:8px">前几轮已修：解析/端口/TLS、引擎 RAII、评分污染、YAML 注入、测速指纹对齐、Tauri 动态窗口、fingerprint 凭证、sing-box 真实 outbound、db 容错、XSS 转义、分享 URL、地域清空、NaN 防护。</div>
+  </div>
+
+  <h2>1. 本轮发现与处理</h2>
+  <table>
+    <thead><tr><th>ID</th><th>严重度</th><th>问题</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>Q1</code></td>
+        <td><span class="tag hi">高</span></td>
+        <td><code>client_with_proxy</code> 未设重定向策略（默认跟随 10 跳，存在重定向炸弹/SSRF 风险）；且远端订阅响应体无上限，<code>resp.text()</code> 整段缓冲 → 内存耗尽 DoS（<code>DefaultBodyLimit</code> 只限请求体，不限响应体）。</td>
+        <td>新增 <code>redirect::Policy::limited(5)</code> 限制重定向链；新增 <code>fetch_subscription_text()</code> 助手，按 <code>Content-Length</code> 预检 + 读取后长度守卫，超过 <b>16 MiB</b> 直接拒绝。替换 <code>add_subscriptions</code> 与 <code>do_refresh_one</code> 两处原始 fetch。</td>
+      </tr>
+      <tr>
+        <td><code>Q2</code></td>
+        <td><span class="tag me">中</span></td>
+        <td><code>incremental_update</code> 在 refresh 时只保留 latency/available/download 等字段，<b>漏掉 <code>bandwidth_measured</code></b> → 已测节点的真实带宽信号被 <code>score_proxy</code> 忽略，Top-N 排名每次刷新后静默变化。</td>
+        <td>补 <code>merged_p.bandwidth_measured = o.bandwidth_measured;</code>。新增单测。</td>
+      </tr>
+      <tr>
+        <td><code>Q3</code></td>
+        <td><span class="tag me">中</span></td>
+        <td><code>fingerprint()</code> 对 Trojan/Hysteria2/Socks5/Http 仅用 password，SNI/Host/Path 不同的真实节点被误判为重复并静默丢弃；Wireguard/Other 凭证为空，同地址两节点也会碰撞。</td>
+        <td>凭证串扩展为 <code>password|sni|host|network|path</code>；Wireguard/Other 分支也纳入 sni/host/network/path。新增单测（不同 SNI 的 Trojan 必须不同 fp）。</td>
+      </tr>
+      <tr>
+        <td><code>Q4</code></td>
+        <td><span class="tag me">中</span></td>
+        <td>订阅 URL 常带鉴权 token（<code>https://user:pass@host/sub?token=</code>），<code>add_subscriptions</code> 的 <code>eprintln!("fetched {url}: …")</code> 把完整 URL（含密码）写进进程日志。</td>
+        <td>新增 <code>redact_url()</code> 剥掉 userinfo 与 query string，日志改为 <code>redact_url(url)</code>。</td>
+      </tr>
+      <tr>
+        <td><code>Q5</code></td>
+        <td><span class="tag lo">低</span></td>
+        <td>webui <code>loadDashboard()</code> 的 <code>api("/api/dashboard")</code> 未包裹 try/catch，一旦报错整个函数中断，连带着 <code>loadSubs</code> / <code>loadTrends</code> 都不执行 → 仪表盘标签页静默白屏。</td>
+        <td>包裹 try/catch：失败时显示错误卡片并仍加载订阅列表与趋势，标签保持可用；并对 <code>by_type</code>/<code>total</code> 做空值兜底。</td>
+      </tr>
+      <tr>
+        <td><code>Q6</code></td>
+        <td><span class="tag lo">低</span></td>
+        <td>① <code>proxy_test</code> 超时提示写「(5s)」但实际超时是 <code>Duration::from_secs(15)</code>，误导用户；② <code>add_subscriptions</code> 仅在代理 URL 语法合法即记住为默认抓取代理，连不通也会被记住。</td>
+        <td>① 提示改为「(15s)」；② 默认代理改为「仅当本次批量中至少一个订阅实际抓取成功」后才持久化。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>2. 验证结果</h2>
+  <div class="card">
+    <ul>
+      <li><code>cargo clippy --release -p subhub-core -p subhub-server</code> → <span class="tag ok">0 警告</span></li>
+      <li><code>cargo build --release -p subhub-server -p subhub-app</code> → <span class="tag ok">成功</span></li>
+      <li><code>cargo test -p subhub-core -p subhub-server</code> → <span class="tag ok">25 passed</span>（core 21 + server 4，含 Q2/Q3 共 2 个新增单测）</li>
+      <li>运行时冒烟（独立 <code>--port 3013 --db /d/tmp/sa_smokeO</code>，未动代理 Sparkle）：
+        <ul>
+          <li><code>/api/health</code> = ok</li>
+          <li>小订阅（带 userinfo 响应头）→ 导入 1 节点 ✓</li>
+          <li>302 重定向 → 仍成功跟随，导入 1 节点 ✓（bounded redirect 生效）</li>
+          <li>&gt;16 MiB 响应体 → 被拒，0 节点 ✓（body cap 生效）</li>
+          <li>语法合法但不可达的代理 → <code>default_fetch_proxy</code> 保持为空，未被记住 ✓</li>
+        </ul>
+      </li>
+      <li>停止后台进程后无残留（subhub-server / testsvr 均退出）</li>
+    </ul>
+  </div>
+
+  <h2>3. 主动跳过 / 待立项项</h2>
+  <div class="card">
+    <p class="muted">本轮未修改（收益低于风险/工作量，或非当前崩溃/数据错误根因）：</p>
+    <ul>
+      <li><b>重定向 SSRF 到内网</b>：本工具为绑定 127.0.0.1 的单机本地程序，响应体仅被解析为节点、从不回传，实际泄露面极小；已用 <code>limited(5)</code> 兜底重定向炸弹。如需更强隔离可改 <code>Policy::none()</code>（会破坏合法 301/短链）。</li>
+      <li><b>M1 单引擎批量 / M8-M9 增量 upsert 与分页 / M11 幂等导入 / L 系列打磨</b>：需较大重构，建议单独立项。</li>
+      <li><b>Wireguard 私有密钥建模</b>：<code>Proxy</code> 当前未建模 wireguard key，故两个 wireguard 节点仅靠 type|server|port|name 区分；属数据模型扩展，非本轮范围。</li>
+    </ul>
+  </div>
+
+  <h2>4. 如何生效</h2>
+  <div class="card">
+    <ul>
+      <li><b>服务端</b>：重启加载新 <code>target/release/subhub-server.exe</code></li>
+      <li><b>原生 app</b>：关闭旧窗口后 <code>cargo build --release -p subhub-app</code> 重建</li>
+      <li><b>WebUI</b>：刷新页面即生效</li>
+    </ul>
+  </div>
+
+  <div class="foot">关联报告：<code>docs/review-round-L.html</code>（T68–T73）、<code>docs/review-round-M.html</code>（N1–N9）、<code>docs/review-round-N.html</code>（P1–P8）。本轮改动源文件：<code>server/src/lib.rs</code>、<code>core/src/ops.rs</code>、<code>core/src/model.rs</code>、<code>webui/app.js</code>。</div>
+</div>
+</body>
+</html>

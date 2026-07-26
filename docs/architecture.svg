@@ -1,0 +1,51 @@
+<svg viewBox="0 0 680 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, sans-serif">
+  <rect width="680" height="500" fill="#0f1117"/>
+  <text x="24" y="34" fill="#e5e7eb" font-size="20" font-weight="700">SubHub — 架构（P0–P4 已实现）</text>
+  <text x="24" y="56" fill="#9ca3af" font-size="12">Rust 核心 + Tauri v2 原生窗口 + 同一份 WebUI 同时可在浏览器访问</text>
+
+  <!-- Native window + browser (same WebUI) -->
+  <rect x="210" y="74" width="260" height="58" rx="10" fill="#1d4ed8" stroke="#3b82f6"/>
+  <text x="340" y="98" fill="#ffffff" font-size="13" font-weight="700" text-anchor="middle">Tauri v2 原生窗口</text>
+  <text x="340" y="118" fill="#dbeafe" font-size="10.5" text-anchor="middle">后台线程跑 axum server，窗口 URL → 3005</text>
+
+  <rect x="500" y="74" width="156" height="58" rx="10" fill="#1d4ed8" stroke="#3b82f6"/>
+  <text x="578" y="98" fill="#ffffff" font-size="13" font-weight="700" text-anchor="middle">浏览器</text>
+  <text x="578" y="118" fill="#dbeafe" font-size="10.5" text-anchor="middle">http://127.0.0.1:3005</text>
+
+  <!-- WebUI -->
+  <rect x="40" y="150" width="600" height="40" rx="10" fill="#171a23" stroke="#272d3a"/>
+  <text x="56" y="175" fill="#e5e7eb" font-size="12">WebUI（静态，无需构建）：仪表盘(类型环图/地区/订阅来源) · 订阅管理 · 节点表 · 算子UI + 多格式导出</text>
+
+  <!-- axum server -->
+  <rect x="40" y="206" width="600" height="92" rx="10" fill="#0f2233" stroke="#0ea5e9"/>
+  <text x="56" y="228" fill="#7dd3fc" font-size="13" font-weight="700">axum 服务 (server crate) — JSON API + 静态托管</text>
+  <g font-size="10.5" fill="#e5e7eb">
+    <text x="56" y="248">GET /api/subscriptions · POST /api/subscriptions · DELETE /api/subscriptions/:id · POST /api/import</text>
+    <text x="56" y="266">GET /api/proxies(?type/region/q) · GET /api/dashboard · POST /api/speedtest · POST /api/export{format,transform,sub_ids}</text>
+    <text x="56" y="284">可选引擎：SUBHUB_ENGINE_BIN → mihomo/sing-box 协议级 HTTP 延迟</text>
+  </g>
+
+  <!-- core -->
+  <rect x="40" y="312" width="600" height="120" rx="10" fill="#0f2a1c" stroke="#16a34a"/>
+  <text x="56" y="334" fill="#86efac" font-size="13" font-weight="700">core 库（纯 Rust）</text>
+  <g font-size="10.5" fill="#e5e7eb">
+    <text x="56" y="354">model: Proxy + Subscription(按来源分组, AtomicU64 id)</text>
+    <text x="56" y="372">parse: clash yaml / sing-box json / base64 / vmess·vless·trojan·ss·ssr·hy2·tuic URI (混合)</text>
+    <text x="56" y="390">merge: 跨订阅去重(fingerprint) · ops: 算子管道(筛选/排序/重命名正则)</text>
+    <text x="56" y="408">export_str: clash-meta · clash · v2ray · sing-box · surge · base64</text>
+    <text x="56" y="426">speedtest: tcp_ping_all(TCP 延迟/可用性, 有界并发, 无外部依赖)</text>
+  </g>
+
+  <!-- output arrow to subscription -->
+  <g stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#a)">
+    <line x1="340" y1="132" x2="340" y2="150"/>
+    <line x1="578" y1="132" x2="578" y2="150"/>
+    <line x1="340" y1="190" x2="340" y2="206"/>
+    <line x1="340" y1="298" x2="340" y2="312"/>
+  </g>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+  </defs>
+</svg>

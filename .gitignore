@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+
+# Runtime data (SQLite db, logs)
+/data
+*.db
+
+# Stray Windows device file occasionally created at repo root
+nul
+
+# Agent / workspace metadata (not part of the project)
+.workbuddy
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
