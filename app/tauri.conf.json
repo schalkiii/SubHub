@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SubHub",
+  "version": "0.1.0",
+  "identifier": "com.subhub.app",
+  "build": {
+    "beforeDevCommand": "",
+    "devUrl": "http://127.0.0.1:3005",
+    "beforeBuildCommand": "",
+    "frontendDist": "../webui"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "category": "Utilities",
+    "shortDescription": "订阅聚合 · 测速 · 合并导出",
+    "longDescription": "SubHub —— 用 Rust + Tauri 构建的代理订阅聚合工具：批量导入订阅、TCP/协议级测速、sub-store 式算子管道（筛选/排序/重命名）、一键合并并导出 clash-meta / clash / v2ray / sing-box / surge / base64 新订阅。",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

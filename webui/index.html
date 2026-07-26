@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SubHub</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo">⬡</span>
+        <span class="brand-name">SubHub</span>
+      </div>
+      <nav>
+        <button class="nav-item active" data-view="dashboard">仪表盘</button>
+        <button class="nav-item" data-view="subscriptions">订阅管理</button>
+        <button class="nav-item" data-view="nodes">节点列表</button>
+        <button class="nav-item" data-view="merge">合并 / 导出</button>
+        <button class="nav-item" data-view="settings">设置</button>
+      </nav>
+      <div class="status" id="status">● 正在连接…</div>
+    </aside>
+
+    <main class="content">
+      <!-- Global progress / hint banner (shown during long ops) -->
+      <div id="progress" class="progress hidden" role="status" aria-live="polite">
+        <span class="spinner"></span>
+        <span id="progress-text">处理中…</span>
+        <span class="bar"></span>
+      </div>
+
+      <!-- Dashboard -->
+      <section class="view active" id="view-dashboard">
+        <h1>仪表盘</h1>
+        <div class="cards" id="dash-cards"></div>
+        <div class="grid2">
+          <div class="panel">
+            <h2>类型分布</h2>
+            <div class="donut-wrap">
+              <div class="donut" id="type-donut"></div>
+              <div class="legend" id="type-legend"></div>
+            </div>
+          </div>
+        <div class="panel">
+          <h2>地区分布</h2>
+          <div id="by-region" class="bars"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>趋势</h2>
+          <span class="result" id="trend-info"></span>
+        </div>
+        <svg id="trend-svg" class="trend-svg"></svg>
+        <div class="trend-legend" id="trend-legend"></div>
+      </div>
+        <div class="panel">
+          <h2>订阅来源</h2>
+          <div id="sub-list" class="sub-list"></div>
+        </div>
+      </section>
+
+      <!-- Subscriptions -->
+      <section class="view" id="view-subscriptions">
+        <h1>订阅管理</h1>
+        <div class="panel">
+          <h2>批量添加订阅</h2>
+          <p class="hint">每行一个订阅链接，支持 clash / sing-box / v2ray / base64 格式。添加后会自动测速并进行健康度检测。</p>
+          <textarea id="sub-urls" rows="6" placeholder="https://example.com/clash&#10;https://example.com/v2ray"></textarea>
+          <div class="row">
+            <button class="btn primary" id="btn-add">添加订阅</button>
+            <span id="add-result" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>粘贴节点内容</h2>
+          <p class="hint">直接粘贴节点 URI 或 clash / sing-box 文本（属于本地订阅，不会再次抓取）。可填写下方名称，便于在节点列表的「归属订阅」列区分来源；留空则自动命名为「本地导入 N」。</p>
+          <input id="import-name" placeholder="订阅名称（可选，如「我的自建节点」；留空自动命名）" />
+          <textarea id="raw-nodes" rows="6" placeholder="vmess://...&#10;ss://...&#10;proxies:"></textarea>
+          <div class="row">
+            <button class="btn" id="btn-import">导入</button>
+            <span id="import-result" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>备份 / 恢复订阅列表</h2>
+          <p class="hint">导出当前全部订阅（含每个订阅的节点与已测速结果）为 JSON 文件，可在本机或其他机器离线恢复或留档。导入按「来源链接」合并：已存在的远程订阅更新其节点，新的订阅追加；已测速数据一并保留，不会重新测速。</p>
+          <div class="row">
+            <button class="btn" id="btn-export-subs" type="button">导出订阅列表</button>
+            <span id="export-subs-result" class="result"></span>
+          </div>
+          <div class="row">
+            <input id="import-subs-file" type="file" accept=".json,application/json" style="flex:1; min-width:220px;" />
+            <button class="btn" id="btn-import-subs" type="button">导入订阅列表</button>
+            <span id="import-subs-result" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>当前订阅</h2>
+            <input id="sub-q" class="sub-search" placeholder="搜索名称 / 来源…" />
+            <button class="btn" id="btn-refresh-all">全部刷新</button>
+          </div>
+          <div id="sub-list-manage" class="sub-cards"></div>
+        </div>
+      </section>
+
+      <!-- Nodes -->
+      <section class="view" id="view-nodes">
+        <h1>节点列表</h1>
+        <div class="row filters">
+          <input id="f-q" placeholder="搜索名称…" />
+          <select id="f-type"><option value="">全部类型</option></select>
+          <input id="f-region" placeholder="地区 (如 HK/US/JP)" />
+          <button class="btn" id="btn-refresh">刷新</button>
+          <button class="btn" id="btn-sort-latency">按延迟排序</button>
+          <button class="btn" id="btn-sort-score">按评分排序</button>
+          <button class="btn" id="btn-sort-speed">按速度排序</button>
+          <button class="btn" id="btn-group">按订阅分组</button>
+          <label class="lbl" style="margin-left:8px">测速范围</label>
+          <select id="test-mode">
+            <option value="all">全部节点</option>
+            <option value="untested">仅未测过</option>
+            <option value="failed">仅测速失败</option>
+          </select>
+          <button class="btn" id="btn-speedtest">测速</button>
+          <button class="btn" id="btn-geo">出口地区</button>
+          <button class="btn" id="btn-unlock">解锁检测</button>
+          <button class="btn danger" id="btn-cleanup">清理不可用</button>
+          <span id="speedtest-result" class="result"></span>
+          <span id="nodes-count" class="result"></span>
+        </div>
+        <div class="panel table-wrap">
+          <table id="nodes-table">
+            <thead>
+              <tr><th>名称</th><th>归属订阅</th><th>类型</th><th>服务器</th><th>端口</th><th>地区</th><th>出口</th><th data-sort="latency">延迟</th><th data-sort="speed" title="速度（TCP 吞吐估算；配置测速引擎 SUBHUB_ENGINE_BIN 可得真实带宽）">速度</th><th>解锁</th><th>状态</th><th data-sort="score">评分</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="row paginate">
+          <button class="btn" id="pg-first" title="首页">«</button>
+          <button class="btn" id="pg-prev">上一页</button>
+          <span id="pg-info" class="result"></span>
+          <button class="btn" id="pg-next">下一页</button>
+          <button class="btn" id="pg-last" title="末页">»</button>
+          <span class="spacer"></span>
+          <label class="lbl">每页</label>
+          <select id="pg-size">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- Merge / Export -->
+      <section class="view" id="view-merge">
+        <h1>合并 / 导出</h1>
+        <div class="panel">
+          <h2>转换算子 (Transform)</h2>
+          <p class="hint">可选：在合并导出前对节点进行筛选 / 排序 / 重命名（sub-store 式算子管道）。</p>
+          <div id="filters"></div>
+          <button class="btn" id="btn-add-filter">+ 添加筛选</button>
+          <div class="row" style="margin-top:14px">
+            <label class="lbl">排序</label>
+            <select id="op-sort-key">
+              <option value="">不排序</option>
+              <option value="name">名称</option>
+              <option value="latency">延迟</option>
+              <option value="type">类型</option>
+            </select>
+            <select id="op-sort-dir">
+              <option value="false">升序</option>
+              <option value="true">降序</option>
+            </select>
+          </div>
+          <div class="row">
+            <label class="lbl">重命名</label>
+            <input id="op-rename-pat" placeholder="正则，如 .*HK-(.*)" />
+            <input id="op-rename-rep" placeholder="替换为，如 HK-$1" />
+          </div>
+        </div>
+        <div class="panel">
+          <h2>合并并生成新订阅</h2>
+          <p class="hint">将所有已导入节点去重合并，按算子处理后导出为标准订阅文本。</p>
+          <div class="row">
+            <select id="exp-format">
+              <option value="clash-meta">clash-meta (YAML)</option>
+              <option value="clash">clash (YAML)</option>
+              <option value="v2ray">v2ray (JSON)</option>
+              <option value="sing-box">sing-box (JSON)</option>
+              <option value="surge">surge</option>
+              <option value="base64">base64</option>
+            </select>
+            <button class="btn primary" id="btn-export">合并并导出</button>
+          </div>
+          <textarea id="export-out" rows="14" readonly placeholder="导出结果将显示在这里…"></textarea>
+          <div class="row">
+            <button class="btn" id="btn-copy">复制</button>
+            <button class="btn" id="btn-download">下载</button>
+            <span id="export-info" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>本地订阅地址（直接拉取）</h2>
+          <p class="hint">把下面生成的地址填到 mihomo / clash / v2rayN / sing-box 的「订阅」里，即可直接拉取合并后的节点。地址已经包含了当前选择的<strong>格式</strong>与<strong>算子（筛选 / 排序 / 重命名）</strong>，并自动遵循「设置」页的全局 <strong>Top-N</strong>，相当于把「合并 / 导出」的结果变成了一个常驻网址。</p>
+          <div class="row">
+            <input id="sub-url" class="grow" readonly placeholder="点击右侧「生成地址」" />
+            <button class="btn primary" id="btn-gen-url">生成地址</button>
+            <button class="btn" id="btn-copy-url">复制</button>
+          </div>
+          <div class="row"><span id="sub-url-info" class="result"></span></div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="view" id="view-settings">
+        <h1>设置</h1>
+        <p class="hint">所有全局偏好集中在此（代理、刷新、测速引擎、自动移除、Top-N）。修改即时保存并持久化，无需重启。</p>
+        <div class="panel">
+          <h2>拉取代理</h2>
+          <div class="row proxy-row">
+            <label class="switch" title="总开关：关闭后添加与刷新订阅均不使用代理">
+              <input type="checkbox" id="use-proxy" checked />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">使用代理拉取 / 刷新订阅</span>
+            <span class="hint" style="margin:0">关闭后，已添加订阅的刷新也会直接连接（不使用代理）。</span>
+          </div>
+          <div class="row proxy-row">
+            <input id="sub-proxy" class="grow" placeholder="拉取代理（可选）：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" />
+            <button class="btn" id="btn-proxy-test" type="button" title="测试该代理能否拉取订阅">测试代理</button>
+          </div>
+          <p class="hint">代理地址由服务端统一记住（添加订阅时自动保存为默认，下次自动填充）。拉取被墙的订阅时填此项（例如本机 Sparkle / Clash 的 7890 端口），添加与后续刷新都会走该代理。</p>
+        </div>
+        <div class="panel">
+          <h2>定时自动刷新</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">定时自动刷新</label>
+            <input id="auto-refresh-min" type="number" min="0" step="1" value="0" />
+            <span class="unit">分钟</span>
+            <span class="hint" style="margin:0">0 = 关闭；仅作用于远程订阅；增量更新（保留存活节点数据、仅测新节点、移除已删节点）</span>
+            <button class="btn" id="btn-save-refresh" type="button">保存</button>
+            <span id="refresh-save-result" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>测速引擎</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">测速引擎</label>
+            <input id="engine-bin" type="text" placeholder="留空 = 不启用（仅基础 TCP 测速）" style="flex:1; min-width:300px;" />
+            <button class="btn" id="btn-save-engine" type="button">保存</button>
+            <span id="engine-save-result" class="result"></span>
+            <span class="hint" style="margin:0">指向 mihomo / sing-box 可执行文件（如 verge-mihomo.exe），用于真实代理延迟与下载带宽；保存后下次测速即生效，并持久化。</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>自动移除</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">自动移除</label>
+            <input id="remove-after" type="number" min="0" step="1" value="0" style="width:80px" />
+            <span class="unit">次</span>
+            <span class="hint" style="margin:0">连续测速不可用达到该次数后自动删除节点（0 = 关闭，不自动删除；建议 5）</span>
+            <button class="btn" id="btn-save-remove" type="button">保存</button>
+            <span id="remove-save-result" class="result"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>全局 Top-N（导出 / 网页订阅统一控制）</h2>
+          <div class="row refresh-settings">
+            <label class="switch" title="仅导出 / 订阅评分最高的 N 个节点">
+              <input type="checkbox" id="topn-on" />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">只保留评分最高的</span>
+            <input id="topn" type="number" min="1" step="1" value="50" style="width:80px" />
+            <span class="unit">个节点</span>
+            <span class="hint" style="margin:0">按延迟 / 带宽 / 解锁综合打分，取前 N 个。在此统一设置后，「合并并导出」与「本地订阅地址（/sub）」都遵循此值（关闭 = 全部节点）。订阅 URL 上带 top_n 可临时覆盖。</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

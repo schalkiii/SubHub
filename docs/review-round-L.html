@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SubHub 代码全面 Review 与改进实施（Round L）</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2129; --ink:#e6edf3; --muted:#9aa7b2; --line:#2a333d;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif; line-height:1.6; }
+  .wrap { max-width:980px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:34px 0 12px; border-left:4px solid var(--accent); padding-left:10px; }
+  h3 { font-size:15px; margin:20px 0 8px; color:var(--accent); }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { background:#0d1117; padding:1px 6px; border-radius:5px; font-size:12.5px; color:#ffa657; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
+  .t-ok { background:rgba(63,185,80,.15); color:var(--ok); }
+  .t-warn { background:rgba(210,153,34,.15); color:var(--warn); }
+  .t-bad { background:rgba(248,81,73,.15); color:var(--bad); }
+  .t-info { background:rgba(88,166,255,.15); color:var(--accent); }
+  .pill { display:inline-block; padding:2px 9px; border-radius:6px; font-size:12px; background:#0d1117; border:1px solid var(--line); margin:2px 4px 2px 0; }
+  ul { margin:8px 0; padding-left:20px; } li { margin:4px 0; }
+  .kbd { background:#0d1117; border:1px solid var(--line); border-radius:5px; padding:1px 7px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SubHub · 全面代码 Review 与改进实施</h1>
+  <div class="sub">Round L · 2026-07-24 · 覆盖 <code>core</code> / <code>server</code> / <code>webui</code> · 目标：非破坏性、高性价比的正确性 + 健壮性修复</div>
+
+  <div class="card">
+    <b>范围与方法</b>
+    <ul>
+      <li>全仓库静态审查（正确性 / 健壮性 / 并发 / 性能 / 安全 / 质量 / 功能 / 可观测性）。</li>
+      <li>按严重度分级：<span class="tag t-bad">C1–C2</span> 发布态路径固化 · <span class="tag t-warn">H1–H4</span> 高危 · <span class="tag t-info">M1–M12</span> 中等 · <span class="tag t-info">L1–L12</span> 低危。</li>
+      <li>策略：先修「会让数据错误或进程泄漏」的根因；需大重构的项单独立项，不混进本次。</li>
+    </ul>
+  </div>
+
+  <h2>一、已实施改进（T68–T73）</h2>
+
+  <h3>T68 · 解析正确性 <span class="tag t-ok">已实施</span></h3>
+  <table>
+    <tr><th>位置</th><th>问题</th><th>修复</th></tr>
+    <tr><td><code>parse.rs</code> clash / sing-box 端口</td><td>端口 70000 经 <code>as u16</code> 静默截断为 4464，产生连不上的幽灵节点</td><td>改用 <code>(1..=65535).contains(&amp;p)</code> 校验，越界则丢节点</td></tr>
+    <tr><td><code>parse.rs</code> <code>split_authority</code></td><td>端口 <code>==0</code> 会被接受</td><td>端口 0 直接返回 <code>None</code></td></tr>
+    <tr><td><code>parse.rs</code> <code>parse_ssr</code></td><td>SSR 端口可能为 0 / 越界</td><td>加 <code>(1..=65535).contains</code> 范围过滤</td></tr>
+    <tr><td><code>parse.rs</code> sing-box <code>tls</code> <span class="tag t-bad">H2</span></td><td>原 <code>is_some()</code> 把 <code>tls:false</code> 也强制为 true，明文节点被误加成 TLS</td><td>区分 <code>Bool(b)→b</code> / 对象→true / 缺省→false</td></tr>
+    <tr><td><code>parse.rs</code> vmess <code>tls</code> <span class="tag t-warn">M5</span></td><td>仅识别字符串 <code>"tls"</code>，布尔 <code>true</code> 被判 false</td><td>同时接受 <code>"tls"|"true"</code> 与 JSON 布尔</td></tr>
+    <tr><td><code>parse.rs</code> URI 行 <span class="tag t-warn">M10</span></td><td><code>update-url:</code> / <code>https://rules…</code> 被当 Http 节点</td><td>仅解析已知 scheme（<code>is_known_scheme</code>）</td></tr>
+  </table>
+
+  <h3>T69 · 评分与可用性污染 <span class="tag t-ok">已实施</span></h3>
+  <table>
+    <tr><th>位置</th><th>问题</th><th>修复</th></tr>
+    <tr><td><code>model.rs</code></td><td>无法区分「真实引擎测得的带宽」与「无引擎时的 TCP 估算」</td><td>新增 <code>bandwidth_measured: bool</code>（<code>#[serde(default)]</code>，默认 false）</td></tr>
+    <tr><td><code>lib.rs</code> <code>persist_results</code></td><td>无引擎时仍把 TCP 估算计入 0.40 带宽权重，污染评分</td><td>仅当 <code>bandwidth_measured</code> 为真才计入带宽分；引擎 HTTP 可达即判 <code>available</code></td></tr>
+  </table>
+
+  <h3>T70 · 资源泄漏与静默失败 <span class="tag t-ok">已实施</span></h3>
+  <table>
+    <tr><th>位置</th><th>问题</th><th>修复</th></tr>
+    <tr><td><code>engine.rs</code> <span class="tag t-bad">H1</span></td><td>引擎进程在 <code>?</code> 提前返回路径上泄漏（进程 + temp 目录）</td><td>新增 <code>EngineGuard{child,dir}</code> + <code>Drop</code>（kill + 删目录），所有出口自动清理</td></tr>
+    <tr><td><code>db.rs</code> <span class="tag t-warn">H3</span></td><td><code>save_all</code> 的 <code>let _ =</code> 把持久化失败吞掉</td><td>改为 <code>eprintln!</code> 打印失败原因与订阅 id</td></tr>
+  </table>
+
+  <h3>T71 · 正则静默清空 <span class="tag t-ok">已实施</span></h3>
+  <table>
+    <tr><th>位置</th><th>问题</th><th>修复</th></tr>
+    <tr><td><code>ops.rs</code> <span class="tag t-warn">H4</span></td><td>导出过滤器正则写错时，导出被静默清空（include 模式）或全量导出（exclude 模式）</td><td><code>apply()</code> 返回 <code>Result&lt;Vec&lt;Proxy&gt;, String&gt;</code>；正则编译失败即时返回可读错误</td></tr>
+  </table>
+
+  <h3>T73 · 服务错误体 + 前端错误展示 <span class="tag t-ok">已实施</span></h3>
+  <table>
+    <tr><th>位置</th><th>问题</th><th>修复</th></tr>
+    <tr><td><code>lib.rs</code> <code>/api/export</code> &amp; <code>/sub</code></td><td>正则/转换错误被 <code>?</code> 静默</td><td>改用 <code>map_err(|e| (StatusCode::BAD_REQUEST, e))</code> 返回 400 + 错误文本；<code>/sub?top_n=N</code> Top-N 已支持</td></tr>
+    <tr><td><code>webui/app.js</code></td><td>导出失败无任何提示</td><td><code>api()</code> 把后端错误响应体带入 <code>throw</code>；<code>btn-export</code> 加 <code>try/catch</code> 在 <code>#export-info</code> 显示「导出失败: …」</td></tr>
+  </table>
+
+  <h2>二、主动跳过的项（需立专项，不在本次范围）</h2>
+  <div class="card">
+    <span class="pill">C1 / C2 · 打包路径固化</span>
+    <span class="pill">M1 · 单引擎进程批处理</span>
+    <span class="pill">M6 / M7 · CORS / body-limit / 流式限制</span>
+    <span class="pill">M8 / M9 · 增量 upsert / 分页下推</span>
+    <span class="pill">M11 · 本地订阅幂等</span>
+    <span class="pill">L1–L12 · 低危清理</span>
+    <p class="sub" style="margin:10px 0 0">理由：收益低于风险/工作量，且均非当前崩溃或数据错误根因。建议作为独立重构项推进，避免与正确性修复混在一起放大回归面。</p>
+  </div>
+
+  <h2>三、验证结果</h2>
+  <div class="card">
+    <ul>
+      <li><span class="tag t-ok">0 警告</span> <code>cargo clippy --release -p subhub-core -p subhub-server</code></li>
+      <li><span class="tag t-ok">构建成功</span> <code>cargo build --release -p subhub-server -p subhub-app</code></li>
+      <li><span class="tag t-ok">17 passed</span> <code>cargo test -p subhub-core</code>（含 7 个新增回归测试）</li>
+    </ul>
+  </div>
+
+  <h3>新增回归测试</h3>
+  <ul>
+    <li><code>clash_port_out_of_range_is_rejected</code> / <code>clash_port_zero_is_rejected</code> / <code>uri_with_port_zero_is_skipped</code></li>
+    <li><code>singbox_tls_false_is_not_forced_true</code>（H2） · <code>vmess_tls_boolean_true_parsed</code>（M5）</li>
+    <li><code>unknown_scheme_lines_are_not_ghost_nodes</code>（M10）</li>
+    <li><code>bad_regex_in_filter_returns_err_not_silent_empty</code> / <code>bad_regex_in_rename_returns_err</code>（T71）</li>
+    <li><code>new_proxy_bandwidth_measured_defaults_false</code>（T69）</li>
+  </ul>
+
+  <h2>四、如何生效</h2>
+  <div class="card">
+    <ul>
+      <li><b>服务端</b>：关闭旧进程后重启，加载新的 <code>subhub-server.exe</code>（含评分/持久化/错误体修复）。</li>
+      <li><b>原生 app</b>：关闭运行中的 app，<code>cargo build --release -p subhub-app</code> 重建后启动。</li>
+      <li><b>WebUI</b>：静态改动，刷新页面即生效；导出面板现在会清晰显示正则/导出错误。</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>

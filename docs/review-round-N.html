@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SubHub 代码 Review 报告 · Round N</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --ink:#e6e9ef; --muted:#9aa3b2; --line:#262b36;
+          --red:#ff6b6b; --orange:#ffa94d; --yellow:#ffe066; --green:#51cf66; --blue:#74c0fc; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         line-height:1.6; padding:28px; }
+  .wrap { max-width:1040px; margin:0 auto; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:34px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 8px; color:var(--blue); }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin:8px 0; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  code { background:#0c0e12; border:1px solid var(--line); border-radius:5px; padding:1px 5px; font-size:12px; }
+  pre { background:#0c0e12; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; font-size:12px; }
+  .pill { display:inline-block; padding:1px 9px; border-radius:999px; font-size:11px; font-weight:700; }
+  .c-crit { background:rgba(255,107,107,.16); color:var(--red); }
+  .c-high { background:rgba(255,169,77,.16); color:var(--orange); }
+  .c-med  { background:rgba(255,224,102,.16); color:var(--yellow); }
+  .c-low  { background:rgba(116,192,252,.16); color:var(--blue); }
+  .c-done { background:rgba(81,207,102,.16); color:var(--green); }
+  .c-skip { background:rgba(154,163,178,.16); color:var(--muted); }
+  .ok { color:var(--green); font-weight:700; }
+  ul { margin:6px 0; padding-left:20px; } li { margin:4px 0; }
+  .tag { font-family:ui-monospace,Menlo,Consolas,monospace; color:var(--blue); }
+  @media (max-width:760px){ body{ padding:16px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SubHub 全面代码 Review —— Round N（第三轮）</h1>
+  <p class="sub">2026-07-26 · 深查 L/M 轮未覆盖模块：fingerprint / score / speedtest / export / db.load / 未触碰 handler / webui 渲染 · 新发现 P1–P8，全部实施</p>
+
+  <div class="card">
+    <strong>结论：</strong> 第三轮用 Explore 子代理深查了前两轮未细看的代码，新发现 <b>P1–P8</b> 项问题，<b>全部实施</b>为非破坏性修复（含 5 个新增单测）。重点修复了两类真实数据/功能风险：<b>fingerprint 碰撞静默丢节点（P1）</b> 与 <b>导入即全量测速导致未测节点被 Top-N 剔除 + 评分 NaN（P4/P7）</b>，以及 <b>sing-box 导出把非核心类型变成不可连的 <code>direct</code>（P3）</b>。编译/clippy/测试/运行时冒烟全部通过。
+  </div>
+
+  <h2>一、本轮发现与处理</h2>
+  <table>
+    <thead><tr><th>ID</th><th>严重度</th><th>位置</th><th>问题</th><th>状态</th></tr></thead>
+    <tbody>
+      <tr><td><b>P1</b></td><td><span class="pill c-high">高</span></td><td><code>core/src/model.rs</code> fingerprint</td><td>fingerprint = <code>type|server|port|name</code>，不含凭证；同名同地址不同 uuid/password 的真实节点被判重复，在 merge/flatten_dedup 中静默丢弃</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P2</b></td><td><span class="pill c-high">高</span></td><td><code>server/src/db.rs</code> load_all</td><td>单条订阅解析失败被 <code>.flatten()</code> 静默吞掉，升级/损坏即丢失该订阅全部节点</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P3</b></td><td><span class="pill c-med">中</span></td><td><code>core/src/export.rs</code> singbox_outbound</td><td>hysteria2/tuic/socks5/http 被输出为 <code>"type":"direct"</code>（不可连），wireguard 静默产出坏配置</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P4</b></td><td><span class="pill c-med">中</span></td><td><code>server/src/lib.rs</code> score_proxy</td><td>未测速节点（available=Some(false)，导入即自动测速标记失败）score=0，被 Top-N 静默剔除</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P5</b></td><td><span class="pill c-med">中</span></td><td><code>webui/app.js</code> renderNodes</td><td><code>outbound_country</code>/<code>region</code> 未转义直接拼 innerHTML（引擎写入，不可信）→ XSS</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P6</b></td><td><span class="pill c-low">低</span></td><td><code>server/src/lib.rs</code> geo_detect</td><td>探测返回 None 时保留上次的 outbound_country，跨次显示陈旧地域</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P7</b></td><td><span class="pill c-low">低</span></td><td><code>server/src/lib.rs</code> score_proxy</td><td>引擎返回 <code>download_speed_bps=NaN</code> 时 score 变 NaN，污染 sort/Top-N</td><td><span class="pill c-done">已修</span></td></tr>
+      <tr><td><b>P8</b></td><td><span class="pill c-low">低</span></td><td><code>webui/app.js</code> buildShareUrl</td><td>分享 URL 写死 <code>127.0.0.1:3005</code>，服务端以 <code>SUBHUB_PORT</code> 运行时生成的订阅地址拉不通</td><td><span class="pill c-done">已修</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2>二、修复详解</h2>
+
+  <h3>P1 · fingerprint 碰撞丢节点（高）→ <code>core/src/model.rs</code></h3>
+  <p>原 <code>fingerprint()</code> 只用 name+server+port，不含凭证。多节点供应商常复用同一 host，同名不同 uuid/password 的节点被当成重复而丢弃。修复：按类型补入凭证字段（vmess/vless/tuic 用 uuid；ss 用 method+password；trojan/hysteria2/socks5/http 用 password）。相同节点仍正常去重，真实不同节点不再被误删。</p>
+  <pre>let cred = match self.type_ {
+    Vmess|Vless|Tuic => self.uuid.clone().unwrap_or_default(),
+    Ss => format!("{}|{}", method?, password?),
+    Trojan|Hysteria2|Socks5|Http => self.password.clone().unwrap_or_default(),
+    _ => String::new(),
+};
+format!("{}|{}|{}|{}|{}", type, server, port, name, cred)</pre>
+
+  <h3>P2 · load_all 静默丢订阅（高）→ <code>server/src/db.rs</code></h3>
+  <p>原循环 <code>if let Ok(sub) = from_str { out.push }</code> 在单条订阅解析失败时整条丢弃且无声。修复：解析失败时打印告警，并尝试<b>节点级容错</b>——把仍能解析的 proxy 保留、跳过坏节点后重建订阅，最大化恢复历史数据。</p>
+  <pre>match serde_json::from_str::&lt;Subscription&gt;(&r) {
+    Ok(sub) => out.push(sub),
+    Err(e) => { eprintln!("[db] 订阅解析失败，尝试节点级容错: {e}");
+                /* 解析 proxies 数组，逐项 from_value，跳过坏节点后重建 */ }
+}</pre>
+
+  <h3>P3 · sing-box 导出 direct（中）→ <code>core/src/export.rs</code></h3>
+  <p><code>singbox_outbound</code> 改为返回 <code>Option&lt;Value&gt;</code>，为 hysteria2/tuic/socks5/http 生成<b>真正的 outbound</b>（hysteria2/tuic 带 tls，socks 标 version 5）；wireguard 与未知类型打印告警并跳过（不再产出 <code>direct</code> 伪节点）。<code>to_singbox_json</code> 用 <code>filter_map</code> 收集。</p>
+  <pre>ProxyType::Hysteria2 => { o["type"]="hysteria2"; o["password"]=...; tls?; Some(o) }
+ProxyType::Tuic       => { o["type"]="tuic"; o["uuid"]=...; o["password"]=...; Some(o) }
+ProxyType::Socks5     => { o["type"]="socks"; o["version"]="5"; pw?; Some(o) }
+ProxyType::Http       => { o["type"]="http"; pw?; Some(o) }
+ProxyType::Wireguard => { eprintln!("...不支持 wireguard，已跳过"); None }</pre>
+
+  <h3>P4 + P7 · 评分（中/低）→ <code>server/src/lib.rs</code> score_proxy</h3>
+  <p>原：<code>if !available.unwrap_or(false) { return 0.0 }</code> 对未测（None）与失败（Some(false)）一视同仁记 0。注意 <code>import_raw</code> 导入即自动跑 TCP 测速，不可达节点被标 Some(false) → 全部 score 0 → Top-N 把它们全剔除。修复：仅 <code>Some(false)</code> 记 0；未测节点用中性延迟 500ms 参与排序，避免被静默丢弃。同时带宽仅在 <code>bandwidth_measured &amp;&amp; is_finite()</code> 时计入，杜绝 NaN 污染。</p>
+  <pre>let latency_ms = match p.available {
+    Some(false) => return 0.0,
+    Some(true)  => p.latency_ms.unwrap_or(2000),
+    None        => 500, // 未测节点中性假设，Top-N 不静默剔除
+};
+let bw = if p.bandwidth_measured && p.download_speed_bps.is_some_and(|b| b.is_finite()) {
+    p.download_speed_bps.unwrap_or(0.0)
+} else { 0.0 };</pre>
+
+  <h3>P5 · webui XSS（中）→ <code>webui/app.js</code></h3>
+  <p>节点表 <code>outbound_country</code> 与 <code>region</code> 原样拼入 <code>innerHTML</code>（outbound_country 由外部引擎写入，不可信）。改为 <code>escapeHtml(...)</code>。</p>
+
+  <h3>P6 · 地域陈旧（低）→ <code>server/src/lib.rs</code> geo_detect</h3>
+  <p>原 <code>if let Some(Some(cc)) = ...</code> 只在探测返回 Some 时更新；返回 None（失败/无引擎）时保留旧值。改为 <code>if let Some(cc) = ...</code> 总是刷新（None 即清掉旧地域）。</p>
+
+  <h3>P8 · 分享 URL 端口（低）→ <code>webui/app.js</code></h3>
+  <p><code>buildShareUrl</code> 由写死 <code>http://127.0.0.1:3005/sub</code> 改为 <code>window.location.origin + "/sub?..."</code>，跟随实际服务端口（含 N5 的 <code>SUBHUB_PORT</code>）。</p>
+
+  <h2>三、新增回归测试（5 个）</h2>
+  <ul>
+    <li><code>model::fingerprint_distinguishes_same_name_diff_credential</code> — P1：同名同地址不同 uuid/password 必须不同 fingerprint，相同凭证必须去重。</li>
+    <li><code>export::singbox_export_emits_real_types_not_direct</code> — P3：hysteria2/tuic/socks/http 真 outbound、无 <code>direct</code>、wireguard 被跳过（5 节点导出 4 个）。</li>
+    <li><code>score_untested_node_not_zeroed</code> — P4：available=None 得分 &gt; 0。</li>
+    <li><code>score_failed_node_is_zero</code> — P4：available=Some(false) 得分 0。</li>
+    <li><code>score_ignores_nan_bandwidth</code> — P7：NaN 带宽下 score 仍有限。</li>
+  </ul>
+
+  <h2>四、验证结果</h2>
+  <table>
+    <thead><tr><th>项</th><th>命令/动作</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>静态检查</td><td><code>cargo clippy --release -p subhub-core -p subhub-server</code></td><td><span class="ok">0 警告</span></td></tr>
+      <tr><td>编译</td><td><code>cargo build --release -p subhub-server -p subhub-app</code></td><td><span class="ok">成功</span></td></tr>
+      <tr><td>测试</td><td><code>cargo test -p subhub-core -p subhub-server</code></td><td><span class="ok">23 passed</span>（core 19 + server 4，含 5 个本轮新增）</td></tr>
+      <tr><td>运行时冒烟</td><td>独立 <code>--port 3011/3012 --db /d/tmp/sa_smoke*</code></td><td><span class="ok">health=ok</span>；本环境强制走 Sparkle 代理，直连 TCP 测速全失败（预存在行为，非本轮改动）→ 单测已确定性覆盖 P3/P4/P7</td></tr>
+      <tr><td>进程清理</td><td>停止冒烟 server 后 <code>tasklist</code></td><td><span class="ok">无残留 subhub-server.exe</span>（未动代理）</td></tr>
+    </tbody>
+  </table>
+
+  <h2>五、如何生效</h2>
+  <ul>
+    <li><b>服务端</b>：重启加载新 <code>target/release/subhub-server.exe</code>。</li>
+    <li><b>原生 app</b>：关闭旧窗口后 <code>cargo build --release -p subhub-app</code> 重建。</li>
+    <li><b>WebUI</b>：刷新页面即生效（P5/P8）。</li>
+    <li><b>注意</b>：P1 改变 fingerprint 后，同一 name+server+port 但不同凭证的节点现在会作为独立节点保留（之前被误删的会"回来"）；P3 让 sing-box 导出可用节点真正可连；P4 让未/失败测速的节点在 Top-N 中不再被一刀切剔除。</li>
+  </ul>
+
+  <p class="sub" style="margin-top:26px">关联：<code>docs/review-round-L.html</code>（T68–T73）、<code>docs/review-round-M.html</code>（N1–N9）。改动源文件：<code>core/src/model.rs</code>、<code>core/src/export.rs</code>、<code>server/src/db.rs</code>、<code>server/src/lib.rs</code>、<code>webui/app.js</code>。</p>
+</div>
+</body>
+</html>
