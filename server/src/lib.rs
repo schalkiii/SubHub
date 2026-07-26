@@ -34,6 +34,28 @@ mod db;
 
 mod engine;
 
+/// Poison-tolerant mutex locking.
+///
+/// `Mutex::lock().unwrap()` turns a single panic while holding the lock into a
+/// *permanent* denial of service: every later request that touches the same
+/// mutex panics on the `PoisonError`, so one bug (e.g. the old `redact_url`
+/// out-of-bounds) kills the whole server until restart. Our guarded state is
+/// plain data (Vec/OTP scalars) that stays structurally valid even if a panic
+/// interrupted an update, so recovering the inner value is always safe here.
+/// Use `lock_ok()` instead of `lock().unwrap()` everywhere in this crate.
+trait LockExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| {
+            eprintln!("[subhub] warning: recovered a poisoned mutex (a previous request panicked)");
+            poisoned.into_inner()
+        })
+    }
+}
+
 
 
 // ---- subscription traffic usage ----
@@ -154,8 +176,7 @@ pub struct AppState {
 fn engine_bin_of(state: &AppState) -> Option<String> {
     state
         .engine_bin
-        .lock()
-        .unwrap()
+        .lock_ok()
         .clone()
         .filter(|v| !v.trim().is_empty())
 }
@@ -644,6 +665,15 @@ async fn fetch_subscription_text(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(String, Option<String>), String> {
+    // Scheme allow-list: subscription sources must be plain http/https. A
+    // `file://`, `ftp://` or other exotic scheme in a user-supplied URL is
+    // either a typo or an SSRF/local-file-read attempt — reject it up front
+    // with a clear message instead of letting reqwest produce an opaque
+    // builder error (or, worse, a future reqwest feature actually fetch it).
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(format!("不支持的订阅 URL 协议（仅支持 http/https）: {}", redact_url(url)));
+    }
     let resp = client
         .get(url)
         .send()
@@ -680,11 +710,20 @@ fn redact_url(url: &str) -> String {
         Some((head, _)) => head,
         None => url,
     };
-    if let Some(at) = without_query.find('@') {
+    if without_query.contains('@') {
         if let Some(scheme_end) = without_query.find("://") {
             let (scheme, rest) = without_query.split_at(scheme_end + 3);
-            // keep everything after the first '@' inside `rest`
-            let host_and_path = &rest[at + 1.min(rest.len())..];
+            // Keep everything after the first '@' *inside `rest`*. The old
+            // code indexed `rest` with an offset computed on `without_query`
+            // (`at + 1`), which is out of range whenever the scheme prefix is
+            // longer than the userinfo — e.g. "https://a@b" → rest="a@b"
+            // (len 3) but at=9 → `rest[10..]` panics, poisoning the store
+            // mutex and killing every subsequent request. `split_once` is
+            // offset-free and cannot panic.
+            let host_and_path = match rest.split_once('@') {
+                Some((_userinfo, host)) => host,
+                None => rest, // '@' was in the scheme part only (malformed URL)
+            };
             return format!("{}{}", scheme, host_and_path);
         }
     }
@@ -817,11 +856,11 @@ fn persist_results(
 
     }
 
-    let threshold = *state.remove_after_fails.lock().unwrap();
+    let threshold = *state.remove_after_fails.lock_ok();
 
     let mut removed: usize = 0;
 
-    let mut guard = state.store.lock().unwrap();
+    let mut guard = state.store.lock_ok();
 
     for sub in guard.iter_mut() {
 
@@ -882,11 +921,11 @@ fn persist_all(state: &AppState) {
 
     if let Some(db) = &state.db {
 
-        let subs = state.store.lock().unwrap().clone();
+        let subs = state.store.lock_ok().clone();
 
         // Serialize DB writes so concurrent `save_all` transactions can't
         // interleave (DELETE + full re-INSERT) and corrupt the store.
-        let _g = state.persist_lock.lock().unwrap();
+        let _g = state.persist_lock.lock_ok();
         db.save_all(&subs);
 
     }
@@ -1191,13 +1230,13 @@ async fn add_subscriptions(
 
 ) -> Result<Json<CountResp>, (StatusCode, String)> {
 
-    let use_proxy = *state.use_proxy.lock().unwrap();
+    let use_proxy = *state.use_proxy.lock_ok();
 
     let effective_proxy: Option<String> = if use_proxy {
         match req.fetch_proxy.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(s) => Some(s.to_string()),
             None => {
-                let d = state.default_fetch_proxy.lock().unwrap();
+                let d = state.default_fetch_proxy.lock_ok();
                 d.as_deref().filter(|s| !s.trim().is_empty()).map(|s| s.to_string())
             }
         }
@@ -1282,7 +1321,7 @@ async fn add_subscriptions(
                 .iter()
                 .any(|s| s.health.last_error.is_none() && !s.proxies.is_empty())
         {
-            *state.default_fetch_proxy.lock().unwrap() = Some(p.clone());
+            *state.default_fetch_proxy.lock_ok() = Some(p.clone());
             if let Some(db) = state.db.as_ref() {
                 db.meta_set("default_fetch_proxy", p);
             }
@@ -1297,9 +1336,35 @@ async fn add_subscriptions(
 
     let (total, subscriptions) = {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
-        guard.extend(new_subs);
+        for sub in new_subs {
+            // Idempotent re-add: adding a URL that already exists as a
+            // subscription updates that subscription in place (refresh
+            // semantics: incremental_update preserves measured health for
+            // surviving nodes) instead of creating a duplicate entry. This
+            // matches /api/import's source-based merge behaviour.
+            if let Some(existing) = guard.iter_mut().find(|s| s.source == sub.source) {
+                let (merged, _new_nodes) = incremental_update(&existing.proxies, &sub.proxies);
+                // On a failed re-fetch keep the old node list (merged would be
+                // empty) — same as subscription refresh.
+                if sub.health.last_error.is_none() {
+                    existing.proxies = merged;
+                    existing.health.last_updated_at = sub.health.last_updated_at;
+                    existing.health.upload = sub.health.upload;
+                    existing.health.download = sub.health.download;
+                    existing.health.total = sub.health.total;
+                    existing.health.expire = sub.health.expire;
+                }
+                existing.health.last_checked_at = sub.health.last_checked_at;
+                existing.health.last_error = sub.health.last_error.clone();
+                if sub.fetch_proxy.is_some() {
+                    existing.fetch_proxy = sub.fetch_proxy.clone();
+                }
+            } else {
+                guard.push(sub);
+            }
+        }
 
         let total: usize = guard.iter().map(|s| s.proxies.len()).sum();
 
@@ -1361,7 +1426,7 @@ async fn import_raw(State(state): State<AppState>, Json(req): Json<ImportReq>) -
 
         .filter(|s| !s.trim().is_empty())
 
-        .unwrap_or_else(|| format!("本地导入 {}", state.store.lock().unwrap().len() + 1));
+        .unwrap_or_else(|| format!("本地导入 {}", state.store.lock_ok().len() + 1));
 
     let now = now_ms();
 
@@ -1375,7 +1440,7 @@ async fn import_raw(State(state): State<AppState>, Json(req): Json<ImportReq>) -
 
     let (total, added) = {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         guard.push(sub);
 
@@ -1409,7 +1474,7 @@ async fn import_raw(State(state): State<AppState>, Json(req): Json<ImportReq>) -
 
         total,
 
-        subscriptions: state.store.lock().unwrap().len(),
+        subscriptions: state.store.lock_ok().len(),
 
     })
 
@@ -1420,7 +1485,7 @@ async fn import_raw(State(state): State<AppState>, Json(req): Json<ImportReq>) -
 /// each subscription's nodes and measured results) as a self-contained JSON
 /// document for backup / transfer.
 async fn export_subscriptions(State(state): State<AppState>) -> Json<SubExportDoc> {
-    let subs = state.store.lock().unwrap().clone();
+    let subs = state.store.lock_ok().clone();
     let items: Vec<SubExportItem> = subs
         .into_iter()
         .map(|s| SubExportItem {
@@ -1453,7 +1518,7 @@ async fn import_subscriptions(
 ) -> Json<SubImportResp> {
     let now = now_ms();
     let (added, replaced) = {
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
         // Index existing subs for merge by source URL only — a re-import of a
         // remote subscription is idempotent. We deliberately do NOT index by the
         // client-supplied `id`: ids are sequential (`sub_N`) and trusting them
@@ -1504,7 +1569,7 @@ async fn import_subscriptions(
     };
 
     let (total, subscriptions) = {
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
         let total: usize = guard.iter().map(|s| s.proxies.len()).sum();
         (total, guard.len())
     };
@@ -1526,7 +1591,7 @@ async fn list_subscriptions(
     Query(q): Query<SubListQuery>,
 ) -> Json<Vec<SubSummary>> {
 
-    let guard = state.store.lock().unwrap();
+    let guard = state.store.lock_ok();
 
     let mut out: Vec<SubSummary> = guard.iter().map(sub_to_summary).collect();
 
@@ -1555,7 +1620,7 @@ async fn delete_subscription(
 
     let (total, subscriptions, found) = {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         let before = guard.len();
 
@@ -1605,7 +1670,7 @@ async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_json::Value>
 
     let target = {
 
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
 
         guard.iter().find(|s| s.id == id).map(|s| {
 
@@ -1627,7 +1692,7 @@ async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_json::Value>
 
 
 
-    let use_proxy = *state.use_proxy.lock().unwrap();
+    let use_proxy = *state.use_proxy.lock_ok();
 
     let proxy_opt = if use_proxy {
 
@@ -1649,7 +1714,7 @@ async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_json::Value>
 
             let msg = e.clone();
 
-            let mut guard = state.store.lock().unwrap();
+            let mut guard = state.store.lock_ok();
 
             if let Some(sub) = guard.iter_mut().find(|s| s.id == id) {
 
@@ -1707,7 +1772,7 @@ async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_json::Value>
 
     let result = {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         let sub = match guard.iter_mut().find(|s| s.id == id) {
 
@@ -1821,7 +1886,7 @@ async fn geo_detect(
 
     let mut proxies: Vec<Proxy> = {
 
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
 
         flatten_dedup(&guard, None)
 
@@ -1859,7 +1924,7 @@ async fn geo_detect(
 
     {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         for sub in guard.iter_mut() {
 
@@ -1925,58 +1990,12 @@ pub struct TopNQuery {
 
 /// Composite node score in [0, 100].
 ///
-/// Combines (in priority order): availability, TCP latency (lower is better),
-/// download bandwidth (higher is better) and streaming-unlock coverage. Each
-/// component is normalised to [0, 1]; latency and bandwidth dominate while
-/// unlock is a small bonus, so no single metric can fully dictate the ranking.
+/// Thin wrapper over the single source of truth in `subhub_core::score_proxy`
+/// so the score column shown by `list_proxies`, the Top-N selection in
+/// `merge_export` / `sub_export` and the `sort.key == "score"` branch of
+/// `ops::apply` can never disagree on ordering.
 fn score_proxy(p: &Proxy) -> f64 {
-    // Explicitly *failed* nodes score 0. Untested nodes (available == None)
-    // are NOT zeroed — they get a neutral latency assumption so a Top-N export
-    // run before any speed test does not silently drop every untested node to
-    // the bottom of the ranking.
-    let latency_ms = match p.available {
-        Some(false) => return 0.0,
-        Some(true) => p.latency_ms.unwrap_or(2000),
-        None => 500, // neutral assumption for untested nodes
-    };
-
-    // Latency component: 0 ms -> 1.0, >= 2000 ms -> 0.0 (linear falloff).
-    let lat = (latency_ms as f64).clamp(0.0, 2000.0);
-    let latency_score = 1.0 - lat / 2000.0;
-
-    // Bandwidth component: 0 -> 0.0, >= 50 Mbps -> 1.0 (sqrt = sub-linear).
-    // NOTE: `download_speed_bps` is stored in **bytes/sec** (despite the `_bps`
-    // suffix — see core/src/model.rs), so 50 Mbps == 6_250_000 bytes/sec, not
-    // 50_000_000. Using the wrong figure would under-rank every measured node
-    // by ~8x and corrupt Top-N export ordering. Only count it when the value
-    // is a *real* engine measurement AND finite; without an engine
-    // `download_speed_bps` is a raw TCP throughput estimate, and a NaN/Inf from
-    // a misbehaving engine must not poison the sort.
-    let bw = if p.bandwidth_measured && p.download_speed_bps.is_some_and(|b| b.is_finite()) {
-        p.download_speed_bps.unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    let bw_norm = (bw / 6_250_000.0).clamp(0.0, 1.0);
-    let bw_score = bw_norm.sqrt();
-
-    // Unlock coverage: fraction of detected services that report "unlocked".
-    let unlock_score = match &p.unlock {
-        Some(u) => {
-            let total = u.services.len() as f64;
-            if total == 0.0 {
-                0.0
-            } else {
-                let ok = u.services.values().filter(|s| s.status == "unlocked").count() as f64;
-                ok / total
-            }
-        }
-        None => 0.0,
-    };
-
-    // Weighted combination; latency + bandwidth dominate, unlock is a bonus.
-    let raw = 0.45 * latency_score + 0.40 * bw_score + 0.15 * unlock_score;
-    (raw * 100.0).clamp(0.0, 100.0)
+    subhub_core::score_proxy(p)
 }
 
 
@@ -1988,7 +2007,7 @@ async fn list_proxies(
 
 ) -> Json<ProxiesResp> {
 
-    let guard = state.store.lock().unwrap();
+    let guard = state.store.lock_ok();
 
     // sub-store model: every node belongs to a subscription, so we surface the
 
@@ -2167,7 +2186,7 @@ async fn list_proxies(
 
 async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 
-    let guard = state.store.lock().unwrap();
+    let guard = state.store.lock_ok();
 
     let all = flatten_dedup(&guard, None);
 
@@ -2251,7 +2270,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 
     {
 
-        let mut h = state.history.lock().unwrap();
+        let mut h = state.history.lock_ok();
 
         h.push_back(TrendPoint {
 
@@ -2290,7 +2309,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 /// Trend history (rolling window of dashboard snapshots).
 async fn trends(State(state): State<AppState>) -> Json<Vec<TrendPoint>> {
 
-    let h = state.history.lock().unwrap();
+    let h = state.history.lock_ok();
 
     Json(h.iter().cloned().collect())
 
@@ -2303,16 +2322,16 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
 
     Json(SettingsResp {
 
-        use_proxy: *state.use_proxy.lock().unwrap(),
+        use_proxy: *state.use_proxy.lock_ok(),
 
-        auto_refresh_sec: *state.auto_refresh_sec.lock().unwrap(),
+        auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
 
-        default_fetch_proxy: state.default_fetch_proxy.lock().unwrap().clone(),
+        default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
 
-        top_n: *state.top_n.lock().unwrap(),
+        top_n: *state.top_n.lock_ok(),
 
-        engine_bin: state.engine_bin.lock().unwrap().clone(),
-        remove_after_fails: *state.remove_after_fails.lock().unwrap(),
+        engine_bin: state.engine_bin.lock_ok().clone(),
+        remove_after_fails: *state.remove_after_fails.lock_ok(),
     })
 
 }
@@ -2329,7 +2348,7 @@ async fn set_settings(
 ) -> Json<SettingsResp> {
 
     if let Some(v) = req.use_proxy {
-        *state.use_proxy.lock().unwrap() = v;
+        *state.use_proxy.lock_ok() = v;
         if let Some(db) = &state.db {
             db.meta_set("use_proxy", if v { "1" } else { "0" });
         }
@@ -2337,7 +2356,7 @@ async fn set_settings(
 
     if let Some(sec) = req.auto_refresh_sec {
 
-        *state.auto_refresh_sec.lock().unwrap() = sec;
+        *state.auto_refresh_sec.lock_ok() = sec;
 
         if let Some(db) = &state.db {
 
@@ -2351,7 +2370,7 @@ async fn set_settings(
     if let Some(p) = &req.default_fetch_proxy {
         let val = p.trim();
         let next = if val.is_empty() { None } else { Some(val.to_string()) };
-        *state.default_fetch_proxy.lock().unwrap() = next.clone();
+        *state.default_fetch_proxy.lock_ok() = next.clone();
         if let Some(db) = &state.db {
             db.meta_set("default_fetch_proxy", if next.is_some() { val } else { "" });
         }
@@ -2359,7 +2378,7 @@ async fn set_settings(
 
     // Top-N export size: persisted so it survives restarts.
     if let Some(n) = req.top_n {
-        *state.top_n.lock().unwrap() = n;
+        *state.top_n.lock_ok() = n;
         if let Some(db) = &state.db {
             db.meta_set("top_n", &n.to_string());
         }
@@ -2369,7 +2388,7 @@ async fn set_settings(
     if let Some(b) = &req.engine_bin {
         let val = b.trim();
         let next = if val.is_empty() { None } else { Some(val.to_string()) };
-        *state.engine_bin.lock().unwrap() = next.clone();
+        *state.engine_bin.lock_ok() = next.clone();
         if let Some(db) = &state.db {
             db.meta_set("engine_bin", if next.is_some() { val } else { "" });
         }
@@ -2378,7 +2397,7 @@ async fn set_settings(
     // Auto-remove threshold: 0 disables auto-removal (the safe default).
     if let Some(n) = req.remove_after_fails {
         let n = n.min(1000); // sanity cap; 1000 consecutive failures is absurd
-        *state.remove_after_fails.lock().unwrap() = n;
+        *state.remove_after_fails.lock_ok() = n;
         if let Some(db) = &state.db {
             db.meta_set("remove_after_fails", &n.to_string());
         }
@@ -2386,16 +2405,16 @@ async fn set_settings(
 
     Json(SettingsResp {
 
-        use_proxy: *state.use_proxy.lock().unwrap(),
+        use_proxy: *state.use_proxy.lock_ok(),
 
-        auto_refresh_sec: *state.auto_refresh_sec.lock().unwrap(),
+        auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
 
-        default_fetch_proxy: state.default_fetch_proxy.lock().unwrap().clone(),
+        default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
 
-        top_n: *state.top_n.lock().unwrap(),
+        top_n: *state.top_n.lock_ok(),
 
-        engine_bin: state.engine_bin.lock().unwrap().clone(),
-        remove_after_fails: *state.remove_after_fails.lock().unwrap(),
+        engine_bin: state.engine_bin.lock_ok().clone(),
+        remove_after_fails: *state.remove_after_fails.lock_ok(),
     })
 
 }
@@ -2417,7 +2436,7 @@ async fn unlock_detect(
 
     let mut proxies: Vec<Proxy> = {
 
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
 
         flatten_dedup(&guard, None)
 
@@ -2455,7 +2474,7 @@ async fn unlock_detect(
 
     {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         for sub in guard.iter_mut() {
 
@@ -2516,7 +2535,7 @@ async fn cleanup_bad(State(state): State<AppState>) -> Json<serde_json::Value> {
 
     {
 
-        let mut guard = state.store.lock().unwrap();
+        let mut guard = state.store.lock_ok();
 
         for sub in guard.iter_mut() {
 
@@ -2545,7 +2564,7 @@ async fn nodes_top(
     State(state): State<AppState>,
     Query(q): Query<TopNQuery>,
 ) -> Json<Vec<serde_json::Value>> {
-    let guard = state.store.lock().unwrap();
+    let guard = state.store.lock_ok();
     let mut all: Vec<serde_json::Value> = Vec::new();
     for sub in guard.iter() {
         for p in &sub.proxies {
@@ -2559,7 +2578,7 @@ async fn nodes_top(
             all.push(v);
         }
     }
-    let n = q.n.unwrap_or(*state.top_n.lock().unwrap());
+    let n = q.n.unwrap_or(*state.top_n.lock_ok());
     all.sort_by(|a, b| {
         let sa = a.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let sb = b.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -2579,7 +2598,7 @@ async fn merge_export(
 
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
 
-    let guard = state.store.lock().unwrap();
+    let guard = state.store.lock_ok();
 
     let fmt = req.format.unwrap_or_else(|| "clash-meta".to_string());
 
@@ -2598,7 +2617,7 @@ async fn merge_export(
     // This is what makes manual export honour the same single "Top-N"
     // configuration as the standing subscribe URL (/sub) — configured once in
     // the Settings page, applied everywhere.
-    let global_top = *state.top_n.lock().unwrap();
+    let global_top = *state.top_n.lock_ok();
     let top_n = req
         .top_n
         .filter(|n| *n > 0)
@@ -2658,7 +2677,7 @@ async fn sub_export(
 
     let base = {
 
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
 
         flatten_dedup(&guard, only.as_deref())
 
@@ -2683,7 +2702,7 @@ async fn sub_export(
         .as_ref()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0);
-    let global_top = *state.top_n.lock().unwrap();
+    let global_top = *state.top_n.lock_ok();
     let top_n = url_top.or(if global_top > 0 { Some(global_top) } else { None });
     let transformed = if let Some(n) = top_n {
         let mut scored: Vec<(f64, Proxy)> = transformed
@@ -2742,7 +2761,7 @@ async fn speedtest(
 
     let mut proxies: Vec<Proxy> = {
 
-        let guard = state.store.lock().unwrap();
+        let guard = state.store.lock_ok();
 
         flatten_dedup(&guard, None)
 
@@ -2791,7 +2810,7 @@ async fn speedtest(
     Json(SpeedTestResp {
         results,
         removed,
-        threshold: *state.remove_after_fails.lock().unwrap(),
+        threshold: *state.remove_after_fails.lock_ok(),
     })
 }
 
@@ -3026,7 +3045,7 @@ pub async fn run_server() {
 
             loop {
 
-                let sec = *st.auto_refresh_sec.lock().unwrap();
+                let sec = *st.auto_refresh_sec.lock_ok();
 
                 if sec == 0 {
 
@@ -3040,7 +3059,7 @@ pub async fn run_server() {
 
                 // re-check in case it was disabled (or changed) while we slept
 
-                if *st.auto_refresh_sec.lock().unwrap() == 0 {
+                if *st.auto_refresh_sec.lock_ok() == 0 {
 
                     continue;
 
@@ -3048,7 +3067,7 @@ pub async fn run_server() {
 
                 let ids: Vec<String> = {
 
-                    let g = st.store.lock().unwrap();
+                    let g = st.store.lock_ok();
 
                     g.iter()
 
@@ -3064,7 +3083,7 @@ pub async fn run_server() {
 
                     // stop early if the user disabled auto-refresh mid-cycle
 
-                    if *st.auto_refresh_sec.lock().unwrap() == 0 {
+                    if *st.auto_refresh_sec.lock_ok() == 0 {
 
                         break;
 
@@ -3180,6 +3199,7 @@ pub async fn run_server() {
 
 #[cfg(test)]
 mod tests {
+    use crate::LockExt;
     use subhub_core::{Proxy, ProxyType};
 
     #[test]
@@ -3214,6 +3234,24 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_short_host_does_not_panic() {
+        // Q/B1 regression: the old implementation indexed `rest` with an
+        // offset computed on the whole string — "https://a@b" panicked
+        // (rest="a@b", at=9 → rest[10..]), poisoning the store mutex and
+        // killing the server. Any userinfo/host length combination must be
+        // safe and the userinfo must be stripped.
+        assert_eq!(super::redact_url("https://a@b"), "https://b");
+        assert_eq!(
+            super::redact_url("https://user:pass@example.com/path?token=secret"),
+            "https://example.com/path"
+        );
+        assert_eq!(super::redact_url("https://example.com/x?k=v"), "https://example.com/x");
+        assert_eq!(super::redact_url("not a url"), "not a url");
+        // '@' but no scheme separator: fall through untouched (minus query)
+        assert_eq!(super::redact_url("user@host"), "user@host");
+    }
+
+    #[test]
     fn auto_remove_after_consecutive_failures() {
         // The "remove after N consecutive failures" rule: a node is dropped only
         // once it has been found unavailable `threshold` times in a row, and a
@@ -3244,7 +3282,7 @@ mod tests {
         let mut p = Proxy::new("n".to_string(), ProxyType::Ss, "1.2.3.4".to_string(), 8388);
         p.password = Some("pw".to_string());
         p.method = Some("aes-256-gcm".to_string());
-        state.store.lock().unwrap()[0].proxies.push(p.clone());
+        state.store.lock_ok()[0].proxies.push(p.clone());
 
         let down = |p: &Proxy| SpeedTestResult {
             fingerprint: p.fingerprint(),
@@ -3259,20 +3297,20 @@ mod tests {
         // Below threshold: never removed.
         assert_eq!(super::persist_results(&state, &[p.clone()], &[down(&p)], &[None], &[None]), 0);
         assert_eq!(super::persist_results(&state, &[p.clone()], &[down(&p)], &[None], &[None]), 0);
-        assert_eq!(state.store.lock().unwrap()[0].proxies.len(), 1, "survives before threshold");
+        assert_eq!(state.store.lock_ok()[0].proxies.len(), 1, "survives before threshold");
 
         // At threshold: removed this run.
         assert_eq!(super::persist_results(&state, &[p.clone()], &[down(&p)], &[None], &[None]), 1);
-        assert_eq!(state.store.lock().unwrap()[0].proxies.len(), 0, "removed at threshold");
+        assert_eq!(state.store.lock_ok()[0].proxies.len(), 0, "removed at threshold");
 
         // A success resets the counter (a flaky node is not removed after one blip).
         let mut p2 = Proxy::new("m".to_string(), ProxyType::Ss, "9.9.9.9".to_string(), 8388);
         p2.password = Some("pw".to_string());
         p2.method = Some("aes-256-gcm".to_string());
-        state.store.lock().unwrap()[0].proxies.push(p2.clone());
+        state.store.lock_ok()[0].proxies.push(p2.clone());
         super::persist_results(&state, &[p2.clone()], &[down(&p2)], &[None], &[None]);
         super::persist_results(&state, &[p2.clone()], &[down(&p2)], &[None], &[None]);
-        assert_eq!(state.store.lock().unwrap()[0].proxies.len(), 1, "still alive at 2 fails");
+        assert_eq!(state.store.lock_ok()[0].proxies.len(), 1, "still alive at 2 fails");
         let up = SpeedTestResult {
             fingerprint: p2.fingerprint(),
             name: p2.name.clone(),
@@ -3283,7 +3321,7 @@ mod tests {
             error: None,
         };
         super::persist_results(&state, &[p2.clone()], &[up], &[None], &[None]);
-        let after = &state.store.lock().unwrap()[0].proxies[0];
+        let after = &state.store.lock_ok()[0].proxies[0];
         assert_eq!(after.consecutive_failures, 0, "success resets counter");
     }
 }

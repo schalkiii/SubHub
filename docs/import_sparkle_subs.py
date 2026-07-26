@@ -33,13 +33,15 @@ with urllib.request.urlopen(BASE + "/api/subscriptions", timeout=30) as r:
     subs = json.loads(r.read().decode())
 print(f"\nCurrent subscriptions in DB: {len(subs)}")
 for s in subs:
-    print(f"  id={s['id']}  name={s['name']!r}  url={s['url'][:60]!r}  nodes={len(s['proxies'])}  err={s['health'].get('last_error')}")
+    # NOTE: GET /api/subscriptions returns flat SubSummary objects —
+    # fields are `source` / `count` / `last_error` (no nested `proxies`/`health`).
+    print(f"  id={s['id']}  name={s['name']!r}  source={s['source'][:60]!r}  nodes={s['count']}  err={s.get('last_error')}")
 
-# patch names to Sparkle friendly names (match by url)
+# patch names to Sparkle friendly names (match by source URL)
 name_by_url = {u: n for n, u in SUBS}
 patched = 0
 for s in subs:
-    target = name_by_url.get(s["url"])
+    target = name_by_url.get(s["source"])
     if target and s["name"] != target:
         s["name"] = target
         patched += 1
@@ -55,7 +57,7 @@ cur = conn.cursor()
 rows = cur.execute("SELECT id, data FROM subscriptions").fetchall()
 for rid, data in rows:
     d = json.loads(data)
-    t = name_by_url.get(d.get("url"))
+    t = name_by_url.get(d.get("source"))  # persisted JSON also uses `source`
     if t and d.get("name") != t:
         d["name"] = t
         cur.execute("UPDATE subscriptions SET data=? WHERE id=?", (json.dumps(d, ensure_ascii=False), rid))
