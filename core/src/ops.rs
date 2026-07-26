@@ -1,4 +1,4 @@
-use crate::model::Proxy;
+use crate::model::{Proxy, Subscription};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -257,6 +257,57 @@ pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Prox
     (merged, new_nodes)
 }
 
+/// Merge incoming subscriptions into an existing store, keyed by `source`.
+///
+/// This is the single source of truth for the "re-add == refresh" semantics
+/// shared by `POST /api/subscriptions` and `POST /api/subscriptions/import`:
+///
+/// * An incoming subscription whose `source` already exists is updated **in
+///   place** (never duplicated) via [`incremental_update`], which preserves
+///   the previously measured health of surviving nodes.
+/// * A failed re-fetch (`health.last_error` set) keeps the *old* node list —
+///   only the health / error bookkeeping is refreshed — exactly like a normal
+///   `refresh`, so a transient network blip can't wipe a working node set.
+/// * A subscription whose `source` is new is appended.
+///
+/// Returns `(created, added_proxies)` where `created` is the number of
+/// *newly created* subscriptions (not merged ones) and `added_proxies` is the
+/// total node count of those newly created subscriptions. Callers use this to
+/// report an accurate "added" metric that does not conflate a refresh with a
+/// genuine addition.
+pub fn merge_subscriptions_by_source(
+    existing: &mut Vec<Subscription>,
+    incoming: Vec<Subscription>,
+) -> (usize, usize) {
+    let mut created = 0usize;
+    let mut added_proxies = 0usize;
+    for sub in incoming {
+        if let Some(e) = existing.iter_mut().find(|s| s.source == sub.source) {
+            let (merged, _new_nodes) = incremental_update(&e.proxies, &sub.proxies);
+            // On a failed re-fetch keep the old node list (merged would be
+            // empty / stale) — same as subscription refresh.
+            if sub.health.last_error.is_none() {
+                e.proxies = merged;
+                e.health.last_updated_at = sub.health.last_updated_at;
+                e.health.upload = sub.health.upload;
+                e.health.download = sub.health.download;
+                e.health.total = sub.health.total;
+                e.health.expire = sub.health.expire;
+            }
+            e.health.last_checked_at = sub.health.last_checked_at;
+            e.health.last_error = sub.health.last_error.clone();
+            if sub.fetch_proxy.is_some() {
+                e.fetch_proxy = sub.fetch_proxy.clone();
+            }
+        } else {
+            added_proxies += sub.proxies.len();
+            existing.push(sub);
+            created += 1;
+        }
+    }
+    (created, added_proxies)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +539,88 @@ mod tests {
         let out = apply(&[dead, alive], &t).unwrap();
         assert_eq!(out[0].name, "Alive", "available must outrank dead even with lower speed");
         assert_eq!(out[1].name, "Dead");
+    }
+
+    #[test]
+    fn merge_creates_new_and_counts_only_added_proxies() {
+        // Two brand-new subscriptions are both created; `added` reflects the
+        // node count of the genuinely new subs (not any merged ones).
+        let mut store: Vec<Subscription> = vec![];
+        let a = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1)]);
+        let b = Subscription::new("B".into(), "https://b.example/sub".into(), vec![node("n2", "2.2.2.2", 2), node("n3", "3.3.3.3", 3)]);
+
+        let (created, added) = merge_subscriptions_by_source(&mut store, vec![a, b]);
+        assert_eq!(created, 2, "both subscriptions are new");
+        assert_eq!(added, 3, "three nodes across the two new subs");
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn merge_does_not_duplicate_on_re_add() {
+        // Re-adding an existing source URL must update in place, not create a
+        // second entry (the bug Round Q's e2e test caught: duplicate URLs).
+        let mut store: Vec<Subscription> = vec![];
+        let first = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1)]);
+        merge_subscriptions_by_source(&mut store, vec![first]);
+        assert_eq!(store.len(), 1);
+
+        // re-add the same source with a different node set
+        let again = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n2", "2.2.2.2", 2)]);
+        let (created, added) = merge_subscriptions_by_source(&mut store, vec![again]);
+        assert_eq!(created, 0, "no new subscription created on re-add");
+        assert_eq!(added, 0, "re-add is a refresh, not an addition");
+        assert_eq!(store.len(), 1, "still a single subscription, not a duplicate");
+        assert_eq!(store[0].proxies.len(), 1);
+        assert_eq!(store[0].proxies[0].name, "n2", "node list replaced by refresh");
+    }
+
+    #[test]
+    fn merge_keeps_old_nodes_on_failed_refetch() {
+        // A failed re-fetch (last_error set) must preserve the existing node
+        // list and only record the error — never wipe working nodes.
+        let mut store: Vec<Subscription> = vec![];
+        let mut good = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1), node("n2", "2.2.2.2", 2)]);
+        good.health.last_error = None;
+        merge_subscriptions_by_source(&mut store, vec![good]);
+
+        let mut failed = Subscription::new("A".into(), "https://a.example/sub".into(), vec![]);
+        failed.health.last_error = Some("connection refused".to_string());
+        failed.health.last_checked_at = Some(999);
+        let (created, added) = merge_subscriptions_by_source(&mut store, vec![failed]);
+
+        assert_eq!(created, 0);
+        assert_eq!(added, 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].proxies.len(), 2, "old nodes preserved on failed refetch");
+        assert_eq!(store[0].health.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(store[0].health.last_checked_at, Some(999));
+    }
+
+    #[test]
+    fn merge_refresh_preserves_surviving_health() {
+        // A successful refresh of an existing subscription must keep measured
+        // health for surviving nodes (via incremental_update) and report the
+        // merged total, not create a duplicate.
+        let mut store: Vec<Subscription> = vec![];
+        let mut existing = Subscription::new("A".into(), "https://a.example/sub".into(), vec![]);
+        // pre-existing measured node
+        let mut measured = node("keep", "1.1.1.1", 1);
+        measured.latency_ms = Some(42);
+        measured.available = Some(true);
+        measured.last_tested_at = Some(100);
+        existing.proxies = vec![measured];
+        merge_subscriptions_by_source(&mut store, vec![existing]);
+
+        // refresh returns the same node plus one genuinely new node
+        let mut refresher = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)]);
+        let (created, added) = merge_subscriptions_by_source(&mut store, vec![refresher]);
+
+        assert_eq!(created, 0);
+        assert_eq!(added, 0, "re-add is a refresh; the new node is not 'added' by count");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].proxies.len(), 2, "surviving + new node present");
+        let kept = store[0].proxies.iter().find(|p| p.name == "keep").unwrap();
+        assert_eq!(kept.latency_ms, Some(42), "measured latency preserved across refresh");
+        assert!(store[0].proxies.iter().any(|p| p.name == "brandnew"));
     }
 }

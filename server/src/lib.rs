@@ -1328,48 +1328,20 @@ async fn add_subscriptions(
         }
     }
 
-    let added: usize = new_subs.iter().map(|s| s.proxies.len()).sum();
-
     // only the freshly added nodes are tested (not the whole existing store)
-
     let new_proxies: Vec<Proxy> = new_subs.iter().flat_map(|s| s.proxies.clone()).collect();
 
-    let (total, subscriptions) = {
-
+    // Merge into the durable store. `merge_subscriptions_by_source` is the
+    // single source of truth for "re-add == refresh" (keyed by `source`, so a
+    // duplicate URL updates in place instead of creating a second entry) and
+    // returns an accurate (created, added-node-count) tuple so the response
+    // doesn't conflate a refresh with a genuine addition.
+    let (total, subscriptions, added) = {
         let mut guard = state.store.lock_ok();
-
-        for sub in new_subs {
-            // Idempotent re-add: adding a URL that already exists as a
-            // subscription updates that subscription in place (refresh
-            // semantics: incremental_update preserves measured health for
-            // surviving nodes) instead of creating a duplicate entry. This
-            // matches /api/import's source-based merge behaviour.
-            if let Some(existing) = guard.iter_mut().find(|s| s.source == sub.source) {
-                let (merged, _new_nodes) = incremental_update(&existing.proxies, &sub.proxies);
-                // On a failed re-fetch keep the old node list (merged would be
-                // empty) — same as subscription refresh.
-                if sub.health.last_error.is_none() {
-                    existing.proxies = merged;
-                    existing.health.last_updated_at = sub.health.last_updated_at;
-                    existing.health.upload = sub.health.upload;
-                    existing.health.download = sub.health.download;
-                    existing.health.total = sub.health.total;
-                    existing.health.expire = sub.health.expire;
-                }
-                existing.health.last_checked_at = sub.health.last_checked_at;
-                existing.health.last_error = sub.health.last_error.clone();
-                if sub.fetch_proxy.is_some() {
-                    existing.fetch_proxy = sub.fetch_proxy.clone();
-                }
-            } else {
-                guard.push(sub);
-            }
-        }
-
+        let (_created, added) =
+            subhub_core::ops::merge_subscriptions_by_source(&mut guard, new_subs);
         let total: usize = guard.iter().map(|s| s.proxies.len()).sum();
-
-        (total, guard.len())
-
+        (total, guard.len(), added)
     };
 
 
