@@ -269,6 +269,16 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 **验证**：`cargo test -p subhub-core -p subhub-server` **38 测试全过**（core 32 + server 6，本轮新增 12）；clippy 0 警告；release 构建通过。
 
+## 代码审计记录（Round R，引擎运行时与数据完整性复查）
+
+在 Round Q 全面修复基础上，对前几轮未覆盖的 `engine.rs`（引擎运行时）与「重复添加幂等合并」做专项复查，并落地一处可测性改进：
+
+- **`engine.rs` 复查（结论：已加固，无需大改）**：逐一核对引擎进程管理——RAII `EngineGuard` 保证子进程与临时目录在所有退出路径（含 `spawn` 之后的早退 `?`）均被清理；`EngineDirSeq` 计数器 + pid 保证并发拉起目录互不覆盖；`engine_ready` 在引擎进程自行退出时立即返回（不再傻等整段超时）。**引擎配置 YAML 注入已安全**：节点 `name` 经 `to_clash_meta` 由 `serde_yaml` 序列化（自动引号转义），`proxy-groups` 引用处再叠加 `escape_yaml_scalar` 双保险，攻击者控制的节点名无法逃逸标量注入任意配置。
+- **Per-sub 刷新错误上抛（结论：已满足）**：复查确认 `do_refresh_one` 失败时写入 `health.last_error` 并由 `refresh_subscription` 持久化，前端 `loadSubs` 重渲染经 `.sub-err` 红字展示，因此「webui 错误上抛」缺口实际已闭合，无需额外改动。
+- **幂等合并提取为可单测纯函数（R2）**：此前「重复 URL 按 source 就地合并」逻辑只存在于 server 的 `add_subscriptions` 闭包内、仅由端到端覆盖。现抽出为 `subhub_core::ops::merge_subscriptions_by_source`（单一真相源，同时被 `/api/subscriptions` 与 `/api/subscriptions/import` 复用），并修复返回 `added` 计数在「重复添加（实为 refresh）」时被整份节点数虚高的小瑕疵——现在只统计**真正新建**订阅的节点数。核心新增 4 个单测覆盖：新建计数、重复添加不重不漏、拉取失败时保留旧节点、refresh 保留存活节点已测健康。
+
+**验证**：`cargo clippy --release -p subhub-core -p subhub-server` 0 警告；`cargo test -p subhub-core -p subhub-server` **42 测试全过**（core 36 + server 6，本轮新增 4）；release 构建通过；`docs/test_subhub.py` 隔离库端到端 **ALL CHECKS PASSED**（含同 URL 重复导入幂等合并用例）。
+
 ## 复用的第三方引擎（可选）
 测速与真实连通性验证不重写协议，调用本地 **mihomo (clash-meta)** 或 **sing-box** 作为连接引擎 —— 与 BestSub 思路一致。通过 `SUBHUB_ENGINE_BIN` 开启。
 存活探测走 gstatic `generate_204`（期望 204）、出口地区走 7 个 geo-IP 通道、流媒体解锁（TikTok `region` 解析 + Netflix/Disney/YouTube/ChatGPT 启发式）、带宽测速走 cloudflare `__down` 端点 —— 这些探测目标与判定逻辑均**直接移植 / 借鉴自 BestSub 成熟实现**（见 `core/src/resources.rs` 文件头署名）；逐个订阅健康度与坏节点熔断清理借鉴 **Resin**；合并导出算子管道借鉴 **sub-store**。
