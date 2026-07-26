@@ -28,10 +28,10 @@ pub struct FilterRule {
 }
 
 /// Sort the resulting list.
-/// - key: name | latency | speed | type
-/// - desc: reverse order (for `speed` the default/dense ordering is
-///   already "fastest first", so `desc` flips it to slowest first; for
-///   `latency` the default is "lowest first")
+/// - key: name | latency | speed | type | score
+/// - desc: reverse order (for `speed` and `score` the natural ordering is
+///   "best first" when `desc == true`; for `latency` the default is
+///   "lowest first")
 ///
 /// Availability dominates every key: a node explicitly marked unavailable
 /// (`available == Some(false)`) is always moved to the bottom regardless of
@@ -157,6 +157,25 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
                 avail_rank(a)
                     .cmp(&avail_rank(b))
                     .then_with(|| a.type_.as_str().cmp(b.type_.as_str()))
+            }),
+            "score" => out.sort_by(|a, b| {
+                // Composite score (see crate::score::score_proxy); higher is
+                // better, so the default/dense ordering is "best first" and
+                // `desc == false` flips to worst first — mirroring the `speed`
+                // key's convention. Availability still dominates (score_proxy
+                // already returns 0 for dead nodes, but avail_rank keeps the
+                // tie-break behaviour identical to every other key).
+                avail_rank(a)
+                    .cmp(&avail_rank(b))
+                    .then_with(|| {
+                        let av = crate::score::score_proxy(a);
+                        let bv = crate::score::score_proxy(b);
+                        if s.desc {
+                            bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                    })
             }),
             _ => out.sort_by(|a, b| {
                 avail_rank(a)
@@ -410,6 +429,43 @@ mod tests {
         let out2 = apply(&[dead, alive], &t_desc).unwrap();
         assert_eq!(out2[0].name, "Alive", "descending: available still before unavailable");
         assert_eq!(out2[1].name, "Dead");
+    }
+
+    #[test]
+    fn sort_score_orders_best_first_and_sinks_dead() {
+        // Q/B6: `sort.key == "score"` must use the shared score_proxy —
+        // best composite score first when desc == true, dead nodes always last
+        // (they score 0 AND avail_rank sinks them).
+        let mut fast = node("Fast", "10.0.0.1", 1);
+        fast.available = Some(true);
+        fast.latency_ms = Some(50);
+        let mut slow = node("Slow", "10.0.0.2", 2);
+        slow.available = Some(true);
+        slow.latency_ms = Some(1500);
+        let mut dead = node("Dead", "10.0.0.3", 3);
+        dead.available = Some(false);
+        dead.latency_ms = Some(1); // stale perfect latency must not matter
+
+        let t = Transform {
+            filters: vec![],
+            sort: Some(SortBy { key: "score".to_string(), desc: true }),
+            rename: None,
+        };
+        let out = apply(&[dead.clone(), slow.clone(), fast.clone()], &t).unwrap();
+        assert_eq!(out[0].name, "Fast", "best score first");
+        assert_eq!(out[1].name, "Slow");
+        assert_eq!(out[2].name, "Dead", "dead node must sink to the bottom");
+
+        // ascending flips the usable nodes but the dead one still sinks
+        let t_asc = Transform {
+            filters: vec![],
+            sort: Some(SortBy { key: "score".to_string(), desc: false }),
+            rename: None,
+        };
+        let out2 = apply(&[fast, dead, slow], &t_asc).unwrap();
+        assert_eq!(out2[0].name, "Slow", "ascending: worst usable score first");
+        assert_eq!(out2[1].name, "Fast");
+        assert_eq!(out2[2].name, "Dead", "avail_rank keeps dead last even ascending");
     }
 
     #[test]

@@ -233,7 +233,7 @@ function renderBars(id, obj) {
     .map(
       ([k, v]) => `
       <div class="bar-row">
-        <div class="bar-label">${k}</div>
+        <div class="bar-label">${escapeHtml(k)}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${(v / max) * 100}%"></div></div>
         <div class="bar-val">${v}</div>
       </div>`
@@ -661,10 +661,20 @@ async function saveTopN() {
   const on = document.getElementById("topn-on").checked;
   const n = parseInt(document.getElementById("topn").value, 10);
   const nn = on && !isNaN(n) && n > 0 ? n : 0;
+  const el = document.getElementById("topn-save-result");
   try {
-    await postJson("/api/settings", { top_n: nn });
-  } catch {
-    /* best-effort */
+    const r = await postJson("/api/settings", { top_n: nn });
+    if (el) {
+      el.style.color = "";
+      el.textContent = r.top_n > 0 ? `已保存：Top-${r.top_n}` : "已保存：不限制（全部节点）";
+    }
+  } catch (err) {
+    // A silent failure here means the user believes Top-N is active while the
+    // /sub URL still exports everything — always surface the error.
+    if (el) {
+      el.style.color = "var(--danger, #ef4444)";
+      el.textContent = "保存失败：" + err.message;
+    }
   }
 }
 document.getElementById("topn-on").addEventListener("change", saveTopN);
@@ -730,9 +740,29 @@ async function loadNodes(page) {
   if (_sortField) params.set("desc", _sortDesc ? "true" : "false");
   params.set("page", _page);
   params.set("page_size", _pageSize);
-  const resp = await api("/api/proxies?" + params.toString());
+  let resp;
+  try {
+    resp = await api("/api/proxies?" + params.toString());
+  } catch (err) {
+    // Surface the failure in the table itself instead of leaving a silently
+    // blank list (which reads as "you have no nodes").
+    const tbody = document.querySelector("#nodes-table tbody");
+    if (tbody) {
+      tbody.innerHTML =
+        `<tr><td colspan="12" style="text-align:center;color:var(--danger,#ef4444);padding:16px">` +
+        `节点列表加载失败：${escapeHtml(err.message)}（可点击「刷新」重试）</td></tr>`;
+    }
+    return;
+  }
   _nodes = resp.items || [];
   _total = resp.total || 0;
+  // Clamp the page: totals shrink (auto-remove / deleting a subscription /
+  // narrower filters), and a stale _page past the last page would render an
+  // empty table with working-looking pager buttons.
+  const totalPages = Math.max(1, Math.ceil(_total / _pageSize));
+  if (_page > totalPages) {
+    return loadNodes(totalPages);
+  }
   renderNodes(_nodes);
   renderPager();
 }

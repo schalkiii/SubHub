@@ -97,7 +97,10 @@ pub fn tcp_ping_all(proxies: &[Proxy], timeout_ms: u64, concurrency: usize) -> V
             s.spawn(move || {
                 loop {
                     let i = {
-                        let mut g = queue.lock().unwrap();
+                        // Poison-tolerant: if a worker panicked mid-update the
+                        // counter is still a valid usize; recover instead of
+                        // cascading the panic to every other worker thread.
+                        let mut g = queue.lock().unwrap_or_else(|e| e.into_inner());
                         if *g >= proxies.len() {
                             break;
                         }

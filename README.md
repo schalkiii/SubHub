@@ -253,6 +253,22 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 **验证**：`cargo clippy --release -p subhub-core -p subhub-server` **0 警告**；`cargo test -p subhub-core --lib` 3 测试通过；`docs/test_subhub.py` 端到端 **ALL CHECKS PASSED**。
 
+## 代码审计记录（Round Q，双代理全面复查）
+
+对后端 Rust（core + server）与前端/脚本（webui + docs）分别做独立审查，逐条核对源码真伪后实施修复：
+
+- **B1 `redact_url` 越界 panic（严重）**：旧实现用全串偏移去索引子串，`https://a@b` 这类「scheme 比 userinfo 长」的 URL 直接 panic 并毒化 store mutex，导致后续所有请求 500。改用 `split_once('@')`（无偏移、不可能 panic），并补回归单测。
+- **B2 Mutex 毒化恢复**：全部 `lock().unwrap()`（约 60 处）替换为 poison 容忍的 `lock_ok()` 扩展 trait——一次 panic 不再永久打死整个服务；`core/speedtest.rs` 工作线程同样处理。
+- **B3 幽灵节点**：订阅正文里无 `user:pass@` 的裸 `http(s)://host:port` 行（更新链接 / 规则 URL）不再被解析成不可用的 Http 节点；带 userinfo 的真实 http 代理不受影响。
+- **B4 SSRF 防护**：`fetch_subscription_text` 增加 scheme 白名单（仅 http/https），`file://` 等一律前置拒绝。
+- **B6 评分单一真相源**：`score_proxy` 移入 `subhub_core`（`core/src/score.rs`），server 侧改为薄包装；`ops::apply` 排序新增 `score` 分支（此前静默回退按名称排），UI 排序 / Top-N 导出 / 算子管道三方评分从此不可能不一致。
+- **B8 base64 解析深度上限**：`parse_subscription` 递归解 base64 增加深度（3 层）与解码体积（16 MiB）上限，防构造输入递归炸栈。
+- **前端 F1/F4/F5/F6**：节点列表加载失败在表格内显示错误（不再静默空白）；总数缩小后页码自动夹取到末页；仪表盘条形图 label HTML 转义（防节点名注入 XSS）；全局 Top-N 保存增加成功 / 失败反馈（不再静默失败）。
+- **重复添加 URL 幂等合并（端到端测试新抓出）**：`POST /api/subscriptions` 重复添加同一 URL 此前会产生重复订阅条目；现改为按 `source` 就地更新（refresh 语义，`incremental_update` 保留存活节点已测健康数据；拉取失败时保留旧节点列表），与 `/api/import` 的合并行为一致。
+- **脚本修复**：`docs/import_sparkle_subs.py` 字段名 `url`→`source`、`s['health']`→扁平 `SubSummary` 字段（原脚本必 KeyError）；`docs/test_subhub.py` speedtest 断言改为对象形状（`{results, removed, threshold}`），并新增跨页全局排序一致性、`top_n` 设置持久化往返、删除不存在订阅返回 404、同 URL 重复导入幂等合并、`mode=untested` 范围测速共 5 组端到端用例。
+
+**验证**：`cargo test -p subhub-core -p subhub-server` **38 测试全过**（core 32 + server 6，本轮新增 12）；clippy 0 警告；release 构建通过。
+
 ## 复用的第三方引擎（可选）
 测速与真实连通性验证不重写协议，调用本地 **mihomo (clash-meta)** 或 **sing-box** 作为连接引擎 —— 与 BestSub 思路一致。通过 `SUBHUB_ENGINE_BIN` 开启。
 存活探测走 gstatic `generate_204`（期望 204）、出口地区走 7 个 geo-IP 通道、流媒体解锁（TikTok `region` 解析 + Netflix/Disney/YouTube/ChatGPT 启发式）、带宽测速走 cloudflare `__down` 端点 —— 这些探测目标与判定逻辑均**直接移植 / 借鉴自 BestSub 成熟实现**（见 `core/src/resources.rs` 文件头署名）；逐个订阅健康度与坏节点熔断清理借鉴 **Resin**；合并导出算子管道借鉴 **sub-store**。

@@ -224,12 +224,62 @@ proxies:
 
     print("== speedtest (local test node) ==")
     call("/api/import", {"content": "ss://YWVzLTI1Ni1nY206cGFzcw==@127.0.0.1:3005#LG-LocalTest"})
-    res = call("/api/speedtest", {"timeout_ms": 3000, "concurrency": 10})
+    # /api/speedtest returns an OBJECT: {results: [...], removed: n, threshold: n}
+    resp = call("/api/speedtest", {"timeout_ms": 3000, "concurrency": 10})
+    assert isinstance(resp, dict) and "results" in resp, f"speedtest must return an object with results, got {type(resp)}"
+    assert "removed" in resp and "threshold" in resp, "speedtest response must carry removed/threshold"
+    res = resp["results"]
     local = [x for x in res if x["name"] == "LG-LocalTest"]
     print("  LG-LocalTest:", local[0] if local else "n/a")
     if local:
         assert local[0]["available"] is True, "local should be reachable"
         assert local[0]["tcp_latency_ms"] is not None
+
+    print("== speedtest mode=untested (scoped run, object shape) ==")
+    r = call("/api/speedtest", {"timeout_ms": 2000, "concurrency": 10, "mode": "untested"})
+    assert isinstance(r, dict) and isinstance(r.get("results"), list)
+    print(f"  mode=untested tested {len(r['results'])} node(s) (all-tested -> 0 is fine)")
+
+    print("== global sort is cross-page (not per-page) ==")
+    # The full ordering (one big page) must equal the concatenation of small
+    # pages — i.e. sorting happens BEFORE pagination, server-side.
+    full = call("/api/proxies?sort=latency&desc=false&page=1&page_size=1000")["items"]
+    names_full = [p["name"] for p in full]
+    names_paged, page = [], 1
+    while True:
+        chunk = call(f"/api/proxies?sort=latency&desc=false&page={page}&page_size=3")["items"]
+        if not chunk:
+            break
+        names_paged.extend(p["name"] for p in chunk)
+        page += 1
+    assert names_paged == names_full, f"paged concat != full order\n paged={names_paged}\n full={names_full}"
+    print(f"  ✅ {len(names_full)} nodes: page_size=3 concatenation matches global order")
+
+    print("== settings persistence (top_n round-trip) ==")
+    call("/api/settings", {"top_n": 7})
+    s = call("/api/settings")
+    assert s["top_n"] == 7, f"top_n not persisted, got {s['top_n']}"
+    call("/api/settings", {"top_n": 0})  # restore
+    assert call("/api/settings")["top_n"] == 0
+    print("  ✅ top_n saved and restored via /api/settings")
+
+    print("== delete non-existent subscription -> 404 ==")
+    import urllib.error
+    try:
+        call("/api/subscriptions/does-not-exist", method="DELETE")
+        raise AssertionError("deleting a bogus id must return HTTP 404")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404, f"expected 404, got {e.code}"
+    print("  ✅ bogus delete correctly rejected with 404")
+
+    print("== import idempotency (same URL merges, no duplicate sub) ==")
+    # importing the same remote source twice must not create two subscriptions
+    before_ids = {s["id"] for s in call("/api/subscriptions")}
+    call("/api/subscriptions", {"urls": ["http://127.0.0.1:9/subs"]})  # same broken URL as earlier
+    after = call("/api/subscriptions")
+    same_src = [s for s in after if s["source"] == "http://127.0.0.1:9/subs"]
+    assert len(same_src) == 1, f"same source URL must merge into one sub, got {len(same_src)}"
+    print(f"  ✅ re-adding same URL kept a single subscription (subs {len(before_ids)} -> {len(after)})")
 
     print("== unlock-detect (no engine -> list, must not error) ==")
     r = call("/api/unlock-detect", {"timeout_ms": 3000})

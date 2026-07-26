@@ -3,20 +3,39 @@ use base64::Engine;
 use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 
+/// Maximum number of nested base64 layers we'll unwrap. Real subscriptions
+/// use at most one layer (base64 of yaml/uri-list); a crafted input of deeply
+/// nested base64 must not recurse unboundedly (stack + CPU DoS).
+const MAX_B64_DEPTH: usize = 3;
+
+/// Maximum decoded size we'll accept from a base64 layer. The server already
+/// caps the *fetched* body at 16 MiB, but parse_subscription is also fed
+/// local imports — keep the same bound here so a pasted blob can't balloon.
+const MAX_B64_DECODED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Entry point: given the raw text of a subscription, figure out the format
 /// and parse it into a list of proxies. Robust to mixed content (a `proxies:`
 /// YAML block with bare `vmess://`/`trojan://`/... URI lines appended).
 pub fn parse_subscription(raw: &str) -> Vec<Proxy> {
+    parse_subscription_depth(raw, 0)
+}
+
+fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Vec::new();
     }
 
-    // 1) base64-wrapped (most clash subscriptions are base64 of yaml)
-    if let Ok(decoded) = b64_decode(raw) {
-        let text = String::from_utf8_lossy(&decoded);
-        if !text.trim().is_empty() && text.trim() != raw && (text.contains("proxies:") || text.contains("\"outbounds\"") || text.contains("\"proxies\"")) {
-            return parse_subscription(&text);
+    // 1) base64-wrapped (most clash subscriptions are base64 of yaml).
+    //    Depth-capped: see MAX_B64_DEPTH.
+    if depth < MAX_B64_DEPTH {
+        if let Ok(decoded) = b64_decode(raw) {
+            if decoded.len() <= MAX_B64_DECODED_BYTES {
+                let text = String::from_utf8_lossy(&decoded);
+                if !text.trim().is_empty() && text.trim() != raw && (text.contains("proxies:") || text.contains("\"outbounds\"") || text.contains("\"proxies\"")) {
+                    return parse_subscription_depth(&text, depth + 1);
+                }
+            }
         }
     }
 
@@ -44,11 +63,23 @@ pub fn parse_subscription(raw: &str) -> Vec<Proxy> {
     //    otherwise be misinterpreted as Http-type "ghost" nodes.
     for line in raw.lines() {
         let line = line.trim();
-        if let Some((scheme, _)) = line.split_once("://") {
-            if is_known_scheme(scheme) {
-                if let Some(p) = parse_uri(line) {
-                    out.push(p);
-                }
+        if let Some((scheme, rest)) = line.split_once("://") {
+            if !is_known_scheme(scheme) {
+                continue;
+            }
+            // Bare `http(s)://host:port` lines with NO userinfo are almost
+            // never proxy nodes — they're update URLs, rule-set links or
+            // comments inside a mixed subscription document. Parsing them
+            // would create untestable "ghost" Http nodes. Only treat an
+            // http(s) line as a proxy when it carries `user:pass@host`
+            // userinfo. All dedicated proxy schemes (vmess/ss/...) are
+            // unambiguous and stay accepted as-is.
+            let sl = scheme.to_ascii_lowercase();
+            if (sl == "http" || sl == "https") && !rest.contains('@') {
+                continue;
+            }
+            if let Some(p) = parse_uri(line) {
+                out.push(p);
             }
         }
     }
@@ -653,6 +684,45 @@ mod tests {
         // split_authority must reject port 0 (M4) so we don't emit a dead node.
         let out = parse_subscription("ss://method:pass@1.2.3.4:0");
         assert!(out.is_empty(), "ss URI with port 0 must be skipped");
+    }
+
+    #[test]
+    fn bare_http_url_without_userinfo_is_not_a_node() {
+        // Q/B3: a standalone `https://host:port` line (no `user:pass@`) is an
+        // update-url / rule link, not a proxy — it must not become a ghost
+        // Http node.
+        assert!(parse_subscription("https://example.com:8080/path").is_empty());
+        assert!(parse_subscription("http://1.2.3.4:8080").is_empty());
+    }
+
+    #[test]
+    fn http_proxy_with_userinfo_still_parses() {
+        // ...but a genuine authenticated http proxy URI must keep working.
+        let out = parse_subscription("http://user:pass@1.2.3.4:8080#MyHttp");
+        assert_eq!(out.len(), 1, "http proxy with userinfo must parse");
+        assert_eq!(out[0].server, "1.2.3.4");
+        assert_eq!(out[0].port, 8080);
+    }
+
+    #[test]
+    fn nested_base64_recursion_is_depth_capped() {
+        // Q/B8: deeply nested base64 must not recurse unboundedly. Build a
+        // payload wrapped in MORE layers than MAX_B64_DEPTH: parsing must
+        // terminate (no stack overflow) and simply yield nothing.
+        let inner = "proxies:\n  - name: n\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-128-gcm\n    password: x\n";
+        let mut wrapped = inner.to_string();
+        for _ in 0..(MAX_B64_DEPTH + 2) {
+            // keep a marker so the recursion heuristic keeps firing
+            wrapped = base64::engine::general_purpose::STANDARD
+                .encode(format!("proxies:\n# marker\n{}", wrapped));
+        }
+        let out = parse_subscription(&wrapped); // must return, not overflow
+        assert!(out.is_empty(), "over-deep base64 nesting yields no nodes");
+
+        // one legitimate layer still works
+        let one = base64::engine::general_purpose::STANDARD.encode(inner);
+        let out1 = parse_subscription(&one);
+        assert_eq!(out1.len(), 1, "single base64 layer must still parse");
     }
 }
 

@@ -3,6 +3,7 @@ pub mod model;
 pub mod ops;
 pub mod parse;
 pub mod resources;
+pub mod score;
 pub mod speedtest;
 
 pub use model::{
@@ -15,6 +16,7 @@ pub use parse::{
     SubscriptionUsage,
 };
 pub use export::{export_filter, export_str, to_clash_meta};
+pub use score::score_proxy;
 pub use speedtest::{tcp_ping, tcp_ping_all, SpeedTestResult};
 pub use resources::{
     GEO_CHANNELS, ALIVE_TARGET, SPEED_DOWNLOAD_URL, STREAM_SERVICES, UnlockDetect, extract_country,
