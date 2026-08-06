@@ -18,7 +18,7 @@
 | 漂亮 WebUI + 全面展示 | ✅ 最强 | 🟡 现代工具风 | 🟡 强但朴素 | ✅ 借鉴 Resin 主题 + 卡片 |
 | **逐个订阅健康度** | ✅ 独有能力 | ❌ | ❌ | ✅ **已实现并验证** |
 | 批量添加订阅 | 🟡 | ✅ 核心 | ✅ | ✅ |
-| 节点测速（延迟/带宽/解锁） | 🟡 被动 | ✅ 主动+解锁 | ❌ | 🟡 延迟/可用性 + 出口地区；流媒体解锁待接 |
+| 节点测速（延迟/带宽/解锁） | 🟡 被动 | ✅ 主动+解锁 | ❌ | ✅ 延迟/可用性 + 出口地区 + 流媒体解锁 + 带宽测速 |
 | 合并 → 输出新订阅 | 🟡 去重 | ✅ | ✅ 最强 | ✅ 算子管道 + 6 格式 |
 | Rust 开发 | ❌ Go | ❌ Go | ❌ Node | ✅ |
 | 原生 GUI | ❌ Web | ❌ Web | ❌ Web | ✅ Tauri v2 |
@@ -75,7 +75,7 @@
   - 支持「达速即停」「跳过已有速度节点」。
 - **流媒体解锁 `tiktok.go`**：
   - `detectTikTok()`：先 `GET https://www.tiktok.com/`，若响应体含 `"region":` 返回 `1`（解锁）；否则 `GET https://www.tiktok.com/api/passport/web/region/get/`，命中返回 `2`（IDC 解锁）；否则 `0`。带 UA 头。
-  - Netflix/Disney 等同理另有 checker（本项目先借 TikTok 目标常量，完整解锁判定待接，见 §4）。
+  - Netflix/Disney 等同理另有 checker（本项目已借 TikTok 目标常量 + Netflix/Disney/YouTube/ChatGPT 启发式，完整解锁判定已完成，见 §4.1）。
 - **出口地区 `country.go` + `modules/country/*`**：
   - `checker/country.go`：对每个未检测节点 `mihomo.Proxy(raw)` 后调 `country.GetCode(ctx, client.Client)`。
   - `modules/country/country.go` 的 `GetCode()`：**遍历注册通道，每个 5s 超时，返回首个非空国家码**。
@@ -180,7 +180,7 @@
 - **解析 / 转换**：`core` 统一 `Proxy` 模型；解析器覆盖 clash(sing-box)/yaml/json/uri/base64；导出 6 格式；算子链对齐 sub-store。
 - **存储 / 网络**：`rusqlite`（bundled 编译）持久化到 `data/subhub.db`（默认开启，`SUBHUB_DB` 可覆盖/置空退回内存态）；进程内 `Mutex<Vec<Subscription>>` 为热数据，`reqwest` 抓取（支持 `fetch_proxy` 经代理拉取）。
 
-### 5.2 路线图（P0–P4 已完成，新增 P5）
+### 5.2 路线图（P0–P10 全部完成）
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 导入→统一模型→去重合并→仪表盘→导出 | ✅ |
@@ -194,6 +194,7 @@
 | **P7** | **SQLite 持久化（重启不丢）+ 节点按订阅来源归属（sub-store 分组）+ Resin 式定时自动刷新** | ✅ 已完成 |
 | **P8** | **本地订阅直接拉取地址（`GET /sub`，可编码算子变成常驻网址）· 节点列表分页 · 算子转换（Transform）图文说明与分享链接 · 应用图标重制 + 重新编译 exe** | ✅ 已完成 |
 | **P9** | **质量加固：健康度排序 · 导出去无效节点 · 地区注入 bug 修复 · 前端解锁调用修复 · 引擎跳过不可导出节点 · clippy 0 警告 · 文档同步** | ✅ 已完成 |
+| **P10** | **节点列表全局排序（跨页）· WebUI 集中「设置」页 + 全局 Top-N 单一真相源 · 手动测速「仅测未测 / 仅失败」模式 · 合并导入防任意覆盖 · 删除不存在订阅返回 404** | ✅ 已完成 |
 
 ---
 
@@ -315,3 +316,132 @@
 - `cargo test -p subhub-core --lib`：**3 测试通过**（含新增 rename 转义测试）。
 - `docs/test_subhub.py` 端到端冒烟：**ALL CHECKS PASSED**（Other 类型排除、地区注入修复、6 格式导出、解锁探测无引擎安全返回等）。
 - 生产实例（端口 3099）未受影响；新二进制需重启服务方可生效。
+
+---
+
+## 10. Round Q —— 双代理全面复查（后端 Rust + 前端 / 脚本独立审查）
+
+在 Round G 之后，对后端（core + server）与前端 / 脚本（webui + docs）分别做独立审查，逐条核对源码真伪后实施修复：
+
+### 10.1 后端 Rust 安全 / 健壮性（B 系列）
+- **B1 `redact_url` 越界 panic（严重）**：旧实现用全串偏移去索引子串，`https://a@b` 这类「scheme 比 userinfo 长」的 URL 直接 panic 并毒化 store mutex，导致后续所有请求 500。改用 `split_once('@')`（无偏移、不可能 panic），并补回归单测。
+- **B2 Mutex 毒化恢复**：全部 `lock().unwrap()`（约 60 处）替换为 poison 容忍的 `lock_ok()` 扩展 trait——一次 panic 不再永久打死整个服务；`core/speedtest.rs` 工作线程同样处理。
+- **B3 幽灵节点**：订阅正文里无 `user:pass@` 的裸 `http(s)://host:port` 行（更新链接 / 规则 URL）不再被解析成不可用的 Http 节点；带 userinfo 的真实 http 代理不受影响。
+- **B4 SSRF 防护**：`fetch_subscription_text` 增加 scheme 白名单（仅 http/https），`file://` 等一律前置拒绝。
+- **B6 评分单一真相源**：`score_proxy` 移入 `subhub_core`（`core/src/score.rs`），server 侧改为薄包装；`ops::apply` 排序新增 `score` 分支（此前静默回退按名称排），UI 排序 / Top-N 导出 / 算子管道三方评分从此不可能不一致。
+- **B8 base64 解析深度上限**：`parse_subscription` 递归解 base64 增加深度（3 层）与解码体积（16 MiB）上限，防构造输入递归炸栈。
+
+### 10.2 前端 / 脚本（F 系列 + 脚本修复）
+- **前端 F1/F4/F5/F6**：节点列表加载失败在表格内显示错误（不再静默空白）；总数缩小后页码自动夹取到末页；仪表盘条形图 label HTML 转义（防节点名注入 XSS）；全局 Top-N 保存增加成功 / 失败反馈（不再静默失败）。
+- **重复添加 URL 幂等合并（端到端测试新抓出）**：`POST /api/subscriptions` 重复添加同一 URL 此前会产生重复订阅条目；现改为按 `source` 就地更新（refresh 语义，`incremental_update` 保留存活节点已测健康数据；拉取失败时保留旧节点列表），与 `/api/import` 的合并行为一致。
+- **脚本修复**：`docs/import_sparkle_subs.py` 字段名 `url`→`source`、`s['health']`→扁平 `SubSummary` 字段（原脚本必 KeyError）；`docs/test_subhub.py` speedtest 断言改为对象形状（`{results, removed, threshold}`），并新增跨页全局排序一致性、`top_n` 设置持久化往返、删除不存在订阅返回 404、同 URL 重复导入幂等合并、`mode=untested` 范围测速共 5 组端到端用例。
+
+### 10.3 验证
+- `cargo test -p subhub-core -p subhub-server`：**38 测试全过**（core 32 + server 6，本轮新增 12）；clippy 0 警告；release 构建通过。
+
+---
+
+## 11. Round R —— 引擎运行时与数据完整性复查
+
+在 Round Q 全面修复基础上，对前几轮未覆盖的 `engine.rs`（引擎运行时）与「重复添加幂等合并」做专项复查，并落地一处可测性改进：
+
+### 11.1 `engine.rs` 复查（结论：已加固，无需大改）
+逐一核对引擎进程管理——RAII `EngineGuard` 保证子进程与临时目录在所有退出路径（含 `spawn` 之后的早退 `?`）均被清理；`EngineDirSeq` 计数器 + pid 保证并发拉起目录互不覆盖；`engine_ready` 在引擎进程自行退出时立即返回（不再傻等整段超时）。**引擎配置 YAML 注入已安全**：节点 `name` 经 `to_clash_meta` 由 `serde_yaml` 序列化（自动引号转义），`proxy-groups` 引用处再叠加 `escape_yaml_scalar` 双保险，攻击者控制的节点名无法逃逸标量注入任意配置。
+
+### 11.2 Per-sub 刷新错误上抛（结论：已满足）
+复查确认 `do_refresh_one` 失败时写入 `health.last_error` 并由 `refresh_subscription` 持久化，前端 `loadSubs` 重渲染经 `.sub-err` 红字展示，因此「webui 错误上抛」缺口实际已闭合，无需额外改动。
+
+### 11.3 幂等合并提取为可单测纯函数（R2）
+此前「重复 URL 按 source 就地合并」逻辑只存在于 server 的 `add_subscriptions` 闭包内、仅由端到端覆盖。现抽出为 `subhub_core::ops::merge_subscriptions_by_source`（单一真相源，同时被 `/api/subscriptions` 与 `/api/subscriptions/import` 复用），并修复返回 `added` 计数在「重复添加（实为 refresh）」时被整份节点数虚高的小瑕疵——现在只统计**真正新建**订阅的节点数。核心新增 4 个单测覆盖：新建计数、重复添加不重不漏、拉取失败时保留旧节点、refresh 保留存活节点已测健康。
+
+### 11.4 验证
+- `cargo clippy --release -p subhub-core -p subhub-server` 0 警告；`cargo test -p subhub-core -p subhub-server` **42 测试全过**（core 36 + server 6，本轮新增 4）；release 构建通过；`docs/test_subhub.py` 隔离库端到端 **ALL CHECKS PASSED**（含同 URL 重复导入幂等合并用例）。
+
+---
+
+## 12. Round S —— base64 包裹的 URI 列表订阅解析缺失修复
+
+### 12.1 问题（症状）
+用户反馈：订阅 `https://s4.laoda666.com/s/...`（laodavip 式短链）「应该有节点，但 subhub 拉取后显示没节点」。订阅源返回 **200 + base64 文本**，subhub 把它当作一条订阅存下，但节点数为 0、`status` 既非 `error` 也非空——典型的「拉到了却被解析成 0 节点」。
+
+### 12.2 根因（`core/src/parse.rs::parse_subscription_depth`）
+base64 解包分支只在「解码后文本包含 `proxies:` / `outbounds` / `"proxies"`」时才递归下去。这只覆盖**base64 的 clash YAML / sing-box JSON**。而该订阅是 **base64 的 URI 列表**（`vless://uuid@host:port?security=reality&...` 每行一个，解码后**不含**上述 YAML/JSON 标记），于是：
+1. base64 分支不触发；
+2. 后续 URI 解析直接遍历**未解码的 base64 原文**（`raw`），原文里没有 `://` 行 → 解析出 0 个节点。
+
+这是大量「转换订阅 / v2rayN / NekoBox 式短链」的真实形态（base64-of-URIs），旧判定把它们整体漏掉了。
+
+### 12.3 修复
+新增 `looks_like_subscription(text)`，让 base64 解包在遇到「解码后是已知代理 scheme（`vmess`/`vless`/`trojan`/`ss`/`ssr`/`hysteria2`/`hy2`/`hysteria`/`tuic`/`socks5`/`socks`/`http`/`https`）的 URI 列表」时也递归下去：
+
+```rust
+fn looks_like_subscription(text: &str) -> bool {
+    if text.contains("proxies:") || text.contains("\"outbounds\"") || text.contains("\"proxies\"") {
+        return true;
+    }
+    text.lines().any(|l| {
+        let l = l.trim();
+        l.split_once("://").is_some_and(|(scheme, _)| is_known_scheme(scheme))
+    })
+}
+```
+
+原 `proxies:`/`outbounds` 判定作为该函数的第一分支保留，行为不退化；新增的 URI-list 判定用 `is_known_scheme` 复用既有方案白名单，避免把无关 URL 误判为订阅。`text.trim() != raw` 守卫仍防止无限递归，`MAX_B64_DEPTH` 仍封顶嵌套层数。
+
+该修复同时作用于三条入口：`POST /api/subscriptions`（添加）、`do_refresh_one`（刷新）、`import_raw`（粘贴导入），因为它们都调用 `parse_subscription(&text)`。
+
+### 12.4 验证
+- 新增回归测试 `base64_of_uri_list_is_decoded`：base64 编码 `vless://` + `trojan://` URI 列表（模拟该订阅真实形态），断言解析出全部节点且类型正确。
+- `cargo test -p subhub-core --lib parse::tests`：**15 测试全过**（含新增用例）。
+- `cargo clippy --release -p subhub-core`：**0 警告**（新引入的 `map_or` 已改为 `is_some_and`）。
+- `cargo build --release -p subhub-server`：**release 构建通过**。
+- 注：`cargo build --release -p subhub-app` 因当前 `target/release/subhub-app.exe` 被运行中的进程占用（拒绝访问，os error 5）未能覆盖；代码与 server 完全一致，server release 已通过即可验证编译正确性。需退出正在运行的 subhub 后再行覆盖该 exe。
+
+### 12.5 加固：URL-safe base64 + 0 节点诊断（同大类第二例）
+
+用户复报同类现象：`https://qijiavpn.salnc.kuaivpn.app/api/v1/client/subscribe?token=...` 也显示 0 节点。该源从本机环境返回 **403 Forbidden: Invalid Client**（后端按客户端/IP 做了校验，无法直接取到内容），但用户侧能拉到 200——即「拉到了却解析为 0 节点」的同一大类。
+
+进一步排查 `salnc/kuaivpn`（V2Board / Xboard 系面板）订阅的编码习惯，发现上一轮只修了一半：
+
+1. ✅ 已修（§12.3）：base64 包裹的 URI 列表 / clash YAML 不解包。
+2. ⚠️ **未覆盖**：这类面板常用 **URL-safe base64**（`-`/`_` 代替标准字母表的 `+`/`/`）编码。`b64_decode` 只试了 `STANDARD` 字母表 → 解码失败 → base64 解包分支永不触发 → 整份订阅解析为 0 节点。
+
+**修复（`core/src/parse.rs::b64_decode`）**：依次尝试 `STANDARD` / `STANDARD_NO_PAD` / `URL_SAFE` / `URL_SAFE_NO_PAD` 四种字母表，首个成功即返回。该改动对 `parse_vmess` / `parse_ssr` / `extract_subscription_usage` 等所有调用 `b64_decode` 的路径一并生效（vmess 链接等也常用 URL-safe base64）。
+
+**诊断增强（`server/src/lib.rs` 的 `add_subscriptions` 与 `do_refresh_one`）**：订阅**拉取成功（200）但解析为 0 节点**时，打印前 400 字节原始 body 前缀到 stderr，便于确认未识别的格式（base64 变种 / 未支持的 clash 键等）。运行 `subhub-server` 时可直接在终端看到；Tauri 窗口模式日志不直达终端。
+
+### 12.6 验证
+- 新增回归测试 `base64_url_safe_uri_list_is_decoded`：构造**确实含 `-`/`_`** 的 URL-safe base64（尾部注入 `0xFF 0xFF` 使 STANDARD 编码出现 `/`，再替换为 `_`），断言 `parse_subscription` 解析出 2 个节点（vless + trojan）；尾部的非 UTF-8 垃圾行无 `://`，被忽略。
+- `cargo test -p subhub-core --lib parse::tests`：**16 测试全过**（含本轮新增用例）。
+- `cargo clippy --release -p subhub-core`：**0 警告**。
+- `cargo build --release -p subhub-app`：**release 构建通过**（35.11s）；已结束占用 exe 的运行中实例后重编成功。
+
+### 12.7 加固：`anytls://` 协议支持 + 端口后多余 `/` 解析（同大类第三例）
+
+用户复报：粘贴的订阅内容解码后是 **base64 包裹的 `anytls://` URI 列表**（形如 `anytls://df28c004-...@aws.v4.jp.group1.mysterianet.xyz:56147/?type=tcp&insecure=1&fp=chrome&sni=updates.cdn-apple.com#...`），subhub 仍显示 0 节点。
+
+排查发现两处根因：
+
+1. ⚠️ **`anytls` 不在 `is_known_scheme` 内**：`parse_subscription_depth` 的 base64 解包判定 `looks_like_subscription` 依赖 `is_known_scheme`，而后者未收录 `anytls` → 解码后虽是 `anytls://` URI 列表，但 `looks_like_subscription` 返回 false → 解包不触发 → 整份解析为 0 节点。这是该订阅「拉到了却 0 节点」的直接原因（此前误以为 qijiavpn 只是 URL-safe 问题，实际是 anytls 未识别）。
+2. ⚠️ **端口后多余 `/` 导致整条解析失败**：真实链接是 `host:56147/?type=...`，`?` 之前带一个**路径分隔 `/`**。`split_authority` 用 `hostport.rsplitn(2, ':')` 取端口时拿到的是 `56147/`，`u16::parse` 因尾部 `/` 失败 → 返回 `None` → 该节点被整体丢弃。即便修了 `is_known_scheme`，只要 URI 带这个 `/` 仍然 0 节点。
+
+**修复：**
+
+- `core/src/parse.rs`：
+  - `is_known_scheme` 加入 `"anytls"`。
+  - `parse_uri` match 加入 `"anytls" => parse_anytls(&body, name)`，新增 `parse_anytls`：userinfo 即 **password**（anytls 用密码鉴权，不是 uuid），`type`/`network` 取传输，`insecure=1/true` → `skip-cert-verify`，`fp` → `fingerprint`，`sni` → `sni`，`tls` 强制 `true`（AnyTLS 永远走 TLS）。
+  - `split_authority` 在提取端口时**只取前导数字**（`split(|c| !c.is_ascii_digit).next()`），容忍端口后的 `/<path>`，ipv6 分支同样加固。该改动对所有走 `split_authority` 的协议（vless/trojan/hy2/tuic/socks/anytls）一并生效。
+- `core/src/model.rs`：`ProxyType` 新增 `AnyTls` 变体（位于 `Wireguard` 之后、`Other` 之前），`as_str() => "anytls"`；`fingerprint` 的 `Trojan | Hysteria2 | Socks5 | Http | AnyTls` 分支纳入 anytls 凭据；`is_exportable` 中 `Trojan | AnyTls => has(&password)`。
+- `core/src/export.rs`：
+  - `to_clash_value` 新增 `AnyTls` 分支：输出 `password` / `sni` / `client-fingerprint` / `skip-cert-verify`，**不输出顶层 `tls:`**（mihomo 的 anytls outbound 无此开关，输出会被拒）。
+  - `v2ray_outbound` / `singbox_outbound` 对 `AnyTls` 显式 `return None`（v2ray-core / sing-box 均不支持 anytls，跳过而非输出错误的 `direct` outbound）。`to_surge` 走 `_ => continue` 已自然跳过。
+
+### 12.8 验证
+- 新增回归测试：
+  - `parse::tests::anytls_uri_is_parsed`：断言 `anytls://` 解析为 1 节点，server/port/password/`tls=true`/`skip-cert-verify=true`/`sni`/`fingerprint`/name 全部正确（含端口后 `/` 的形态）。
+  - `parse::tests::base64_of_anytls_uri_list_is_decoded`：base64 编码 `anytls://` URI 列表，断言解包后解析出 2 个 anytls 节点。
+  - `export::tests::anytls_to_clash_meta_emits_password_no_top_level_tls`：断言 clash-meta 输出含 `type: anytls` / `password` / `sni` / `skip-cert-verify: true` / `client-fingerprint`，且**不含** `tls:`。
+  - `export::tests::anytls_skipped_in_v2ray_and_singbox`：断言 v2ray 输出为 `[]`、sing-box 不含 anytls 节点（跳过）。
+- `cargo test -p subhub-core --lib`：**42 测试全过**（含本轮 4 个新增用例）。
+- `cargo clippy --release -p subhub-core`：**0 警告**。
+- `cargo build --release -p subhub-app`：**release 构建通过**（1m19s）。

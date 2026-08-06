@@ -26,13 +26,21 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
         return Vec::new();
     }
 
-    // 1) base64-wrapped (most clash subscriptions are base64 of yaml).
-    //    Depth-capped: see MAX_B64_DEPTH.
+    // 1) base64-wrapped. Most clash subscriptions are base64 of a clash YAML,
+    //    but a *lot* of sources (v2rayN / NekoBox / many "generic" sub
+    //    converters, e.g. laodavip-style short links) instead ship base64 of a
+    //    plain URI list (`vmess://`, `vless://`, `ss://` … one per line). Both
+    //    shapes must be unwrapped here, otherwise the URI parser below runs on
+    //    the still-encoded base64 and finds zero nodes. Depth-capped:
+    //    see MAX_B64_DEPTH.
     if depth < MAX_B64_DEPTH {
         if let Ok(decoded) = b64_decode(raw) {
             if decoded.len() <= MAX_B64_DECODED_BYTES {
                 let text = String::from_utf8_lossy(&decoded);
-                if !text.trim().is_empty() && text.trim() != raw && (text.contains("proxies:") || text.contains("\"outbounds\"") || text.contains("\"proxies\"")) {
+                if !text.trim().is_empty()
+                    && text.trim() != raw
+                    && looks_like_subscription(&text)
+                {
                     return parse_subscription_depth(&text, depth + 1);
                 }
             }
@@ -93,8 +101,28 @@ fn is_known_scheme(scheme: &str) -> bool {
     matches!(
         scheme.to_ascii_lowercase().as_str(),
         "vmess" | "vless" | "trojan" | "ss" | "ssr" | "hysteria2" | "hy2" | "hysteria" | "tuic"
-            | "socks5" | "socks" | "http" | "https"
+            | "anytls" | "socks5" | "socks" | "http" | "https"
     )
+}
+
+/// Heuristic used to decide whether a base64-decoded blob is actually a
+/// subscription we should parse, as opposed to a coincidental valid base64
+/// string of unrelated text (which we must NOT recurse into, or we'd throw
+/// away the original plain-text nodes).
+///
+/// True when the text is either a structured clash yaml / sing-box json
+/// (carries `proxies:` / `outbounds`), or a plain URI list (one known proxy
+/// scheme per line). The latter is the common base64-of-URIs shape that the
+/// old `proxies:`-only check silently dropped.
+fn looks_like_subscription(text: &str) -> bool {
+    if text.contains("proxies:") || text.contains("\"outbounds\"") || text.contains("\"proxies\"") {
+        return true;
+    }
+    text.lines().any(|l| {
+        let l = l.trim();
+        l.split_once("://")
+            .is_some_and(|(scheme, _)| is_known_scheme(scheme))
+    })
 }
 
 /// Extract only the `proxies:` block from a YAML-ish document and parse it.
@@ -130,13 +158,25 @@ fn extract_yaml_proxies(raw: &str) -> Vec<Proxy> {
 
 fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     let s = s.trim().replace(['\n', '\r'], "");
-    let s = match base64::engine::general_purpose::STANDARD.decode(&s) {
-        Ok(b) => return Ok(b),
-        Err(_) => s,
-    };
-    // try with padding
-    let pad = format!("{}{}", s, "=".repeat((4 - s.len() % 4) % 4));
-    base64::engine::general_purpose::STANDARD.decode(&pad)
+    // Try every common base64 flavour. V2Board / Xboard / sspanel-style panels
+    // frequently emit URL-safe base64 (`-`/`_` instead of `+`/`/`), and many
+    // sources omit trailing `=` padding. The old decoder only tried the
+    // standard alphabet, so a URL-safe body failed to decode, the base64
+    // unwrap in `parse_subscription_depth` never fired, and the whole
+    // subscription parsed to zero nodes. Try all four combinations (standard /
+    // url-safe × padded / unpadded) and take the first that succeeds.
+    for eng in [
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::STANDARD_NO_PAD,
+        base64::engine::general_purpose::URL_SAFE,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(b) = eng.decode(&s) {
+            return Ok(b);
+        }
+    }
+    // Nothing decoded — surface STANDARD's error for a meaningful message.
+    base64::engine::general_purpose::STANDARD.decode(&s)
 }
 
 /// Parse a clash YAML/JSON document that contains a `proxies:` list.
@@ -354,6 +394,7 @@ pub fn parse_uri(line: &str) -> Option<Proxy> {
         "trojan" => parse_trojan(&body, name),
         "ss" => parse_ss(&body, name),
         "ssr" => parse_ssr(&body, name),
+        "anytls" => parse_anytls(&body, name),
         "hysteria2" | "hy2" | "hysteria" => parse_hy2(&body, name),
         "tuic" => parse_tuic(&body, name),
         "socks5" | "socks" => parse_socks(&body, name, ProxyType::Socks5),
@@ -386,14 +427,25 @@ fn split_authority(body: &str) -> Option<Auth> {
         // ipv6 [::1]:port
         let end = hostport.find(']')?;
         let host = hostport[1..end].to_string();
-        let port: u16 = hostport[end + 1..].trim_start_matches(':').parse().ok()?;
+        // The authority may carry a trailing `/<path>` before the query is
+        // stripped (e.g. `anytls://h:56147/?type=...`); tolerate it by parsing
+        // only the leading digits of the port field.
+        let port: u16 = hostport[end + 1..]
+            .trim_start_matches(':')
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|s| s.parse().ok())?;
         if port == 0 {
             return None;
         }
         (host, port)
     } else {
         let mut it = hostport.rsplitn(2, ':');
-        let port: u16 = it.next()?.parse().ok()?;
+        let port: u16 = it
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|s| s.parse().ok())?;
         let host = it.next()?.to_string();
         if port == 0 {
             return None;
@@ -563,6 +615,31 @@ fn parse_tuic(body: &str, name: Option<String>) -> Option<Proxy> {
     Some(p)
 }
 
+/// Parse an `anytls://` URI (mihomo / Clash.Meta native AnyTLS).
+///
+/// AnyTLS authenticates with a **password** (not a uuid) — the userinfo before
+/// `@` is the password (mihomo's `anytls` outbound has no `uuid` field). The
+/// query carries the same knobs as a vless link: `type`/`network` (transport),
+/// `insecure` (skip-cert-verify), `fp` (client-fingerprint), `sni`. AnyTLS is
+/// always TLS, so `tls` is forced true; mihomo has no top-level `tls:` switch for
+/// it, so the clash exporter deliberately omits one.
+fn parse_anytls(body: &str, name: Option<String>) -> Option<Proxy> {
+    let a = split_authority(body)?;
+    let mut p = Proxy::new(
+        name.unwrap_or_else(|| a.host.clone()),
+        ProxyType::AnyTls,
+        a.host,
+        a.port,
+    );
+    p.password = Some(a.userinfo);
+    p.network = a.query.get("type").or_else(|| a.query.get("network")).cloned();
+    p.tls = Some(true);
+    p.sni = a.query.get("sni").cloned();
+    p.fingerprint = a.query.get("fp").cloned();
+    p.skip_cert_verify = a.query.get("insecure").map(|v| v == "1" || v == "true");
+    Some(p)
+}
+
 fn parse_socks(body: &str, name: Option<String>, t: ProxyType) -> Option<Proxy> {
     let a = split_authority(body)?;
     let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), t, a.host, a.port);
@@ -702,6 +779,81 @@ mod tests {
         assert_eq!(out.len(), 1, "http proxy with userinfo must parse");
         assert_eq!(out[0].server, "1.2.3.4");
         assert_eq!(out[0].port, 8080);
+    }
+
+    #[test]
+    fn base64_of_uri_list_is_decoded() {
+        // A very common shape (v2rayN / NekoBox / laodavip-style short links):
+        // the subscription body is base64 of a plain URI list, NOT a clash
+        // yaml. The old parser only unwrapped base64 when the decoded text
+        // contained `proxies:`, so these subs parsed to zero nodes. The real
+        // laodavip sub is base64-of-`vless://` lines; mirror that here.
+        let uri_list = "vless://e61f9468-4eac-43f2-99e4-ca057b3895de@free.us2.laodavip.com:443?mode=multi&security=reality&type=tcp#US2\r\nvless://e61f9468-4eac-43f2-99e4-ca057b3895de@free.us1.laodavip.com:443?type=tcp#US1\r\ntrojan://pass@hk.example.com:443?security=tls#HK\r\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(uri_list);
+        let out = parse_subscription(&b64);
+        assert_eq!(out.len(), 3, "base64-wrapped URI list must yield its nodes");
+        let types: Vec<&str> = out.iter().map(|p| p.type_.as_str()).collect();
+        assert!(types.contains(&"vless"));
+        assert!(types.contains(&"trojan"));
+    }
+
+    #[test]
+    fn base64_url_safe_uri_list_is_decoded() {
+        // V2Board / Xboard / sspanel panels frequently emit URL-safe base64
+        // (`-`/`_` instead of `+`/`/`). The old decoder only tried the standard
+        // alphabet, so these subs decoded to nothing and parsed to zero nodes.
+        // Build a genuinely URL-safe-only body: append two 0xFF bytes, whose
+        // STANDARD base64 is "////" (index 63 = '/'), then swap '+'/'/' for
+        // '-'/'_'. The trailing non-UTF8 junk decodes to replacement chars on a
+        // line with no `://` and is ignored, so the node count stays 2.
+        let mut bytes: Vec<u8> = b"vless://e61f9468-4eac-43f2-99e4-ca057b3895de@free.us2.laodavip.com:443?type=tcp#US2\r\ntrojan://pass@hk.example.com:443?security=tls#HK\r\n".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        let std = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(
+            std.contains('+') || std.contains('/'),
+            "test setup: need a '+' or '/' to make a URL-safe form"
+        );
+        let b64 = std.replace('+', "-").replace('/', "_");
+        assert_ne!(b64, std, "test setup: body must be genuinely URL-safe");
+        let out = parse_subscription(&b64);
+        assert_eq!(out.len(), 2, "URL-safe base64 URI list must yield its nodes");
+        let types: Vec<&str> = out.iter().map(|p| p.type_.as_str()).collect();
+        assert!(types.contains(&"vless"));
+        assert!(types.contains(&"trojan"));
+    }
+
+    #[test]
+    fn anytls_uri_is_parsed() {
+        // AnyTLS authenticates with a password (NOT a uuid); the userinfo
+        // before `@` is the password. The node in the third failing sub is
+        // base64-of-`anytls://` URIs. Mirror that shape here.
+        let line = "anytls://df28c004-87ca-40fb-ae5a-3b4ce9fb8654@aws.v4.jp.group1.mysterianet.xyz:56147/?type=tcp&insecure=1&fp=chrome&sni=updates.cdn-apple.com#JP-AWS";
+        let out = parse_subscription(line);
+        assert_eq!(out.len(), 1, "anytls:// URI must parse to one node");
+        let p = &out[0];
+        assert_eq!(p.type_, ProxyType::AnyTls);
+        assert_eq!(p.server, "aws.v4.jp.group1.mysterianet.xyz");
+        assert_eq!(p.port, 56147);
+        assert_eq!(p.password.as_deref(), Some("df28c004-87ca-40fb-ae5a-3b4ce9fb8654"));
+        // always TLS
+        assert_eq!(p.tls, Some(true));
+        // insecure=1 -> skip-cert-verify
+        assert_eq!(p.skip_cert_verify, Some(true));
+        assert_eq!(p.sni.as_deref(), Some("updates.cdn-apple.com"));
+        assert_eq!(p.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(p.name, "JP-AWS");
+    }
+
+    #[test]
+    fn base64_of_anytls_uri_list_is_decoded() {
+        // The real-world failing case: the body is base64 of an `anytls://`
+        // URI list. The old `is_known_scheme` set did not include `anytls`, so
+        // the base64 unwrap never fired and the sub parsed to zero nodes.
+        let uri_list = "anytls://df28c004-87ca-40fb-ae5a-3b4ce9fb8654@aws.v4.jp.group1.mysterianet.xyz:56147/?type=tcp&insecure=1&fp=chrome&sni=updates.cdn-apple.com#JP-AWS\r\nanytls://abc123@hk.example.com:443/?insecure=0&sni=hk.example.com#HK\r\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(uri_list);
+        let out = parse_subscription(&b64);
+        assert_eq!(out.len(), 2, "base64-wrapped anytls URI list must yield its nodes");
+        assert!(out.iter().all(|p| p.type_ == ProxyType::AnyTls));
     }
 
     #[test]

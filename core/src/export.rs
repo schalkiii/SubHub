@@ -117,6 +117,16 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "password", &p.password);
             insert_opt(&mut m, "sni", &p.sni);
         }
+        ProxyType::AnyTls => {
+            // AnyTLS authenticates with a password (not a uuid). It is always
+            // TLS, but mihomo's `anytls` outbound has *no* top-level `tls:`
+            // switch — emitting one would be rejected — so we deliberately
+            // omit it. `client-fingerprint` carries the `fp` query param.
+            insert_opt(&mut m, "password", &p.password);
+            insert_opt(&mut m, "sni", &p.sni);
+            insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
+            insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
+        }
         ProxyType::Socks5 | ProxyType::Http => {
             if let Some(extra) = &p.extra {
                 if let Some(u) = extra.get("user").and_then(|x| x.as_str()) {
@@ -260,7 +270,9 @@ fn v2ray_outbound(p: &Proxy) -> Option<serde_json::Value> {
         }),
         // V2Ray core cannot represent these protocols as outbounds — skip
         // rather than emit a `freedom` (direct) outbound that would break the
-        // node's connectivity.
+        // node's connectivity. This includes AnyTLS, which v2ray-core does not
+        // support at all.
+        ProxyType::AnyTls => return None,
         _ => return None,
     };
     Some(v)
@@ -416,6 +428,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             None
         }
         _ => {
+            // AnyTLS is unsupported by sing-box as well as v2ray-core.
             eprintln!(
                 "[export] sing-box 不支持的节点类型 {:?}「{}」，已跳过",
                 p.type_,
@@ -541,5 +554,39 @@ mod tests {
         // wireguard is unsupported and must be skipped (4 of 5 nodes exported).
         let count = out.matches("\"tag\": \"node\"").count();
         assert_eq!(count, 4, "wireguard should be skipped (4 of 5 nodes exported)");
+    }
+
+    #[test]
+    fn anytls_to_clash_meta_emits_password_no_top_level_tls() {
+        // AnyTLS → clash-meta must carry `password`, `sni`, `skip-cert-verify`,
+        // `client-fingerprint`, and NO top-level `tls:` key (mihomo rejects one).
+        let mut p = mk(ProxyType::AnyTls, "aws.host.xyz", 56147);
+        p.password = Some("df28c004-87ca-40fb-ae5a-3b4ce9fb8654".into());
+        p.sni = Some("updates.cdn-apple.com".into());
+        p.fingerprint = Some("chrome".into());
+        p.skip_cert_verify = Some(true);
+
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(yaml.contains("type: anytls"), "type must be anytls");
+        assert!(yaml.contains("password: df28c004-87ca-40fb-ae5a-3b4ce9fb8654"));
+        assert!(yaml.contains("sni: updates.cdn-apple.com"));
+        assert!(yaml.contains("skip-cert-verify: true"));
+        assert!(yaml.contains("client-fingerprint: chrome"));
+        // mihomo's anytls outbound has no tls: switch — must be absent.
+        assert!(!yaml.contains("tls:"), "anytls must not emit a top-level tls key");
+    }
+
+    #[test]
+    fn anytls_skipped_in_v2ray_and_singbox() {
+        // v2ray-core / sing-box have no anytls support — exporting must skip
+        // (return None), not emit a broken `direct` outbound.
+        let mut p = mk(ProxyType::AnyTls, "aws.host.xyz", 56147);
+        p.password = Some("pw".into());
+
+        let v2 = super::to_v2ray_json(&[p.clone()]);
+        let sb = super::to_singbox_json(&[p]);
+        assert_eq!(v2, "[]", "v2ray must skip anytls (empty array)");
+        assert!(!sb.contains("\"anytls\""), "sing-box must skip anytls");
+        assert!(!sb.contains("\"aws.host.xyz\""), "sing-box must skip anytls node");
     }
 }
