@@ -154,6 +154,7 @@ pub async fn engine_http_latency(
 
     timeout_ms: u64,
     concurrency: usize,
+    on_progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Vec<Option<u64>> {
 
     if !std::path::Path::new(bin).exists() {
@@ -168,11 +169,17 @@ pub async fn engine_http_latency(
     let mut tasks = Vec::new();
     for p in proxies {
         let permit = sem.clone().acquire_owned().await.unwrap();
+        let name = p.name.clone();
         let p = p.clone();
         let bin = bin.to_string();
+        let cb = on_progress.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            engine_latency_one(p, bin, timeout_ms).await
+            let r = engine_latency_one(p, bin, timeout_ms).await;
+            if let Some(cb) = cb {
+                cb(name);
+            }
+            r
         }));
     }
 
@@ -433,6 +440,7 @@ pub async fn engine_bandwidth(
 
     timeout_ms: u64,
     concurrency: usize,
+    on_progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Vec<Option<f64>> {
 
     if !std::path::Path::new(bin).exists() {
@@ -447,11 +455,17 @@ pub async fn engine_bandwidth(
     let mut tasks = Vec::new();
     for p in proxies {
         let permit = sem.clone().acquire_owned().await.unwrap();
+        let name = p.name.clone();
         let p = p.clone();
         let bin = bin.to_string();
+        let cb = on_progress.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            bandwidth_one(p, bin, timeout_ms).await
+            let r = bandwidth_one(p, bin, timeout_ms).await;
+            if let Some(cb) = cb {
+                cb(name);
+            }
+            r
         }));
     }
 

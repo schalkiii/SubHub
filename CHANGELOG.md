@@ -14,9 +14,11 @@
 - `/api/speedtest` 由 `POST`（body）改为 `GET`（query：`timeout_ms` / `concurrency` / `mode`）。
 - WebUI 地区列取值顺序：`outbound_country || region || "OTHER"`。
 - `tcp_ping_all` 进度回调签名为 `Option<&(dyn Fn(TestProgress) + Sync)>`。
+- `engine_http_latency` / `engine_bandwidth` 新增 `on_progress` 回调参数（逐节点回报进度）。
 
 ### Fixed
 - 测速接口 405 Method Not Allowed（路由 POST → GET）。
+- **测速进度「到 x/x 不结束」**：原进度仅统计 TCP 阶段，配置引擎后「HTTP 延迟 + 带宽」阶段静默运行、无反馈。现进度总量贯穿三阶段（无引擎 `total=节点数`；有引擎 `total=节点数×3`），引擎两阶段经 `on_progress` 逐节点回报，带 `phase` 字段；进度条真正到 100% 才结束。
 - `region()` 曾把 `russia` 误判为 `us`（整词 token 匹配修复）；真实节点库 OTHER 由 1122 降至 701。
 
 ## [P10] 全局排序 + 设置页 + 增量测速 + 合并防覆盖
