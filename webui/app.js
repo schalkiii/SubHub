@@ -19,9 +19,9 @@ const del = (path) => api(path, { method: "DELETE" });
 
 // ---- global progress / hint banner ----
 // Shows an indeterminate progress bar + descriptive text during long
-// operations (add / import / speedtest / refresh / detect / cleanup). The
-// backend runs each op synchronously and returns once done, so this is an
-// indeterminate indicator with a clear, operation-specific hint.
+// operations (add / import / refresh / detect / cleanup). The backend runs
+// each op synchronously and returns once done, so this is an indeterminate
+// indicator with a clear, operation-specific hint.
 function showProgress(text) {
   const el = document.getElementById("progress");
   document.getElementById("progress-text").textContent = text;
@@ -29,6 +29,33 @@ function showProgress(text) {
 }
 function hideProgress() {
   document.getElementById("progress").classList.add("hidden");
+  // 收起测速专用的实时进度区（仅测速时短暂显示）
+  const detail = document.getElementById("progress-detail");
+  if (detail) detail.classList.add("hidden");
+}
+// 测速专用：显示实时进度条 + 当前被测节点区，并重置进度
+function showSpeedProgress(text) {
+  showProgress(text);
+  const detail = document.getElementById("progress-detail");
+  if (detail) detail.classList.remove("hidden");
+  const fill = document.getElementById("progress-fill");
+  if (fill) fill.style.width = "0%";
+  const cur = document.getElementById("progress-current");
+  if (cur) cur.textContent = "";
+}
+// 根据单个 Progress 事件刷新进度条与“当前节点”行
+function updateSpeedProgress(ev) {
+  const { done, total, name, available, latency_ms, bandwidth_bps } = ev;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  const fill = document.getElementById("progress-fill");
+  if (fill) fill.style.width = pct + "%";
+  const cur = document.getElementById("progress-current");
+  if (cur) {
+    const lat = latency_ms != null ? latency_ms + " ms" : "超时";
+    const bw = bandwidth_bps != null ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s" : "—";
+    const status = available ? "✓" : "✗";
+    cur.textContent = `(${done}/${total}) ${status} ${name} · ${lat} · ${bw}`;
+  }
 }
 
 // ---- nav ----
@@ -596,6 +623,9 @@ async function loadSettings() {
     document.getElementById("use-proxy").checked = !!s.use_proxy;
     const minInput = document.getElementById("auto-refresh-min");
     if (minInput) minInput.value = Math.round((s.auto_refresh_sec || 0) / 60);
+    // Prefill the node-health re-test interval (persisted setting, minutes).
+    const healthInput = document.getElementById("health-check-min");
+    if (healthInput) healthInput.value = Math.round((s.node_health_check_sec || 0) / 60);
     // Prefill the "pull proxy" box from the server-side default (single source
     // of truth, persisted in the meta table — replaces the old browser-local
     // "remember" checkbox).
@@ -646,6 +676,26 @@ document.getElementById("btn-save-refresh").addEventListener("click", async () =
       r.auto_refresh_sec > 0
         ? `已保存：每 ${Math.round(r.auto_refresh_sec / 60)} 分钟自动刷新`
         : "已保存：已关闭定时刷新";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "保存失败：" + err.message;
+  }
+});
+
+// Save the node-health periodic re-test interval (minutes -> seconds). A
+// separate, independent toggle from subscription auto-refresh; the scheduler
+// reads /api/settings live, so no restart is needed.
+document.getElementById("btn-save-health").addEventListener("click", async () => {
+  const min = parseInt(document.getElementById("health-check-min").value, 10);
+  const sec = (isNaN(min) ? 0 : Math.max(0, min)) * 60;
+  const el = document.getElementById("health-save-result");
+  try {
+    const r = await postJson("/api/settings", { node_health_check_sec: sec });
+    el.style.color = "";
+    el.textContent =
+      r.node_health_check_sec > 0
+        ? `已保存：每 ${Math.round(r.node_health_check_sec / 60)} 分钟自动重测节点健康`
+        : "已保存：已关闭节点健康定时重测";
   } catch (err) {
     el.style.color = "var(--danger, #ef4444)";
     el.textContent = "保存失败：" + err.message;
@@ -748,8 +798,8 @@ async function loadNodes(page) {
     // blank list (which reads as "you have no nodes").
     const tbody = document.querySelector("#nodes-table tbody");
     if (tbody) {
-      tbody.innerHTML =
-        `<tr><td colspan="12" style="text-align:center;color:var(--danger,#ef4444);padding:16px">` +
+        tbody.innerHTML =
+        `<tr><td colspan="13" style="text-align:center;color:var(--danger,#ef4444);padding:16px">` +
         `节点列表加载失败：${escapeHtml(err.message)}（可点击「刷新」重试）</td></tr>`;
     }
     return;
@@ -820,13 +870,14 @@ function renderNodes(list) {
       <td><span class="tag">${p.type_}</span></td>
       <td>${escapeHtml(p.server)}</td>
       <td>${p.port}</td>
-      <td>${escapeHtml(p.region || "OTHER")}</td>
+      <td>${escapeHtml(p.outbound_country || p.region || "OTHER")}</td>
       <td>${escapeHtml(p.outbound_country || "—")}</td>
       <td class="${latencyClass(p.latency_ms)}">${lat}</td>
       <td>${speed}</td>
       <td class="unlock-cell">${escapeHtml(unlock)}</td>
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
+      <td class="row-actions"><button class="btn btn-del-node" data-sub="${escapeHtml(p.sub_id)}" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" title="删除该节点">✕</button></td>
     </tr>`;
   };
 
@@ -841,7 +892,7 @@ function renderNodes(list) {
     tbody.innerHTML = ordered
       .map((name) => {
         const rows = groups[name].map(rowHtml).join("");
-        return `<tr class="group-row"><td colspan="12">${escapeHtml(name)} · ${groups[name].length} 个节点</td></tr>${rows}`;
+        return `<tr class="group-row"><td colspan="13">${escapeHtml(name)} · ${groups[name].length} 个节点</td></tr>${rows}`;
       })
       .join("");
   } else {
@@ -911,6 +962,27 @@ document.querySelector("#nodes-table thead").addEventListener("click", (e) => {
   if (th) sortNodes(th.dataset.sort);
 });
 
+// delegated delete handler for the per-node "✕" buttons (rows are re-rendered
+// on every load, so we listen on the stable table element instead).
+document.getElementById("nodes-table").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".btn-del-node");
+  if (!btn) return;
+  const name = btn.dataset.name || "该节点";
+  if (!confirm(`确定从「${btn.dataset.sub}」删除节点「${name}」？`)) return;
+  btn.disabled = true;
+  try {
+    await postJson("/api/proxies/delete", {
+      sub_id: btn.dataset.sub,
+      fingerprint: btn.dataset.fp,
+    });
+    await loadNodes();
+    loadDashboard();
+  } catch (err) {
+    alert("删除失败：" + err.message);
+    btn.disabled = false;
+  }
+});
+
 document.getElementById("btn-speedtest").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   const resultEl = document.getElementById("speedtest-result");
@@ -918,30 +990,47 @@ document.getElementById("btn-speedtest").addEventListener("click", async (e) => 
   if (resultEl) resultEl.textContent = "";
   const mode = document.getElementById("test-mode").value;
   const modeText = mode === "untested" ? "未测过的节点" : mode === "failed" ? "测速失败的节点" : "全部节点";
-  showProgress(`正在测速${modeText}（TCP 延迟 + 速度估算；配置测速引擎可得真实带宽，可能需要一会儿）…`);
+  showSpeedProgress(`正在测速${modeText}（TCP 延迟 + 速度估算；配置测速引擎可得真实带宽，可能需要一会儿）…`);
+  const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20, mode });
   try {
-    const r = await postJson("/api/speedtest", { timeout_ms: 4000, concurrency: 20, mode });
-    const results = Array.isArray(r) ? r : r.results;
+    const resp = await fetch(`/api/speedtest?${params.toString()}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    // 按 SSE 逐事件读取：Progress（进度）/ Done（汇总）
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let summary = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          let ev;
+          try { ev = JSON.parse(payload); } catch { continue; }
+          if (ev.type === "Progress") {
+            updateSpeedProgress(ev);
+          } else if (ev.type === "Done") {
+            summary = ev;
+          }
+        }
+      }
+    }
     await loadNodes();
     loadDashboard();
-    if (resultEl) {
-      if (!results || results.length === 0) {
-        resultEl.textContent = `当前范围内没有可测速的节点（范围：${modeText}）`;
-      } else {
-        const tested = results.length;
-        const reachable = results.filter((x) => x.available).length;
-        const lat = results.filter((x) => x.tcp_latency_ms != null).map((x) => x.tcp_latency_ms);
-        const avg = lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null;
-        const withHttp = results.filter((x) => x.http_latency_ms != null).length;
-        const withBw = results.filter((x) => x.download_speed_bps != null).length;
-        let msg =
-          `测速完成：共 ${tested} 个，可达 ${reachable} 个，` +
-          `平均延迟 ${avg != null ? avg + " ms" : "—"}（含 HTTP 延迟 ${withHttp} 个，带宽 ${withBw} 个）`;
-        if (r && r.removed > 0) {
-          msg += `；已自动移除连续不可用节点 ${r.removed} 个（阈值 ${r.threshold} 次）`;
-        }
-        resultEl.textContent = msg;
-      }
+    if (resultEl && summary) {
+      const { tested, reachable, avg_latency_ms, with_http, with_bw, removed, threshold } = summary;
+      let msg =
+        `测速完成：共 ${tested} 个，可达 ${reachable} 个，` +
+        `平均延迟 ${avg_latency_ms != null ? avg_latency_ms + " ms" : "—"}（含 HTTP 延迟 ${with_http} 个，带宽 ${with_bw} 个）`;
+      if (removed > 0) msg += `；已自动移除连续不可用节点 ${removed} 个（阈值 ${threshold} 次）`;
+      resultEl.textContent = msg;
     }
   } catch (err) {
     alert("测速失败: " + err.message);

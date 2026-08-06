@@ -1,6 +1,7 @@
 use crate::model::Proxy;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,20 +81,44 @@ fn measure_send_throughput(stream: &mut TcpStream, budget: Duration) -> Option<f
     }
 }
 
+/// Per-node progress emitted by `tcp_ping_all` as each node finishes. `done` is
+/// the running completion count; `total` the node set size. Streamed to the
+/// WebUI so the speed-test view can show a live progress bar plus the node
+/// currently being reported (name + ping + TCP throughput estimate).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TestProgress {
+    pub done: usize,
+    pub total: usize,
+    pub name: String,
+    pub available: bool,
+    pub latency_ms: Option<u64>,
+    pub bandwidth_bps: Option<f64>,
+}
+
 /// Run TCP ping for every proxy with bounded concurrency. Returns one result
-/// per proxy, order not guaranteed.
-pub fn tcp_ping_all(proxies: &[Proxy], timeout_ms: u64, concurrency: usize) -> Vec<SpeedTestResult> {
+/// per proxy, order not guaranteed. When `on_progress` is `Some`, it is invoked
+/// once per completed node (synchronously, inside a worker thread) so callers
+/// can stream live progress. The callback is `Sync` because it is shared across
+/// the worker threads.
+pub fn tcp_ping_all(
+    proxies: &[Proxy],
+    timeout_ms: u64,
+    concurrency: usize,
+    on_progress: Option<&(dyn Fn(TestProgress) + Sync)>,
+) -> Vec<SpeedTestResult> {
     if proxies.is_empty() {
         return Vec::new();
     }
     let concurrency = concurrency.clamp(1, 64);
     let (tx, rx) = std::sync::mpsc::channel::<SpeedTestResult>();
     let queue: &Mutex<usize> = &Mutex::new(0usize);
+    let done = Arc::new(AtomicUsize::new(0));
     let timeout = Duration::from_millis(timeout_ms);
 
     thread::scope(|s| {
         for _ in 0..concurrency {
             let tx = tx.clone();
+            let done = Arc::clone(&done);
             s.spawn(move || {
                 loop {
                     let i = {
@@ -110,6 +135,17 @@ pub fn tcp_ping_all(proxies: &[Proxy], timeout_ms: u64, concurrency: usize) -> V
                     };
                     let p = &proxies[i];
                     let r = test_one(p, timeout);
+                    if let Some(cb) = on_progress {
+                        let done_n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        cb(TestProgress {
+                            done: done_n,
+                            total: proxies.len(),
+                            name: r.name.clone(),
+                            available: r.available,
+                            latency_ms: r.tcp_latency_ms,
+                            bandwidth_bps: r.download_speed_bps,
+                        });
+                    }
                     let _ = tx.send(r);
                 }
             });

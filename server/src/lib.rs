@@ -4,6 +4,8 @@ use axum::{
 
     http::{header, HeaderValue, StatusCode},
 
+    response::sse::{Event, Sse},
+
     routing::{delete, get, post},
 
     Json, Router,
@@ -13,6 +15,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
+use futures::stream;
 
 use std::net::SocketAddr;
 
@@ -137,6 +141,13 @@ pub struct AppState {
     /// Runtime-configurable via /api/settings and persisted to the meta table,
     /// so it can change without restarting the server.
     pub auto_refresh_sec: Arc<Mutex<u64>>,
+
+    /// independent node-health re-test interval (seconds). 0 = disabled. Unlike
+    /// `auto_refresh_sec` (which re-fetches subscription *content* and only tests
+    /// brand-new nodes), this scheduler periodically re-probes the connectivity /
+    /// latency of EVERY node so previously-tested nodes get their availability
+    /// refreshed on a timer. Runtime-configurable + persisted like the above.
+    pub node_health_check_sec: Arc<Mutex<u64>>,
 
     /// default upstream proxy used to prefill the "pull proxy" box and as a
     /// fallback when adding a subscription without an explicit proxy. Persisted
@@ -372,20 +383,41 @@ pub struct SpeedTestReq {
 
 }
 
-/// Wrapper for `POST /api/speedtest` so the WebUI can show how many nodes were
-/// auto-removed by the "remove after N consecutive failures" rule.
+
+
+/// Live speed-test progress event, streamed to the WebUI over SSE so the test
+/// view can show a progress bar and the node currently being reported. One
+/// `Progress` is emitted per completed node; a single `Done` closes the stream
+/// with the run summary. `type` is the SSE event name (`progress` / `done`).
 #[derive(Serialize)]
+#[serde(tag = "type")]
+enum SpeedEvent {
+    Progress(ProgressView),
+    Done(SummaryView),
+}
 
-pub struct SpeedTestResp {
+/// One node's in-progress result (emitted as the `progress` SSE event).
+#[derive(Serialize)]
+struct ProgressView {
+    done: usize,
+    total: usize,
+    name: String,
+    available: bool,
+    latency_ms: Option<u64>,
+    bandwidth_bps: Option<f64>,
+}
 
-    pub results: Vec<SpeedTestResult>,
-
-    /// nodes removed this run because they hit the `remove_after_fails` threshold
-    pub removed: usize,
-
-    /// the active threshold that was applied (0 = auto-remove disabled)
-    pub threshold: u64,
-
+/// Final summary (emitted as the `done` SSE event) — mirrors the old
+/// per-node result shape so the WebUI can render the same post-run message.
+#[derive(Serialize)]
+struct SummaryView {
+    tested: usize,
+    reachable: usize,
+    avg_latency_ms: Option<u64>,
+    with_http: usize,
+    with_bw: usize,
+    removed: usize,
+    threshold: u64,
 }
 
 
@@ -415,6 +447,10 @@ pub struct SettingsResp {
     /// auto-refresh interval in seconds for remote subscriptions (0 = disabled)
     pub auto_refresh_sec: u64,
 
+    /// node-health re-test interval in seconds (0 = disabled). Independent of
+    /// `auto_refresh_sec`: re-probes every node's connectivity/latency on a timer.
+    pub node_health_check_sec: u64,
+
     /// default upstream proxy prefilled into the "pull proxy" box (server-side
     /// source of truth, replaces the old browser-local "remember" checkbox)
     pub default_fetch_proxy: Option<String>,
@@ -440,6 +476,9 @@ pub struct SettingsReq {
 
     /// optional: when present, updates the auto-refresh interval (seconds)
     pub auto_refresh_sec: Option<u64>,
+
+    /// optional: when present, updates the node-health re-test interval (seconds)
+    pub node_health_check_sec: Option<u64>,
 
     /// optional: when present, updates the default pull proxy (empty string
     /// clears it)
@@ -754,13 +793,11 @@ async fn run_speedtest_core(
 
 ) -> (Vec<SpeedTestResult>, Vec<Option<u64>>, Vec<Option<f64>>) {
 
-    let engine_bin = engine_bin_of(state);
-
     let proxies_tcp = proxies.to_vec();
 
     let tcp_results = tokio::task::spawn_blocking(move || {
 
-        subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency)
+        subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, None)
 
     })
 
@@ -770,28 +807,69 @@ async fn run_speedtest_core(
 
 
 
-    // Run the HTTP-latency and bandwidth engine passes concurrently instead of
-    // sequentially — they share the same (clamped) engine-worker budget, so
-    // running them at the same time roughly halves the engine portion of a
-    // speedtest and removes the "tested 10 then nothing happens" feel.
-    let (engine_http, engine_bw) = if let Some(bin) = engine_bin.clone() {
-
-        let bin_http = bin.clone();
-        let bin_bw = bin.clone();
-        let proxies_http = proxies.to_vec();
-        let proxies_bw = proxies.to_vec();
-        let (h, b) = tokio::join!(
-            engine::engine_http_latency(&proxies_http, &bin_http, timeout_ms, concurrency),
-            engine::engine_bandwidth(&proxies_bw, &bin_bw, timeout_ms, concurrency),
-        );
-        (h, b)
-    } else {
-        (vec![None; proxies.len()], vec![None; proxies.len()])
-    };
-
-
+    let (engine_http, engine_bw) = run_engine_passes(state, proxies, timeout_ms, concurrency).await;
 
     (tcp_results, engine_http, engine_bw)
+
+}
+
+
+
+/// Engine HTTP-latency + bandwidth passes (run concurrently, share the same
+
+/// clamped engine-worker budget). Returns `(http_latency, bandwidth)` aligned
+
+/// with `proxies` order. Skipped entirely (all `None`) when no engine binary is
+
+/// configured — in that case the caller falls back to the TCP throughput estimate.
+
+async fn run_engine_passes(
+
+    state: &AppState,
+
+    proxies: &[Proxy],
+
+    timeout_ms: u64,
+
+    concurrency: usize,
+
+) -> (Vec<Option<u64>>, Vec<Option<f64>>) {
+
+    let engine_bin = engine_bin_of(state);
+
+    // Run the HTTP-latency and bandwidth engine passes concurrently instead of
+
+    // sequentially — they share the same (clamped) engine-worker budget, so
+
+    // running them at the same time roughly halves the engine portion of a
+
+    // speedtest and removes the "tested 10 then nothing happens" feel.
+
+    if let Some(bin) = engine_bin {
+
+        let bin_http = bin.clone();
+
+        let bin_bw = bin.clone();
+
+        let proxies_http = proxies.to_vec();
+
+        let proxies_bw = proxies.to_vec();
+
+        let (h, b) = tokio::join!(
+
+            engine::engine_http_latency(&proxies_http, &bin_http, timeout_ms, concurrency),
+
+            engine::engine_bandwidth(&proxies_bw, &bin_bw, timeout_ms, concurrency),
+
+        );
+
+        (h, b)
+
+    } else {
+
+        (vec![None; proxies.len()], vec![None; proxies.len()])
+
+    }
 
 }
 
@@ -932,6 +1010,37 @@ fn persist_all(state: &AppState) {
 
 }
 
+
+
+/// Periodic node-health re-test (the "节点健康定时重测" scheduler). Unlike a
+/// full speedtest it runs the engine-free TCP ping only (latency +
+/// reachability), which is the core health signal and stays bounded by
+/// `tcp_ping_all`'s internal worker queue — a large node set is tested as a
+/// controlled stream rather than all sockets at once. The external engine
+/// (real HTTP latency / bandwidth) is intentionally skipped here so the
+/// background loop stays light instead of spawning one engine process per node.
+/// The `remove_after_fails` threshold still applies, so nodes that fail N
+/// consecutive checks get pruned by this path too.
+async fn run_health_check_core(
+    state: &AppState,
+    proxies: &[Proxy],
+    timeout_ms: u64,
+    concurrency: usize,
+) -> usize {
+    if proxies.is_empty() {
+        return 0;
+    }
+    let proxies_tcp = proxies.to_vec();
+    let tcp_results = tokio::task::spawn_blocking(move || {
+        subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, None)
+    })
+    .await
+    .unwrap_or_default();
+    // TCP-only: no engine HTTP latency / bandwidth to fold in.
+    let none_u64: Vec<Option<u64>> = vec![None; proxies.len()];
+    let none_f64: Vec<Option<f64>> = vec![None; proxies.len()];
+    persist_results(state, proxies, &tcp_results, &none_u64, &none_f64)
+}
 
 
 /// Build a subscription summary (recomputing derived health from proxies).
@@ -1299,6 +1408,19 @@ async fn add_subscriptions(
                 sub.health.last_updated_at = Some(now);
                 sub.health.last_error = None;
                 eprintln!("fetched {}: {n} nodes", redact_url(url));
+                if n == 0 {
+                    // Diagnostics: a 200 response that parsed to zero nodes is
+                    // almost always an unrecognised body format (e.g. a base64
+                    // flavour or a clash key we don't unwrap). Dump the first
+                    // 400 bytes so the operator can identify the shape.
+                    let snippet: String = text.chars().take(400).collect();
+                    eprintln!(
+                        "  [subhub] warning: 0 nodes parsed from {}. body prefix ({}B): {:?}",
+                        redact_url(url),
+                        snippet.len(),
+                        snippet
+                    );
+                }
             }
 
             Err(e) => {
@@ -1582,6 +1704,60 @@ async fn list_subscriptions(
 
 
 
+/// Request to delete a single node from a subscription. `fingerprint` is the
+/// stable per-node identity produced by `Proxy::fingerprint` (surfaced by
+/// `GET /api/proxies` as the `fingerprint` field), so renaming a node never
+/// breaks the match.
+#[derive(Deserialize)]
+struct DeleteProxyReq {
+    sub_id: String,
+    fingerprint: String,
+}
+
+/// Delete one node from its owning subscription. Unlike `delete_subscription`
+/// (which drops the whole group), this removes just the targeted proxy and
+/// recomputes that subscription's derived health. Returns 404 when the
+/// subscription or the node (by fingerprint) is not found.
+async fn delete_proxy(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteProxyReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut found = false;
+    let mut sub_name = String::new();
+    {
+        let mut guard = state.store.lock_ok();
+        if let Some(sub) = guard.iter_mut().find(|s| s.id == req.sub_id) {
+            let before = sub.proxies.len();
+            sub.proxies.retain(|p| p.fingerprint() != req.fingerprint);
+            found = sub.proxies.len() != before;
+            if found {
+                sub.health.recompute(&sub.proxies);
+                sub_name = sub.name.clone();
+            }
+        }
+    }
+    if found {
+        persist_all(&state);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "removed": 1,
+                "sub_id": req.sub_id,
+                "sub_name": sub_name,
+            })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "not_found",
+                "sub_id": req.sub_id,
+            })),
+        )
+    }
+}
+
 async fn delete_subscription(
 
     State(state): State<AppState>,
@@ -1717,9 +1893,19 @@ async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_json::Value>
 
             Ok((text, userinfo)) => {
                 let proxies = parse_subscription(&text);
+                let empty = proxies.is_empty();
                 let usage = usage_from_sources(&userinfo, &text);
                 fetched = Some(proxies);
                 usage_hint = Some(usage);
+                if empty {
+                    let snippet: String = text.chars().take(400).collect();
+                    eprintln!(
+                        "  [subhub] warning: refresh of {} parsed 0 nodes. body prefix ({}B): {:?}",
+                        redact_url(&url),
+                        snippet.len(),
+                        snippet
+                    );
+                }
             }
 
             Err(e) => fetch_err = Some(e),
@@ -2039,6 +2225,11 @@ async fn list_proxies(
 
                 obj.insert("sub_name".into(), serde_json::Value::String(sub.name.clone()));
 
+                // Stable per-node identity (`Proxy::fingerprint`) so the WebUI
+                // can target a single node for deletion without relying on a
+                // name that the user might rename.
+                obj.insert("fingerprint".into(), serde_json::Value::String(p.fingerprint()));
+
                 // `region` is a computed method on `Proxy`, not a serialized
 
                 // field — surface it here so the WebUI can read `p.region`
@@ -2298,6 +2489,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
 
         auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
 
+        node_health_check_sec: *state.node_health_check_sec.lock_ok(),
+
         default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
 
         top_n: *state.top_n.lock_ok(),
@@ -2338,6 +2531,18 @@ async fn set_settings(
 
     }
 
+    if let Some(sec) = req.node_health_check_sec {
+
+        *state.node_health_check_sec.lock_ok() = sec;
+
+        if let Some(db) = &state.db {
+
+            db.meta_set("node_health_check_sec", &sec.to_string());
+
+        }
+
+    }
+
     // default pull-proxy: empty string clears it (None), otherwise stored as-is
     if let Some(p) = &req.default_fetch_proxy {
         let val = p.trim();
@@ -2367,21 +2572,23 @@ async fn set_settings(
     }
 
     // Auto-remove threshold: 0 disables auto-removal (the safe default).
-    if let Some(n) = req.remove_after_fails {
-        let n = n.min(1000); // sanity cap; 1000 consecutive failures is absurd
-        *state.remove_after_fails.lock_ok() = n;
-        if let Some(db) = &state.db {
-            db.meta_set("remove_after_fails", &n.to_string());
+        if let Some(n) = req.remove_after_fails {
+            let n = n.min(1000); // sanity cap; 1000 consecutive failures is absurd
+            *state.remove_after_fails.lock_ok() = n;
+            if let Some(db) = &state.db {
+                db.meta_set("remove_after_fails", &n.to_string());
+            }
         }
-    }
 
-    Json(SettingsResp {
+        Json(SettingsResp {
 
-        use_proxy: *state.use_proxy.lock_ok(),
+            use_proxy: *state.use_proxy.lock_ok(),
 
-        auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
+            auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
 
-        default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
+            node_health_check_sec: *state.node_health_check_sec.lock_ok(),
+
+            default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
 
         top_n: *state.top_n.lock_ok(),
 
@@ -2719,71 +2926,92 @@ async fn speedtest(
 
     State(state): State<AppState>,
 
-    Json(req): Json<SpeedTestReq>,
+    Query(req): Query<SpeedTestReq>,
 
-) -> Json<SpeedTestResp> {
+) -> Sse<impl stream::Stream<Item = Result<Event, Infallible>>> {
 
     let timeout_ms = req.timeout_ms.unwrap_or(4000);
 
     let concurrency = req.concurrency.unwrap_or(20);
 
-
-
     // snapshot proxies (release lock before the (blocking) test)
-
-    let mut proxies: Vec<Proxy> = {
-
+    let proxies: Vec<Proxy> = {
         let guard = state.store.lock_ok();
-
         flatten_dedup(&guard, None)
-
     };
     let mode = req.mode.clone().unwrap_or_default();
-    if !mode.is_empty() {
-        proxies = apply_mode(proxies, &mode);
-    }
+    let proxies = if mode.is_empty() {
+        proxies
+    } else {
+        apply_mode(proxies, &mode)
+    };
 
 
 
-    let (tcp, http, bw) = run_speedtest_core(&state, &proxies, timeout_ms, concurrency).await;
+    // Stream progress out to the WebUI as nodes complete. The heavy lifting runs
+    // in a background task so the SSE stream starts emitting immediately instead
+    // of buffering until the whole test finishes.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SpeedEvent>();
 
-    let removed = persist_results(&state, &proxies, &tcp, &http, &bw);
+    tokio::spawn(async move {
+        // TCP phase with a live-progress callback (runs in worker threads).
+        let proxies_tcp = proxies.clone();
+        let tx_tcp = tx.clone();
+        let tcp_results = tokio::task::spawn_blocking(move || {
+            let cb = move |p: subhub_core::speedtest::TestProgress| {
+                let _ = tx_tcp.send(SpeedEvent::Progress(ProgressView {
+                    done: p.done,
+                    total: p.total,
+                    name: p.name,
+                    available: p.available,
+                    latency_ms: p.latency_ms,
+                    bandwidth_bps: p.bandwidth_bps,
+                }));
+            };
+            subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, Some(&cb))
+        })
+        .await
+        .unwrap_or_default();
 
-    persist_all(&state);
+        // Engine phase (real HTTP latency + bandwidth) when an engine is set.
+        let (http, bw) = run_engine_passes(&state, &proxies, timeout_ms, concurrency).await;
 
+        let removed = persist_results(&state, &proxies, &tcp_results, &http, &bw);
+        persist_all(&state);
 
+        // Aggregate a summary for the final `done` event.
+        let tested = tcp_results.len();
+        let reachable = tcp_results.iter().filter(|r| r.available).count();
+        let with_http = http.iter().filter(|x| x.is_some()).count();
+        let with_bw = bw.iter().filter(|x| x.is_some()).count();
+        let latencies: Vec<u64> = tcp_results.iter().filter_map(|r| r.tcp_latency_ms).collect();
+        let avg_latency_ms = if latencies.is_empty() {
+            None
+        } else {
+            Some(latencies.iter().sum::<u64>() / latencies.len() as u64)
+        };
+        let threshold = *state.remove_after_fails.lock_ok();
+        let _ = tx.send(SpeedEvent::Done(SummaryView {
+            tested,
+            reachable,
+            avg_latency_ms,
+            with_http,
+            with_bw,
+            removed,
+            threshold,
+        }));
+    });
 
-    // Build the per-node result list: merge engine HTTP latency and bandwidth
-    // into the TCP results. The WebUI aggregates these into a summary for
-    // display, and /api/speedtest stays the source of truth for per-node data.
-    // `tcp` (from `tcp_ping_all`) is ordered by *completion*, whereas
-    // `http`/`bw` (from the engine tasks) are ordered by *input*. Zipping
-    // them by position would assign the wrong latency/bandwidth to most
-    // nodes. Align via fingerprint, the same way `persist_results` does.
-    let fp_to_idx: std::collections::HashMap<String, usize> = proxies
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.fingerprint(), i))
-        .collect();
-    let mut results = tcp;
-    for r in results.iter_mut() {
-        if let Some(&idx) = fp_to_idx.get(&r.fingerprint) {
-            if let Some(h) = http.get(idx).and_then(|x| *x) {
-                r.http_latency_ms = Some(h);
+    Sse::new(stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(ev) => {
+                let data = serde_json::to_string(&ev).unwrap_or_default();
+                Some((Ok(Event::default().data(data)), rx))
             }
-            // Only override the engine-free TCP throughput estimate with the
-            // real engine bandwidth when the engine actually produced a
-            // measurement.
-            if let Some(b) = bw.get(idx).and_then(|x| *x) {
-                r.download_speed_bps = Some(b);
-            }
+            None => None,
         }
-    }
-    Json(SpeedTestResp {
-        results,
-        removed,
-        threshold: *state.remove_after_fails.lock_ok(),
-    })
+    }))
+    .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 
@@ -2940,6 +3168,28 @@ pub async fn run_server() {
 
         .unwrap_or(auto_refresh_default);
 
+
+    // Node-health re-test interval: env `SUBHUB_HEALTH_CHECK_SEC` sets the
+    // default; a value persisted in meta (set from the UI) overrides it.
+    // 0 = disabled. Independent of the subscription-content auto-refresh above.
+    let node_health_check_default = std::env::var("SUBHUB_HEALTH_CHECK_SEC")
+
+        .ok()
+
+        .and_then(|s| s.parse::<u64>().ok())
+
+        .unwrap_or(0);
+
+    let node_health_check_sec = db
+
+        .as_ref()
+
+        .and_then(|d| d.meta_get("node_health_check_sec"))
+
+        .and_then(|v| v.parse::<u64>().ok())
+
+        .unwrap_or(node_health_check_default);
+
     // Default pull-proxy: server-side source of truth (replaces the old
     // browser-local "remember" checkbox). Env `SUBHUB_DEFAULT_PROXY` seeds it;
     // otherwise the value persisted in the meta table (set from the UI).
@@ -2987,6 +3237,8 @@ pub async fn run_server() {
         use_proxy: Arc::new(Mutex::new(use_proxy)),
 
         auto_refresh_sec: Arc::new(Mutex::new(auto_refresh_sec)),
+
+        node_health_check_sec: Arc::new(Mutex::new(node_health_check_sec)),
 
         default_fetch_proxy: Arc::new(Mutex::new(default_fetch_proxy)),
 
@@ -3075,6 +3327,47 @@ pub async fn run_server() {
 
     }
 
+    // Node-health periodic re-test scheduler: independently of the
+    // subscription-content auto-refresh above, this re-probes every node's
+    // connectivity/latency on its own interval (`node_health_check_sec`, 0 =
+    // disabled) and writes the results back. Concurrency is bounded by
+    // `tcp_ping_all`'s internal worker queue (a pool of `concurrency` workers
+    // pulling from a shared index), so a big node set is tested in a controlled
+    // stream rather than all at once. The `remove_after_fails` threshold still
+    // applies, so nodes that fail N consecutive checks get pruned here too.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let sec = *st.node_health_check_sec.lock_ok();
+                if sec == 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(sec)).await;
+                // re-check in case it was disabled (or changed) while we slept
+                if *st.node_health_check_sec.lock_ok() == 0 {
+                    continue;
+                }
+                // Snapshot every node under a short lock, then release before the
+                // (potentially long) test so we never hold the store across .await.
+                let all: Vec<Proxy> = {
+                    let g = st.store.lock_ok();
+                    g.iter().flat_map(|s| s.proxies.iter().cloned()).collect()
+                };
+                if all.is_empty() {
+                    continue;
+                }
+                // Bounded concurrency: a fixed worker pool regardless of how many
+                // nodes exist, so we never open thousands of sockets simultaneously.
+                let concurrency = 20usize;
+                let timeout_ms = 4000u64;
+                run_health_check_core(&st, &all, timeout_ms, concurrency).await;
+                persist_all(&st);
+            }
+        });
+    }
+
 
 
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -3107,6 +3400,7 @@ pub async fn run_server() {
         .route("/api/import", post(import_raw))
 
         .route("/api/proxies", get(list_proxies))
+        .route("/api/proxies/delete", post(delete_proxy))
 
         .route("/api/dashboard", get(dashboard))
 
@@ -3122,7 +3416,7 @@ pub async fn run_server() {
 
         .route("/sub/", get(sub_export))
 
-        .route("/api/speedtest", post(speedtest))
+        .route("/api/speedtest", get(speedtest))
 
         .route("/api/proxy-test", post(proxy_test))
 
@@ -3244,6 +3538,7 @@ mod tests {
             db: None,
             use_proxy: Arc::new(Mutex::new(false)),
             auto_refresh_sec: Arc::new(Mutex::new(0)),
+            node_health_check_sec: Arc::new(Mutex::new(0)),
             default_fetch_proxy: Arc::new(Mutex::new(None)),
             top_n: Arc::new(Mutex::new(0)),
             engine_bin: Arc::new(Mutex::new(None)),

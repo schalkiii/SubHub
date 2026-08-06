@@ -24,6 +24,7 @@
 | **P8** | **本地订阅直接拉取地址（`GET /sub`，可编码算子变成常驻网址）· 节点列表分页 · 算子转换（Transform）图文说明与分享链接 · 应用图标重制 + 重新编译 exe** | ✅ |
 | **P9** | **质量加固：订阅按健康度排序 · 导出自动去除无效节点（`other`/缺字段/已测不可用）· 修复地区列恒为 `OTHER` 的注入 bug · 修复前端 `unlock.summary()` 调用错误 · 引擎跳过不可导出节点 · clippy 0 警告 · 文档同步** | ✅ |
 | **P10** | **节点列表全局排序（跨页，不再是只排当页 50 个）· WebUI 集中「设置」页 + 全局 Top-N 单一真相源 · 手动测速「仅测未测 / 仅失败」模式 · 合并导入防任意覆盖** | ✅ |
+| **P11** | **节点地区识别增强（`region()` 名称/国旗/机场码/2 字母码分级匹配 + 真实节点库补全，OTHER 占比大幅下降）· 手动测速改为 SSE 流式并实时显示进度（当前节点 / Ping / 带宽）· 修复测速接口 405（POST→GET）** | ✅ |
 
 ## 架构
 
@@ -117,17 +118,23 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | GET  | `/api/subscriptions` | 订阅来源列表（**含逐个健康度**：`status` / `source_type` / `node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` / `last_checked_at` / `last_updated_at` / `last_error`） |
 | POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加协议级 HTTP 延迟与带宽） |
 | POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}` |
-| DELETE | `/api/subscriptions/:id` | 删除某个订阅来源 |
+| DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
+| GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`），用于整机备份或跨实例迁移 |
+| POST | `/api/subscriptions/import` | **从备份恢复订阅**：按源 URL 幂等合并（重导入同一实例或跨实例的远程订阅不重复），保留内嵌节点结果（不重新抓取 / 测速），本地 / 粘贴类无 URL 订阅互不冲突 |
+| GET  | `/api/settings`      | 读取当前全局设置（`use_proxy` / `auto_refresh_sec` / `default_fetch_proxy` / `top_n` / `engine_bin` / `remove_after_fails`） |
+| POST | `/api/settings`      | 更新并**持久化**全局设置到 `meta` 表（重启不丢）；`default_fetch_proxy` 仅在代理 URL 校验通过后才写入 |
 | POST | `/api/import`        | 粘贴订阅内容直接导入（body: `{"content":"..."}`，支持 clash yaml / sing-box json / base64 / 各类 URI 混合） |
 | POST | `/api/geo-detect`    | **出口地区探测**（BestSub 风格）：经 `SUBHUB_ENGINE_BIN` 起引擎，逐节点跑 geo-IP 通道，写回 `Proxy.outbound_country`（无引擎时安全返回空） |
 | POST | `/api/unlock-detect` | **流媒体解锁判定**（BestSub 风格）：经引擎逐节点探测 TikTok / Netflix / Disney+ / YouTube Premium / ChatGPT，写回 `Proxy.unlock`（无引擎时安全返回空矩阵） |
 | POST | `/api/nodes/cleanup` | **坏节点熔断清理**（Resin 风格）：删除所有 `available==false` 的节点（保留未测节点），返回 `{status,removed}` |
+| GET  | `/api/nodes/top`     | **跨订阅 Top-N 节点**：按综合评分返回全局最高的前 N 个节点（受全局 `top_n` 设置控制；`?n=N` 可临时覆盖，0=全部），每项含 `sub_id`/`sub_name`/`region`/`score` |
 | GET  | `/api/proxies`       | 节点列表（可 `?type=ss&region=HK&q=foo` 过滤；**分页** `?page=1&page_size=50`，返回 `{total,page,page_size,items}`，`page_size` 上限 500；**全局排序** `?sort=name\|latency\|speed\|score&desc=1` 在**分页前对全部节点**生效，可用性主导——`available==false` 的节点无论按哪列都沉底；每项含 `outbound_country` / `unlock` / `download_speed_bps` / `region` / `sub_id` / `sub_name` —— `region` 为节点地区（HK/JP/US…，此前曾因未注入而恒为 `OTHER`，已修复）；`sub_id`/`sub_name` 标明节点归属的订阅来源，供「按订阅分组」视图使用） |
 | GET  | `/api/dashboard`     | 仪表盘统计（总数 / 订阅数 / 可用·不可用·未测 / 平均·最佳延迟 / 按类型 / 按地区 / 每订阅） |
 | GET  | `/api/trends`        | **趋势数据**（Resin 风格）：滚动窗口内的 `TrendPoint` 快照序列（总/可用/未测节点 + 平均延迟），供趋势图使用 |
-| POST | `/api/export`        | 合并并导出（body: `{"format":"clash-meta","transform":{...},"sub_ids":[...]}`），返回 `{format,count,content}` |
+| POST | `/api/export`        | 合并并导出（body: `{"format":"clash-meta","transform":{...},"sub_ids":[...],"top_n":N}`），返回 `{format,count,content}`，`top_n` 可临时覆盖全局设置 |
 | GET  | `/sub`               | **本地订阅直接拉取地址**：合并所有（或 `?sub=id1,id2` 指定）订阅，可选 `?format=clash-meta` / `clash` / `v2ray` / `sing-box` / `surge` / `base64` 与算子参数 `?sort=latency&desc=1&rename_pat=.*HK-(.*)&rename_rep=HK-$1&q=关键词&region=HK&type=ss`，返回**纯文本订阅内容**（clash 类为 `text/plain`、v2ray/sing-box 为 `application/json`），无 JSON 包装、无需鉴权。把这个网址直接填进 mihomo / clash / v2rayN / sing-box 的「订阅」即可常驻拉取（详见下文「本地订阅地址」一节） |
-| POST | `/api/speedtest`     | 测速（body: `{"timeout_ms":4000,"concurrency":20,"mode":"all\|untested\|failed"}`）：`mode` 为 `untested` 只测 `last_tested_at==None` 的节点、`failed` 只测 `available==Some(false)` 的节点（复用自动刷新的增量思路），返回每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟、下行带宽），并写回节点记录 |
+| GET  | `/api/speedtest`     | 手动测速，返回 **SSE 流**（`text/event-stream`），WebUI 据此实时显示进度条与「正在测的节点 / Ping / 带宽」。查询参数：`timeout_ms`（默认 4000）、`concurrency`（默认 20）、`mode`（`all` 全部 / `untested` 只测 `last_tested_at==None` / `failed` 只测 `available==Some(false)`，复用自动刷新增量思路）。事件：`progress`（每测完一个节点发一条，含 `done/total/name/available/latency_ms/bandwidth_bps`）与 `done`（汇总 `tested/reachable/avg_latency_ms`）。每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟、下行带宽）测完即写回节点记录 |
+| POST | `/api/proxy-test`    | **代理可达性测试**（body: `{"proxy":"http://127.0.0.1:7890","url?":"https://..."}`）：经该代理发 HTTP GET（默认 gstatic `generate_204`），15s 超时，返回 `{ok,status|error}`，用于校验「拉取代理」是否可用 |
 
 ## 设置（统一配置）
 
@@ -179,7 +186,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 - `filters[].field`：`name` | `type` | `region` | `server`
 - `filters[].mode`：`include`（保留匹配）| `exclude`（丢弃匹配）
 - `filters[].match_`：`contains` | `regex` | `exact`
-- `sort.key`：`name` | `latency` | `type`；`sort.desc`：是否降序
+- `sort.key`：`name` | `latency` | `type` | `speed` | `score`；`sort.desc`：是否降序（`speed` 按下行带宽、`score` 按综合评分，二者均可用性主导——`available==false` 沉底）
 - `rename`：`pattern` 为 Rust 正则，`replacement` 支持 `$1` `$2` 捕获组
 
 ## 本地订阅地址（直接拉取）
@@ -194,7 +201,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 - 默认端口 `3005`，可用 `SUBHUB_PORT` 覆盖（网址里的端口要跟着改）。
 - 只合并部分订阅：加 `&sub=id1,id2`（订阅 id 见 `GET /api/subscriptions`）。
-- 支持的算子参数：`sort`（`name`/`latency`/`type`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）。
+- 支持的算子参数：`sort`（`name`/`latency`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（保留评分最高的前 N 个，0 / 留空 = 全部，覆盖全局设置）。
 - 注意：分享网址只编码**包含类**筛选（名称/地区用 `contains`、类型用 `exact`）；**排除 / 正则类**筛选无法编码进网址，遇到时会提示，需要那种效果请改用「合并并导出」手动导出。
 
 ### 导出格式
@@ -207,6 +214,20 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **跳过已测但不可用**的节点（`available == Some(false)`），但**保留未测**（`available == None`）节点，避免误删还没来得及测速的节点。
 
 服务端会在日志打印「导出时去除 N 个无效节点」，便于核对导出结果。这能避免把好节点之外的垃圾节点（尤其是 `other` 类型的「伪节点」）导出到 mihomo / clash 后整份订阅被拒。
+
+## 节点地区识别（region 与 outbound_country）
+
+节点地区有两个来源，WebUI「地区」列优先显示真实出口地区、回退到名称推断：
+
+- **`region`（`Proxy::region()`，名称推断）**：纯前端无引擎时也能用。按 **4 级优先级** 解析节点名（与 `server` 地址）得到 2 字母国家码：
+  1. **国旗 emoji** → 直接映射成对应国家码（最高优先级，最可靠）；
+  2. **国家/地区全名**（中英文子串匹配，如 `香港`/`hong kong`/`tokyo`/`东京`/`首尔`/`乌克兰` 等 ~90 条）；
+  3. **3 字母机场码**（如 `NRT`/`LAX`/`SIN`）；
+  4. **2 字母国家码** + 安全前缀变体（如 `JP-`、`hk_`、`US|` 这类「码+分隔符」写法，但整词 token 匹配避免把 `russia` 误判成 `us`）。
+  词典已从真实节点库（3382 个节点）反查补全，未知地区从 1122 个降到 701 个；剩余 701 个多为上游「其他地区 / 无意义名」，正确归为 `OTHER`。
+- **`outbound_country`（出口地区，真实 geo-IP）**：配置 `SUBHUB_ENGINE_BIN` 后由 `POST /api/geo-detect` 经引擎逐节点跑 geo-IP 通道得到，是**真实出口位置**，比名称推断更准。WebUI 地区列取值顺序：`outbound_country || region || "OTHER"`。
+
+> 提示：仅装了引擎并跑过 `/api/geo-detect`，出口地区才会填充；否则地区列走 `region()` 名称推断。
 
 ## 已验证（端到端冒烟测试 `docs/test_subhub.py`）
 - 混合内容导入（clash yaml + vmess/trojan/vless/ss URI 混排 + base64）→ 正确解析、去重
@@ -278,6 +299,19 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **幂等合并提取为可单测纯函数（R2）**：此前「重复 URL 按 source 就地合并」逻辑只存在于 server 的 `add_subscriptions` 闭包内、仅由端到端覆盖。现抽出为 `subhub_core::ops::merge_subscriptions_by_source`（单一真相源，同时被 `/api/subscriptions` 与 `/api/subscriptions/import` 复用），并修复返回 `added` 计数在「重复添加（实为 refresh）」时被整份节点数虚高的小瑕疵——现在只统计**真正新建**订阅的节点数。核心新增 4 个单测覆盖：新建计数、重复添加不重不漏、拉取失败时保留旧节点、refresh 保留存活节点已测健康。
 
 **验证**：`cargo clippy --release -p subhub-core -p subhub-server` 0 警告；`cargo test -p subhub-core -p subhub-server` **42 测试全过**（core 36 + server 6，本轮新增 4）；release 构建通过；`docs/test_subhub.py` 隔离库端到端 **ALL CHECKS PASSED**（含同 URL 重复导入幂等合并用例）。
+
+## 代码审计记录（Round S，地区识别增强 + 测速进度流式化）
+
+针对「大量节点被分入 OTHER」「测速无进度提示」「测速点击失败 405」三处问题，实施如下修复：
+
+- **地区识别增强（`core/src/model.rs` 的 `region()`）**：重写为 4 级优先级匹配——① 国旗 emoji 直接映射；② 中英文国家/地区全名子串表（扩充到 ~90 条，含从真实节点库反查补全的乌克兰、哈萨克、柬埔寨、缅甸、老挝等）；③ 3 字母机场码表；④ 2 字母国家码 + 安全前缀变体（整词 token 匹配，杜绝 `russia`→`us` 误判）。真实节点库（3382 节点）验证：OTHER 从 1122 降到 701。
+- **WebUI 地区列取值顺序（`webui/app.js`）**：改为 `outbound_country || region || "OTHER"`，优先展示真实出口地区。
+- **测速改为 SSE 流式（`server/src/lib.rs` + `webui/app.js` + `index.html` + `style.css`）**：`/api/speedtest` 由一次性 JSON 响应改为 `GET` + `text/event-stream` 流式；后端 `tcp_ping_all(..., Some(&cb))` 每测完一个节点推送 `progress` 事件（含 `done/total/name/available/latency_ms/bandwidth_bps`），结束推 `done` 汇总；前端用 `fetch` + `ReadableStream` 消费，实时渲染进度条与「当前节点 / Ping / 带宽」。`server` 侧提取 `run_engine_passes()`，移除一次性 `SpeedTestResp` 结构。
+- **修复测速 405**：路由由 `post(speedtest)` 改为 `get(speedtest)`（前端用 `fetch` GET 消费 SSE，原 POST 导致 405 Method Not Allowed）。
+- **`core/src/speedtest.rs`**：`tcp_ping_all` 进度回调签名由泛型 `F` 改为 `Option<&(dyn Fn(TestProgress) + Sync)>`，消除编译期模糊（E0283/E0425），闭包标注 `subhub_core::speedtest::TestProgress`。
+- **单测**：`core/src/model.rs` 新增 `region_resolves_common_naming_styles` / `region_prefix_variant_safe_from_false_positive`（`ukraine-kyiv`→`UA`、`ruse-node`→`OTHER`）/ `region_flag_emoji_maps_to_code` / `region_more_countries_from_real_db`。
+
+**验证**：`cargo clippy --release -p subhub-core -p subhub-server` 0 警告；`cargo test -p subhub-core --lib` 全部通过（含本轮新增地区单测）；release 构建通过；WebUI 测速进度条与实时节点信息正常显示，405 不再出现。
 
 ## 复用的第三方引擎（可选）
 测速与真实连通性验证不重写协议，调用本地 **mihomo (clash-meta)** 或 **sing-box** 作为连接引擎 —— 与 BestSub 思路一致。通过 `SUBHUB_ENGINE_BIN` 开启。
