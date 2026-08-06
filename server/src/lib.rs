@@ -405,6 +405,10 @@ struct ProgressView {
     available: bool,
     latency_ms: Option<u64>,
     bandwidth_bps: Option<f64>,
+    /// Which stage produced this tick: "tcp" (TCP latency) / "http"
+    /// (engine HTTP latency) / "bw" (engine bandwidth). Lets the WebUI label
+    /// the live row correctly — the whole speedtest spans all three stages.
+    phase: String,
 }
 
 /// Final summary (emitted as the `done` SSE event) — mirrors the old
@@ -807,7 +811,7 @@ async fn run_speedtest_core(
 
 
 
-    let (engine_http, engine_bw) = run_engine_passes(state, proxies, timeout_ms, concurrency).await;
+    let (engine_http, engine_bw) = run_engine_passes(state, proxies, timeout_ms, concurrency, None, None).await;
 
     (tcp_results, engine_http, engine_bw)
 
@@ -816,13 +820,9 @@ async fn run_speedtest_core(
 
 
 /// Engine HTTP-latency + bandwidth passes (run concurrently, share the same
-
 /// clamped engine-worker budget). Returns `(http_latency, bandwidth)` aligned
-
 /// with `proxies` order. Skipped entirely (all `None`) when no engine binary is
-
 /// configured — in that case the caller falls back to the TCP throughput estimate.
-
 async fn run_engine_passes(
 
     state: &AppState,
@@ -832,6 +832,10 @@ async fn run_engine_passes(
     timeout_ms: u64,
 
     concurrency: usize,
+
+    on_http: Option<Arc<dyn Fn(String) + Send + Sync>>,
+
+    on_bw: Option<Arc<dyn Fn(String) + Send + Sync>>,
 
 ) -> (Vec<Option<u64>>, Vec<Option<f64>>) {
 
@@ -857,9 +861,9 @@ async fn run_engine_passes(
 
         let (h, b) = tokio::join!(
 
-            engine::engine_http_latency(&proxies_http, &bin_http, timeout_ms, concurrency),
+            engine::engine_http_latency(&proxies_http, &bin_http, timeout_ms, concurrency, on_http),
 
-            engine::engine_bandwidth(&proxies_bw, &bin_bw, timeout_ms, concurrency),
+            engine::engine_bandwidth(&proxies_bw, &bin_bw, timeout_ms, concurrency, on_bw),
 
         );
 
@@ -2954,6 +2958,17 @@ async fn speedtest(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SpeedEvent>();
 
     tokio::spawn(async move {
+        // Total progress units span every stage: TCP latency, then (if an engine
+        // is configured) engine HTTP latency + bandwidth. Each node contributes 1
+        // unit for TCP and, with an engine, 2 more — so the bar only reaches 100%
+        // once the whole test (including bandwidth) is done, instead of stalling
+        // at "TCP done" while the silent bandwidth stage runs.
+        let node_count = proxies.len() as u64;
+        let has_engine = engine_bin_of(&state)
+            .map(|b| std::path::Path::new(&b).exists())
+            .unwrap_or(false);
+        let unit_total = (if has_engine { node_count * 3 } else { node_count }) as usize;
+
         // TCP phase with a live-progress callback (runs in worker threads).
         let proxies_tcp = proxies.clone();
         let tx_tcp = tx.clone();
@@ -2961,11 +2976,12 @@ async fn speedtest(
             let cb = move |p: subhub_core::speedtest::TestProgress| {
                 let _ = tx_tcp.send(SpeedEvent::Progress(ProgressView {
                     done: p.done,
-                    total: p.total,
+                    total: unit_total,
                     name: p.name,
                     available: p.available,
                     latency_ms: p.latency_ms,
                     bandwidth_bps: p.bandwidth_bps,
+                    phase: "tcp".to_string(),
                 }));
             };
             subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, Some(&cb))
@@ -2974,7 +2990,54 @@ async fn speedtest(
         .unwrap_or_default();
 
         // Engine phase (real HTTP latency + bandwidth) when an engine is set.
-        let (http, bw) = run_engine_passes(&state, &proxies, timeout_ms, concurrency).await;
+        // Each node fires a progress tick so the bar keeps advancing through this
+        // stage too. Offsets place http/bw ticks after the TCP segment of the bar.
+        let (http, bw) = {
+            let tx_http = tx.clone();
+            let tx_bw = tx.clone();
+            let http_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bw_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let http_off = node_count as usize;
+            let bw_off = (node_count as usize) * 2;
+            let ut = unit_total;
+            let on_http: Option<Arc<dyn Fn(String) + Send + Sync>> = if has_engine {
+                let tx = tx_http.clone();
+                let c = http_counter.clone();
+                Some(Arc::new(move |name: String| {
+                    let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let _ = tx.send(SpeedEvent::Progress(ProgressView {
+                        done: http_off + d as usize,
+                        total: ut,
+                        name,
+                        available: false,
+                        latency_ms: None,
+                        bandwidth_bps: None,
+                        phase: "http".to_string(),
+                    }));
+                }))
+            } else {
+                None
+            };
+            let on_bw: Option<Arc<dyn Fn(String) + Send + Sync>> = if has_engine {
+                let tx = tx_bw.clone();
+                let c = bw_counter.clone();
+                Some(Arc::new(move |name: String| {
+                    let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let _ = tx.send(SpeedEvent::Progress(ProgressView {
+                        done: bw_off + d as usize,
+                        total: ut,
+                        name,
+                        available: false,
+                        latency_ms: None,
+                        bandwidth_bps: None,
+                        phase: "bw".to_string(),
+                    }));
+                }))
+            } else {
+                None
+            };
+            run_engine_passes(&state, &proxies, timeout_ms, concurrency, on_http, on_bw).await
+        };
 
         let removed = persist_results(&state, &proxies, &tcp_results, &http, &bw);
         persist_all(&state);

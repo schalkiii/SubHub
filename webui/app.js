@@ -45,16 +45,21 @@ function showSpeedProgress(text) {
 }
 // 根据单个 Progress 事件刷新进度条与“当前节点”行
 function updateSpeedProgress(ev) {
-  const { done, total, name, available, latency_ms, bandwidth_bps } = ev;
+  const { done, total, name, available, latency_ms, bandwidth_bps, phase } = ev;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const fill = document.getElementById("progress-fill");
   if (fill) fill.style.width = pct + "%";
   const cur = document.getElementById("progress-current");
   if (cur) {
-    const lat = latency_ms != null ? latency_ms + " ms" : "超时";
-    const bw = bandwidth_bps != null ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s" : "—";
-    const status = available ? "✓" : "✗";
-    cur.textContent = `(${done}/${total}) ${status} ${name} · ${lat} · ${bw}`;
+    // phase 标明当前进度来自哪一阶段：tcp / http / bw。非 tcp 阶段节点尚在
+    // 测量中，不可用“超时 / —”误导用户以为节点已失败。
+    const stage = phase === "http" ? "测 HTTP 延迟" : phase === "bw" ? "测带宽" : "";
+    const lat = latency_ms != null ? latency_ms + " ms" : (phase === "tcp" ? "超时" : "测量中");
+    const bw = bandwidth_bps != null
+      ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s"
+      : (phase === "bw" ? "测速中" : "—");
+    const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
+    cur.textContent = `(${done}/${total}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
   }
 }
 
@@ -990,7 +995,7 @@ document.getElementById("btn-speedtest").addEventListener("click", async (e) => 
   if (resultEl) resultEl.textContent = "";
   const mode = document.getElementById("test-mode").value;
   const modeText = mode === "untested" ? "未测过的节点" : mode === "failed" ? "测速失败的节点" : "全部节点";
-  showSpeedProgress(`正在测速${modeText}（TCP 延迟 + 速度估算；配置测速引擎可得真实带宽，可能需要一会儿）…`);
+  showSpeedProgress(`正在测速${modeText}（TCP 延迟 → 引擎 HTTP 延迟 → 带宽，进度条覆盖全程）…`);
   const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20, mode });
   try {
     const resp = await fetch(`/api/speedtest?${params.toString()}`);
