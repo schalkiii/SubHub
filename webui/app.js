@@ -804,7 +804,7 @@ async function loadNodes(page) {
     const tbody = document.querySelector("#nodes-table tbody");
     if (tbody) {
         tbody.innerHTML =
-        `<tr><td colspan="13" style="text-align:center;color:var(--danger,#ef4444);padding:16px">` +
+        `<tr><td colspan="15" style="text-align:center;color:var(--danger,#ef4444);padding:16px">` +
         `节点列表加载失败：${escapeHtml(err.message)}（可点击「刷新」重试）</td></tr>`;
     }
     return;
@@ -870,6 +870,7 @@ function renderNodes(list) {
         ? `<span class="dot down"></span>不可用${p.consecutive_failures > 0 ? " ×" + p.consecutive_failures : ""}`
         : '<span class="dot"></span>未测';
     return `<tr>
+      <td class="col-check"><input type="checkbox" class="node-check" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" /></td>
       <td>${escapeHtml(p.name)}</td>
       <td class="sub-cell" title="${escapeHtml(p.sub_name || "")}">${escapeHtml(p.sub_name || "—")}</td>
       <td><span class="tag">${p.type_}</span></td>
@@ -882,6 +883,7 @@ function renderNodes(list) {
       <td class="unlock-cell">${escapeHtml(unlock)}</td>
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
+      <td class="lasttest-cell">${formatLastTested(p.last_tested_at)}</td>
       <td class="row-actions"><button class="btn btn-del-node" data-sub="${escapeHtml(p.sub_id)}" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" title="删除该节点">✕</button></td>
     </tr>`;
   };
@@ -897,7 +899,7 @@ function renderNodes(list) {
     tbody.innerHTML = ordered
       .map((name) => {
         const rows = groups[name].map(rowHtml).join("");
-        return `<tr class="group-row"><td colspan="13">${escapeHtml(name)} · ${groups[name].length} 个节点</td></tr>${rows}`;
+        return `<tr class="group-row"><td colspan="15">${escapeHtml(name)} · ${groups[name].length} 个节点</td></tr>${rows}`;
       })
       .join("");
   } else {
@@ -988,6 +990,46 @@ document.getElementById("nodes-table").addEventListener("click", async (e) => {
   }
 });
 
+// 读取 SSE 测速流并推进进度条，返回汇总 summary。「测速」「测速选中」共用。
+async function runSpeedtest(params) {
+  const resp = await fetch(`/api/speedtest?${params.toString()}`);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let summary = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+        if (ev.type === "Progress") updateSpeedProgress(ev);
+        else if (ev.type === "Done") summary = ev;
+      }
+    }
+  }
+  return summary;
+}
+
+function speedSummaryText(summary) {
+  if (!summary) return "";
+  const { tested, reachable, avg_latency_ms, with_http, with_bw, removed, threshold } = summary;
+  let msg =
+    `测速完成：共 ${tested} 个，可达 ${reachable} 个，` +
+    `平均延迟 ${avg_latency_ms != null ? avg_latency_ms + " ms" : "—"}（含 HTTP 延迟 ${with_http} 个，带宽 ${with_bw} 个）`;
+  if (removed > 0) msg += `；已自动移除连续不可用节点 ${removed} 个（阈值 ${threshold} 次）`;
+  return msg;
+}
+
 document.getElementById("btn-speedtest").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   const resultEl = document.getElementById("speedtest-result");
@@ -998,45 +1040,10 @@ document.getElementById("btn-speedtest").addEventListener("click", async (e) => 
   showSpeedProgress(`正在测速${modeText}（TCP 延迟 → 引擎 HTTP 延迟 → 带宽，进度条覆盖全程）…`);
   const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20, mode });
   try {
-    const resp = await fetch(`/api/speedtest?${params.toString()}`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    // 按 SSE 逐事件读取：Progress（进度）/ Done（汇总）
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    let summary = null;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const chunk = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        for (const line of chunk.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (!payload) continue;
-          let ev;
-          try { ev = JSON.parse(payload); } catch { continue; }
-          if (ev.type === "Progress") {
-            updateSpeedProgress(ev);
-          } else if (ev.type === "Done") {
-            summary = ev;
-          }
-        }
-      }
-    }
+    const summary = await runSpeedtest(params);
     await loadNodes();
     loadDashboard();
-    if (resultEl && summary) {
-      const { tested, reachable, avg_latency_ms, with_http, with_bw, removed, threshold } = summary;
-      let msg =
-        `测速完成：共 ${tested} 个，可达 ${reachable} 个，` +
-        `平均延迟 ${avg_latency_ms != null ? avg_latency_ms + " ms" : "—"}（含 HTTP 延迟 ${with_http} 个，带宽 ${with_bw} 个）`;
-      if (removed > 0) msg += `；已自动移除连续不可用节点 ${removed} 个（阈值 ${threshold} 次）`;
-      resultEl.textContent = msg;
-    }
+    if (resultEl && summary) resultEl.textContent = speedSummaryText(summary);
   } catch (err) {
     alert("测速失败: " + err.message);
   } finally {
@@ -1045,10 +1052,53 @@ document.getElementById("btn-speedtest").addEventListener("click", async (e) => 
   }
 });
 
+// 选中节点单独测速：收集勾选的 fingerprint 传给 /api/speedtest?ids=...
+document.getElementById("btn-speedtest-selected").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const resultEl = document.getElementById("speedtest-result");
+  const checked = [...document.querySelectorAll("#nodes-table tbody .node-check:checked")];
+  const ids = checked.map((cb) => cb.dataset.fp);
+  if (ids.length === 0) {
+    alert("请先在节点前的复选框勾选要测速的节点（可多选），再点「测速选中」。");
+    return;
+  }
+  btn.disabled = true;
+  if (resultEl) resultEl.textContent = "";
+  showSpeedProgress(`正在测速选中的 ${ids.length} 个节点（TCP 延迟 → 引擎 HTTP 延迟 → 带宽）…`);
+  const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20 });
+  params.set("ids", ids.join(","));
+  try {
+    const summary = await runSpeedtest(params);
+    await loadNodes();
+    loadDashboard();
+    if (resultEl && summary) resultEl.textContent = speedSummaryText(summary);
+  } catch (err) {
+    alert("测速失败: " + err.message);
+  } finally {
+    hideProgress();
+    btn.disabled = false;
+  }
+});
+
+// 全选 / 取消全选本页节点
+document.getElementById("check-all").addEventListener("change", (e) => {
+  const checked = e.target.checked;
+  document.querySelectorAll("#nodes-table tbody .node-check").forEach((cb) => { cb.checked = checked; });
+});
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+// 上次测速时间戳（epoch 毫秒）→ 本地日期时间；无记录显示「—」
+function formatLastTested(ts) {
+  if (ts == null) return "—";
+  const d = new Date(Number(ts));
+  if (isNaN(d.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 document.getElementById("btn-refresh").addEventListener("click", loadNodes);

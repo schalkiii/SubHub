@@ -10,8 +10,13 @@ use serde_yaml::{Mapping, Value};
 /// nodes missing type-specific required fields, and nodes that were
 /// speed-tested and found unavailable. This keeps the exported subscription
 /// clean so a client's strict profile checker never chokes on a broken entry.
+///
+/// Proxy names are also guaranteed unique (see [`ensure_unique_names`]) — clash /
+/// v2ray / sing-box / surge all key a node by its name, so a duplicate name
+/// would make the whole profile fail validation.
 pub fn export_str(proxies: &[Proxy], format: &str) -> String {
-    let valid = export_filter(proxies);
+    let mut valid = export_filter(proxies);
+    ensure_unique_names(&mut valid);
     match format {
         "v2ray" => to_v2ray_json(&valid),
         "sing-box" | "singbox" => to_singbox_json(&valid),
@@ -36,6 +41,25 @@ pub fn export_filter(proxies: &[Proxy]) -> Vec<Proxy> {
         eprintln!("导出时去除 {removed} 个无效节点（缺必填字段或测速不可用）");
     }
     valid
+}
+
+/// Clash / v2ray / sing-box / surge all key a node by its (unique) name. Two
+/// genuinely different nodes — e.g. from different subscriptions, or collapsed
+/// to the same name by a rename rule — can share a display name. Exporting such
+/// a set makes mihomo / clash-verge reject the profile with
+/// `... is the duplicate name`, taking down the whole config. Rewrite names so
+/// each is unique: the first occurrence keeps its original name; later
+/// collisions get a ` #2`, ` #3` … suffix.
+fn ensure_unique_names(proxies: &mut [Proxy]) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for p in proxies.iter_mut() {
+        let count = seen.entry(p.name.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            p.name = format!("{} #{}", p.name, *count);
+        }
+    }
 }
 
 // ===================== clash-meta / clash yaml =====================
@@ -588,5 +612,32 @@ mod tests {
         assert_eq!(v2, "[]", "v2ray must skip anytls (empty array)");
         assert!(!sb.contains("\"anytls\""), "sing-box must skip anytls");
         assert!(!sb.contains("\"aws.host.xyz\""), "sing-box must skip anytls node");
+    }
+
+    #[test]
+    fn duplicate_display_names_are_made_unique_on_export() {
+        // 两个不同节点（不同服务器）却共享显示名「US美国」（常见于地区重命名规则
+        // 把同地区节点都改成同一名字，或不同订阅里本就重名）。导出若不处理，clash
+        // 会报 `... is the duplicate name` 整份配置被拒。修复后：首个保留原名，
+        // 后续撞名加 ` #2` 后缀，确保整份订阅可被客户端加载。
+        let mut a = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        a.name = "US美国".to_string();
+        a.method = Some("aes-256-gcm".into());
+        a.password = Some("pw1".into());
+        let mut b = mk(ProxyType::Ss, "2.2.2.2", 8388);
+        b.name = "US美国".to_string();
+        b.method = Some("aes-256-gcm".into());
+        b.password = Some("pw2".into());
+
+        let yaml = super::export_str(&[a, b], "clash-meta");
+        let keep = yaml.matches("name: US美国").count();
+        // 撞名节点加 ` #2` 后缀；serde_yaml 会对含 `#` 的名字加引号
+        //（`name: 'US美国 #2'`），故用子串包含而非精确前缀匹配。
+        let suffixed = yaml.contains("US美国 #2");
+        assert_eq!(keep, 1, "恰好一个节点保留原名");
+        assert!(suffixed, "撞名节点必须加后缀以保证唯一");
+        // 两个节点的服务器地址都应出现在产物中（都保留了，只是名字不同）。
+        assert!(yaml.contains("1.1.1.1"), "原节点 A 必须保留");
+        assert!(yaml.contains("2.2.2.2"), "原节点 B 必须保留");
     }
 }
