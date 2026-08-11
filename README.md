@@ -25,6 +25,7 @@
 | **P9** | **质量加固：订阅按健康度排序 · 导出自动去除无效节点（`other`/缺字段/已测不可用）· 修复地区列恒为 `OTHER` 的注入 bug · 修复前端 `unlock.summary()` 调用错误 · 引擎跳过不可导出节点 · clippy 0 警告 · 文档同步** | ✅ |
 | **P10** | **节点列表全局排序（跨页，不再是只排当页 50 个）· WebUI 集中「设置」页 + 全局 Top-N 单一真相源 · 手动测速「仅测未测 / 仅失败」模式 · 合并导入防任意覆盖** | ✅ |
 | **P11** | **节点地区识别增强（`region()` 名称/国旗/机场码/2 字母码分级匹配 + 真实节点库补全，OTHER 占比大幅下降）· 手动测速改为 SSE 流式并实时显示进度（当前节点 / Ping / 带宽）· 修复测速接口 405（POST→GET）** | ✅ |
+| **P12** | **导出质量筛选（带宽下限 / 延迟上限，手动导出 + 常驻订阅网址皆可用）· 进度条悬浮常驻（滚动页面始终可见）** | ✅ |
 
 ## 架构
 
@@ -179,7 +180,9 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
       { "field": "name",   "mode": "include", "match_": "regex", "value": ".*JP.*" }
     ],
     "sort":   { "key": "latency", "desc": false },
-    "rename": { "pattern": "JP-(.*)", "replacement": "日本-$1" }
+    "rename": { "pattern": "JP-(.*)", "replacement": "日本-$1" },
+    "min_bandwidth_bps": 5242880,
+    "max_latency_ms": 300
   }
 }
 ```
@@ -188,6 +191,8 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 - `filters[].match_`：`contains` | `regex` | `exact`
 - `sort.key`：`name` | `latency` | `type` | `speed` | `score`；`sort.desc`：是否降序（`speed` 按下行带宽、`score` 按综合评分，二者均可用性主导——`available==false` 沉底）
 - `rename`：`pattern` 为 Rust 正则，`replacement` 支持 `$1` `$2` 捕获组
+- `min_bandwidth_bps`（可选）：带宽下限（**bps**）。导出时排除 `download_speed_bps` 低于该值的节点；**未测速（无带宽数据）的节点保留**，避免误删还没测的节点。
+- `max_latency_ms`（可选）：延迟上限（**ms**）。导出时排除 `latency_ms` 高于该值的节点；**未测速（无延迟数据）的节点保留**。
 
 ## 本地订阅地址（直接拉取）
 
@@ -201,7 +206,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 - 默认端口 `3005`，可用 `SUBHUB_PORT` 覆盖（网址里的端口要跟着改）。
 - 只合并部分订阅：加 `&sub=id1,id2`（订阅 id 见 `GET /api/subscriptions`）。
-- 支持的算子参数：`sort`（`name`/`latency`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（保留评分最高的前 N 个，0 / 留空 = 全部，覆盖全局设置）。
+- 支持的算子参数：`sort`（`name`/`latency`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（保留评分最高的前 N 个，0 / 留空 = 全部，覆盖全局设置）、`min_bw`（带宽下限，**bps**，排除更慢的节点）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
 - 注意：分享网址只编码**包含类**筛选（名称/地区用 `contains`、类型用 `exact`）；**排除 / 正则类**筛选无法编码进网址，遇到时会提示，需要那种效果请改用「合并并导出」手动导出。
 
 ### 导出格式

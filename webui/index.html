@@ -189,6 +189,13 @@
             <input id="op-rename-pat" placeholder="正则，如 .*HK-(.*)" />
             <input id="op-rename-rep" placeholder="替换为，如 HK-$1" />
           </div>
+          <div class="row">
+            <label class="lbl">最小带宽</label>
+            <input id="op-min-bw" type="number" min="0" step="0.1" placeholder="MB/s，如 5" style="width:120px" />
+            <label class="lbl">最大延迟</label>
+            <input id="op-max-lat" type="number" min="0" step="1" placeholder="ms，如 300" style="width:120px" />
+            <span class="hint" style="margin:0">导出 / 订阅时排除带宽低于下限、延迟高于上限的节点（未测速节点保留）</span>
+          </div>
         </div>
         <div class="panel">
           <h2>合并并生成新订阅</h2>

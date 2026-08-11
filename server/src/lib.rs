@@ -358,6 +358,13 @@ pub struct SubQuery {
     /// manual export — handy for a small "best nodes" subscribe link.
     pub top_n: Option<String>,
 
+    /// 数值质量阈值（可选，单位 bps / ms）：导出时排除带宽低于 `min_bw` 或延迟
+    /// 高于 `max_lat` 的节点。与手动导出 `Transform.min_bandwidth_bps` /
+    /// `max_latency_ms` 对应，便于把「只要快节点」编码进常驻订阅网址。
+    pub min_bw: Option<String>,
+
+    pub max_lat: Option<String>,
+
 }
 
 
@@ -1301,7 +1308,17 @@ fn transform_from_sub_query(q: &SubQuery) -> Option<Transform> {
 
     };
 
-    if filters.is_empty() && sort.is_none() && rename.is_none() {
+    // 数值质量阈值：min_bw（带宽下限，bps）/ max_lat（延迟上限，ms）。解析失败的
+    // 值视为「未设置」，不影响其余筛选。
+    let min_bandwidth_bps = q.min_bw.as_ref().and_then(|s| s.parse::<u64>().ok());
+    let max_latency_ms = q.max_lat.as_ref().and_then(|s| s.parse::<u64>().ok());
+
+    if filters.is_empty()
+        && sort.is_none()
+        && rename.is_none()
+        && min_bandwidth_bps.is_none()
+        && max_latency_ms.is_none()
+    {
 
         None
 
@@ -1314,6 +1331,10 @@ fn transform_from_sub_query(q: &SubQuery) -> Option<Transform> {
             sort,
 
             rename,
+
+            min_bandwidth_bps,
+
+            max_latency_ms,
 
         })
 

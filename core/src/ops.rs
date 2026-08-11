@@ -13,6 +13,13 @@ pub struct Transform {
     pub filters: Vec<FilterRule>,
     pub sort: Option<SortBy>,
     pub rename: Option<RenameRule>,
+    /// 数值质量阈值（可选）：导出 / 订阅时排除「带宽低于下限」或「延迟高于上限」
+    /// 的节点。单位：带宽 bps、延迟 ms。未测速（无对应数据）的节点按「保留」处理，
+    /// 避免把还没测过的节点误删。
+    #[serde(default)]
+    pub min_bandwidth_bps: Option<u64>,
+    #[serde(default)]
+    pub max_latency_ms: Option<u64>,
 }
 
 /// Keep or drop nodes by matching a field.
@@ -93,6 +100,22 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
         .filter(|p| compiled.iter().all(|(rule, re)| keep(p, rule, re)))
         .cloned()
         .collect();
+
+    // 1b) 数值质量阈值：按带宽下限 / 延迟上限过滤。未测速（无数据）的节点无法
+    // 判断是否超标，按「保留」处理，避免把还没测过的节点误删。
+    if let Some(min_bw) = t.min_bandwidth_bps {
+        let min = min_bw as f64;
+        out.retain(|p| match p.download_speed_bps {
+            Some(b) => b >= min,
+            None => true,
+        });
+    }
+    if let Some(max_lat) = t.max_latency_ms {
+        out.retain(|p| match p.latency_ms {
+            Some(l) => l <= max_lat,
+            None => true,
+        });
+    }
 
     // 2) rename
     if let Some(r) = &t.rename {
@@ -394,6 +417,8 @@ mod tests {
                 pattern: "US-(.*)".to_string(),
                 replacement: "\\$1-OK".to_string(),
             }),
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out = apply(&[p.clone()], &t).unwrap();
         assert_eq!(out[0].name, "$1-OK", "escaped \\$ must yield a literal dollar");
@@ -406,6 +431,8 @@ mod tests {
                 pattern: "US-(.*)".to_string(),
                 replacement: "$1".to_string(),
             }),
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out2 = apply(&[p], &t2).unwrap();
         assert_eq!(out2[0].name, "Test", "unescaped $1 stays a capture group");
@@ -426,6 +453,8 @@ mod tests {
             }],
             sort: None,
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let res = apply(&[p], &t);
         assert!(res.is_err(), "invalid regex must return Err, got Ok");
@@ -442,6 +471,8 @@ mod tests {
                 pattern: "*badclass".to_string(),
                 replacement: "x".to_string(),
             }),
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let res = apply(&[p], &t);
         assert!(res.is_err(), "invalid rename regex must return Err");
@@ -466,6 +497,8 @@ mod tests {
             filters: vec![],
             sort: Some(SortBy { key: "latency".to_string(), desc: false }),
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out = apply(&[dead.clone(), alive.clone()], &t_asc).unwrap();
         assert_eq!(out[0].name, "Alive", "available must outrank unavailable even with higher latency");
@@ -476,6 +509,8 @@ mod tests {
             filters: vec![],
             sort: Some(SortBy { key: "latency".to_string(), desc: true }),
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out2 = apply(&[dead, alive], &t_desc).unwrap();
         assert_eq!(out2[0].name, "Alive", "descending: available still before unavailable");
@@ -501,6 +536,8 @@ mod tests {
             filters: vec![],
             sort: Some(SortBy { key: "score".to_string(), desc: true }),
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out = apply(&[dead.clone(), slow.clone(), fast.clone()], &t).unwrap();
         assert_eq!(out[0].name, "Fast", "best score first");
@@ -512,6 +549,8 @@ mod tests {
             filters: vec![],
             sort: Some(SortBy { key: "score".to_string(), desc: false }),
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out2 = apply(&[fast, dead, slow], &t_asc).unwrap();
         assert_eq!(out2[0].name, "Slow", "ascending: worst usable score first");
@@ -535,10 +574,45 @@ mod tests {
             filters: vec![],
             sort: Some(SortBy { key: "speed".to_string(), desc: true }),
             rename: None,
+            min_bandwidth_bps: None,
+            max_latency_ms: None,
         };
         let out = apply(&[dead, alive], &t).unwrap();
         assert_eq!(out[0].name, "Alive", "available must outrank dead even with lower speed");
         assert_eq!(out[1].name, "Dead");
+    }
+
+    #[test]
+    fn numeric_thresholds_drop_slow_high_latency_keep_untested() {
+        // 排除带宽低于下限、延迟高于上限的节点；未测速（无数据）节点保留。
+        let mut fast = node("Fast", "10.0.0.1", 1);
+        fast.available = Some(true);
+        fast.latency_ms = Some(50);
+        fast.download_speed_bps = Some(50_000_000.0);
+        let mut slow = node("Slow", "10.0.0.2", 2);
+        slow.available = Some(true);
+        slow.latency_ms = Some(1500);
+        slow.download_speed_bps = Some(40_000_000.0);
+        let mut weak = node("Weak", "10.0.0.3", 3);
+        weak.available = Some(true);
+        weak.latency_ms = Some(80);
+        weak.download_speed_bps = Some(1_000_000.0); // 1 MB/s
+        // 未测速：无延迟 / 带宽数据
+        let untested = node("Untested", "10.0.0.4", 4);
+
+        let t = Transform {
+            filters: vec![],
+            sort: None,
+            rename: None,
+            min_bandwidth_bps: Some(5_000_000), // 5 MB/s 下限
+            max_latency_ms: Some(500),
+        };
+        let out = apply(&[fast.clone(), slow.clone(), weak.clone(), untested.clone()], &t).unwrap();
+        let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Fast"), "快且低延迟应保留");
+        assert!(!names.contains(&"Slow"), "高延迟应排除");
+        assert!(!names.contains(&"Weak"), "低带宽应排除");
+        assert!(names.contains(&"Untested"), "未测速（无数据）应保留，不误删");
     }
 
     #[test]
@@ -612,7 +686,7 @@ mod tests {
         merge_subscriptions_by_source(&mut store, vec![existing]);
 
         // refresh returns the same node plus one genuinely new node
-        let mut refresher = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)]);
+        let refresher = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)]);
         let (created, added) = merge_subscriptions_by_source(&mut store, vec![refresher]);
 
         assert_eq!(created, 0);
