@@ -271,13 +271,16 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 .switch-label { color: var(--text); font-size: 13px; white-space: nowrap; }
 
-/* global progress / hint banner */
+/* global progress / hint banner（悬浮：滚动页面时始终固定在内容区顶部可见） */
 .progress {
+  position: sticky; top: 0; z-index: 50;
   display: flex; align-items: center; gap: 12px;
   padding: 11px 16px; margin-bottom: 14px;
-  background: linear-gradient(90deg, rgba(79,140,255,.14), rgba(79,140,255,.06));
-  border: 1px solid rgba(79,140,255,.4); border-radius: 12px;
+  background: linear-gradient(90deg, rgba(79,140,255,.18), rgba(79,140,255,.10));
+  border: 1px solid rgba(79,140,255,.5); border-radius: 12px;
   color: var(--text); font-size: 14px;
+  box-shadow: 0 8px 22px rgba(0,0,0,.45);
+  backdrop-filter: blur(2px);
 }
 .progress.hidden { display: none; }
 .progress #progress-text { font-weight: 600; letter-spacing: .2px; }

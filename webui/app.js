@@ -1215,6 +1215,11 @@ function buildShareUrl() {
     params.set("rename_pat", pat);
     params.set("rename_rep", rep);
   }
+  // 数值质量阈值也编码进网址（与手动导出一致）：min_bw 为 bps、max_lat 为 ms。
+  const mb = parseFloat(document.getElementById("op-min-bw").value);
+  const lat = parseInt(document.getElementById("op-max-lat").value, 10);
+  if (!isNaN(mb) && mb > 0) params.set("min_bw", String(Math.round(mb * 1048576)));
+  if (!isNaN(lat) && lat > 0) params.set("max_lat", String(lat));
   return { url: window.location.origin + "/sub?" + params.toString(), unsupported };
 }
 
@@ -1293,8 +1298,17 @@ function buildTransform() {
   const rep = document.getElementById("op-rename-rep").value;
   const rename = pat ? { pattern: pat, replacement: rep } : null;
 
+  // 数值质量阈值：最小带宽（MB/s → bps）、最大延迟（ms）。仅在有值时加入，
+  // 与后端 Transform.min_bandwidth_bps / max_latency_ms 对应。
+  const mb = parseFloat(document.getElementById("op-min-bw").value);
+  const lat = parseInt(document.getElementById("op-max-lat").value, 10);
+  const min_bandwidth_bps = !isNaN(mb) && mb > 0 ? Math.round(mb * 1048576) : null;
+  const max_latency_ms = !isNaN(lat) && lat > 0 ? lat : null;
+
   const t = { filters, sort, rename };
-  if (!filters.length && !sort && !rename) return null;
+  if (min_bandwidth_bps != null) t.min_bandwidth_bps = min_bandwidth_bps;
+  if (max_latency_ms != null) t.max_latency_ms = max_latency_ms;
+  if (!filters.length && !sort && !rename && min_bandwidth_bps == null && max_latency_ms == null) return null;
   return t;
 }
 
