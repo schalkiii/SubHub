@@ -26,6 +26,7 @@
 | **P10** | **节点列表全局排序（跨页，不再是只排当页 50 个）· WebUI 集中「设置」页 + 全局 Top-N 单一真相源 · 手动测速「仅测未测 / 仅失败」模式 · 合并导入防任意覆盖** | ✅ |
 | **P11** | **节点地区识别增强（`region()` 名称/国旗/机场码/2 字母码分级匹配 + 真实节点库补全，OTHER 占比大幅下降）· 手动测速改为 SSE 流式并实时显示进度（当前节点 / Ping / 带宽）· 修复测速接口 405（POST→GET）** | ✅ |
 | **P12** | **导出质量筛选（带宽下限 / 延迟上限，手动导出 + 常驻订阅网址皆可用）· 进度条悬浮常驻（滚动页面始终可见）** | ✅ |
+| **P13** | **节点多选单独测速 + 列表「上次测速」时间列 · 可用性以引擎 gstatic generate_204 实测为准（对齐 clash-verge，消除「TCP 通但协议不通」的假绿）** | ✅ |
 
 ## 架构
 
@@ -134,7 +135,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | GET  | `/api/trends`        | **趋势数据**（Resin 风格）：滚动窗口内的 `TrendPoint` 快照序列（总/可用/未测节点 + 平均延迟），供趋势图使用 |
 | POST | `/api/export`        | 合并并导出（body: `{"format":"clash-meta","transform":{...},"sub_ids":[...],"top_n":N}`），返回 `{format,count,content}`，`top_n` 可临时覆盖全局设置 |
 | GET  | `/sub`               | **本地订阅直接拉取地址**：合并所有（或 `?sub=id1,id2` 指定）订阅，可选 `?format=clash-meta` / `clash` / `v2ray` / `sing-box` / `surge` / `base64` 与算子参数 `?sort=latency&desc=1&rename_pat=.*HK-(.*)&rename_rep=HK-$1&q=关键词&region=HK&type=ss`，返回**纯文本订阅内容**（clash 类为 `text/plain`、v2ray/sing-box 为 `application/json`），无 JSON 包装、无需鉴权。把这个网址直接填进 mihomo / clash / v2rayN / sing-box 的「订阅」即可常驻拉取（详见下文「本地订阅地址」一节） |
-| GET  | `/api/speedtest`     | 手动测速，返回 **SSE 流**（`text/event-stream`），WebUI 据此实时显示进度条与「正在测的节点 / Ping / 带宽」。查询参数：`timeout_ms`（默认 4000）、`concurrency`（默认 20）、`mode`（`all` 全部 / `untested` 只测 `last_tested_at==None` / `failed` 只测 `available==Some(false)`，复用自动刷新增量思路）。事件：`progress`（每个节点完成 **任一阶段** 发一条，含 `done/total/name/available/latency_ms/bandwidth_bps/phase`，`phase` 为 `tcp`/`http`/`bw`）与 `done`（汇总 `tested/reachable/avg_latency_ms`）。**进度总量覆盖全程**：无引擎时 `total = 节点数`（仅 TCP）；配置引擎时 `total = 节点数 × 3`（TCP + HTTP 延迟 + 带宽各占一段），所以进度条**真正到 100% 才结束**，不会在 TCP 完成后卡住。每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟、下行带宽）测完即写回节点记录 |
+| GET  | `/api/speedtest`     | 手动测速，返回 **SSE 流**（`text/event-stream`），WebUI 据此实时显示进度条与「正在测的节点 / Ping / 带宽」。查询参数：`timeout_ms`（默认 4000）、`concurrency`（默认 20）、`mode`（`all` 全部 / `untested` 只测 `last_tested_at==None` / `failed` 只测 `available==Some(false)`，复用自动刷新增量思路）、`ids`（可选，逗号分隔的节点 `fingerprint` 列表，**只测这些选中节点**，供节点页「测速选中」多选使用）。事件：`progress`（每个节点完成 **任一阶段** 发一条，含 `done/total/name/available/latency_ms/bandwidth_bps/phase`，`phase` 为 `tcp`/`http`/`bw`）与 `done`（汇总 `tested/reachable/avg_latency_ms`）。**进度总量覆盖全程**：无引擎时 `total = 节点数`（仅 TCP）；配置引擎时 `total = 节点数 × 3`（TCP + HTTP 延迟 + 带宽各占一段），所以进度条**真正到 100% 才结束**，不会在 TCP 完成后卡住。每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟、下行带宽）测完即写回节点记录。**可用性判定对齐 clash-verge**：配置了 `SUBHUB_ENGINE_BIN` 且本批确有节点经引擎探测成功时，节点的「可用」以**引擎对 gstatic generate_204 的真实代理级 HTTP 探测**为准——TCP 能连但协议层不通的节点会被正确判为不可用，不再出现「SubHub 绿、clash-verge 红」的假绿；引擎未配置或本批全部探测失败时退回 TCP 结果，避免误杀 |
 | POST | `/api/proxy-test`    | **代理可达性测试**（body: `{"proxy":"http://127.0.0.1:7890","url?":"https://..."}`）：经该代理发 HTTP GET（默认 gstatic `generate_204`），15s 超时，返回 `{ok,status|error}`，用于校验「拉取代理」是否可用 |
 
 ## 设置（统一配置）
@@ -219,6 +220,8 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **跳过已测但不可用**的节点（`available == Some(false)`），但**保留未测**（`available == None`）节点，避免误删还没来得及测速的节点。
 
 服务端会在日志打印「导出时去除 N 个无效节点」，便于核对导出结果。这能避免把好节点之外的垃圾节点（尤其是 `other` 类型的「伪节点」）导出到 mihomo / clash 后整份订阅被拒。
+
+- **导出代理名自动去重**：clash / v2ray / sing-box / surge 都按**代理名**作唯一键。两个不同节点（如地区重命名规则把同地区节点都改成同一名字、或不同订阅本就重名）共享显示名时，客户端会报 `... is the duplicate name` 而拒绝整份配置。导出时首个同名节点保留原名，后续撞名追加 ` #2` / ` #3` 后缀，确保订阅可被正常加载（两个节点都会保留，仅名字不同）。
 
 ## 节点地区识别（region 与 outbound_country）
 

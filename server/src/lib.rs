@@ -388,6 +388,13 @@ pub struct SpeedTestReq {
     /// don't re-hammer already-known nodes.
     pub mode: Option<String>,
 
+    /// Restrict the manual speedtest to specific nodes, identified by their
+    /// `fingerprint` (comma-separated). Optional — when present, only the listed
+    /// nodes are tested. Backs the WebUI's "测速选中节点" multi-select so users
+    /// can re-test a handful of chosen nodes without hammering the whole list.
+    /// Fingerprints not found in the current store are silently ignored.
+    pub ids: Option<String>,
+
 }
 
 
@@ -915,7 +922,24 @@ fn persist_results(
 
         .collect();
 
-    let mut by_fp: std::collections::HashMap<String, (Option<u64>, bool, Option<f64>, bool)> =
+    // When an external engine is configured AND it actually produced at least
+    // one successful probe this run, treat the engine's real HTTP probe to
+    // gstatic generate_204 as the availability authority — mirroring how
+    // clash-verge tests connectivity (it IS mihomo, which hits generate_204
+    // through the node's tunnel). A node that opens a TCP connection but fails
+    // the real proxy-level HTTP check is then correctly marked unavailable
+    // instead of showing a false "green". When the engine is absent or broken
+    // (no successful probe at all), we fall back to the raw TCP result so a
+    // misconfigured engine can never mass-flag every node.
+    let engine_configured = engine_bin_of(state)
+        .map(|b| std::path::Path::new(&b).exists())
+        .unwrap_or(false);
+    let engine_active = engine_configured && http.iter().any(|x| x.is_some());
+
+    // (latency_ms, tcp_available, engine_http_ms, download_speed_bps, bandwidth_measured)
+    type PersistRow = (Option<u64>, bool, Option<u64>, Option<f64>, bool);
+
+    let mut by_fp: std::collections::HashMap<String, PersistRow> =
 
         std::collections::HashMap::new();
 
@@ -927,10 +951,6 @@ fn persist_results(
 
         let lat = r.tcp_latency_ms.or(h);
 
-        // A node the engine successfully probed over its own tunnel is genuinely
-        // reachable even if direct TCP to it was blocked, so count it alive.
-        let avail = r.available || h.is_some();
-
         // Prefer the real engine bandwidth when present; otherwise fall back to
         // the engine-free TCP throughput estimate carried on the TCP result so
         // the 速度 column is populated even without SUBHUB_ENGINE_BIN. Only the
@@ -941,7 +961,9 @@ fn persist_results(
             None => (r.download_speed_bps, false),
         };
 
-        by_fp.insert(r.fingerprint.clone(), (lat, avail, dl, measured));
+        // Store raw TCP availability + engine HTTP result separately; the final
+        // `available` is decided per stored node below (needs `is_exportable`).
+        by_fp.insert(r.fingerprint.clone(), (lat, r.available, h, dl, measured));
 
     }
 
@@ -955,11 +977,19 @@ fn persist_results(
 
         for p in sub.proxies.iter_mut() {
 
-            if let Some((lat, avail, dl, measured)) = by_fp.get(&p.fingerprint()) {
+            if let Some((lat, tcp_avail, h, dl, measured)) = by_fp.get(&p.fingerprint()) {
 
                 p.latency_ms = *lat;
 
-                p.available = Some(*avail);
+                // 可用性：引擎活跃时，对「引擎可表示」的节点以引擎的 gstatic
+                // generate_204 实测为准（对齐 clash-verge）；不可导出节点
+                // （Other / 缺字段）引擎测不了，退回 TCP 结果，避免误杀。
+                let avail = if engine_active && p.is_exportable() {
+                    h.is_some()
+                } else {
+                    *tcp_avail
+                };
+                p.available = Some(avail);
 
                 p.last_tested_at = Some(now);
 
@@ -974,7 +1004,7 @@ fn persist_results(
                 // Consecutive-failure tracking for the auto-remove feature.
                 // Only a *tested* failure (`Some(false)`) counts; an untested
                 // node (`None`) is left alone, and any success resets the run.
-                if *avail {
+                if avail {
                     p.consecutive_failures = 0;
                 } else {
                     p.consecutive_failures = p.consecutive_failures.saturating_add(1);
@@ -2969,6 +2999,25 @@ async fn speedtest(
         proxies
     } else {
         apply_mode(proxies, &mode)
+    };
+
+    // 可选「选中节点」过滤（WebUI 的多选测速）：只保留列出的 fingerprint。
+    let proxies = if let Some(ids) = &req.ids {
+        let want: std::collections::HashSet<String> = ids
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if want.is_empty() {
+            proxies
+        } else {
+            proxies
+                .into_iter()
+                .filter(|p| want.contains(&p.fingerprint()))
+                .collect()
+        }
+    } else {
+        proxies
     };
 
 

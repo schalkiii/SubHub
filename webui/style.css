@@ -245,6 +245,12 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 .btn-del-node:hover { background: rgba(195,58,47,.16); color: var(--danger); border-color: rgba(195,58,47,.5); }
 .btn-del-node:disabled { opacity: .4; cursor: default; }
 
+/* 节点多选复选框列 + 上次测速列 */
+#nodes-table .col-check { width: 36px; text-align: center; padding-left: 0; padding-right: 0; }
+#nodes-table td.col-check { text-align: center; }
+#nodes-table .col-check input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
+#nodes-table .lasttest-cell { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; }
+
 /* sortable column headers + active sort indicators */
 #nodes-table th[data-sort] { cursor: pointer; user-select: none; }
 #nodes-table th[data-sort]:hover { color: var(--text); }

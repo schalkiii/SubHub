@@ -131,6 +131,7 @@
             <option value="failed">仅测速失败</option>
           </select>
           <button class="btn" id="btn-speedtest">测速</button>
+          <button class="btn" id="btn-speedtest-selected" title="先勾选节点前的复选框，再仅测这些选中的节点">测速选中</button>
           <button class="btn" id="btn-geo">出口地区</button>
           <button class="btn" id="btn-unlock">解锁检测</button>
           <button class="btn danger" id="btn-cleanup">清理不可用</button>
@@ -140,7 +141,7 @@
         <div class="panel table-wrap">
           <table id="nodes-table">
             <thead>
-              <tr><th>名称</th><th>归属订阅</th><th>类型</th><th>服务器</th><th>端口</th><th>地区</th><th>出口</th><th data-sort="latency">延迟</th><th data-sort="speed" title="速度（TCP 吞吐估算；配置测速引擎 SUBHUB_ENGINE_BIN 可得真实带宽）">速度</th><th>解锁</th><th>状态</th><th data-sort="score">评分</th><th>操作</th></tr>
+              <tr><th class="col-check"><input type="checkbox" id="check-all" title="全选本页节点" /></th><th>名称</th><th>归属订阅</th><th>类型</th><th>服务器</th><th>端口</th><th>地区</th><th>出口</th><th data-sort="latency">延迟</th><th data-sort="speed" title="速度（TCP 吞吐估算；配置测速引擎 SUBHUB_ENGINE_BIN 可得真实带宽）">速度</th><th>解锁</th><th>状态</th><th data-sort="score">评分</th><th>上次测速</th><th>操作</th></tr>
             </thead>
             <tbody></tbody>
           </table>
