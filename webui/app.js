@@ -892,7 +892,7 @@ function renderNodes(list) {
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
       <td class="lasttest-cell">${formatLastTested(p.last_tested_at)}</td>
-      <td class="row-actions"><button class="btn btn-del-node" data-sub="${escapeHtml(p.sub_id)}" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" title="删除该节点">✕</button></td>
+      <td class="row-actions"><button class="btn btn-copy-yaml" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" title="复制该节点原始 clash-meta YAML（与测速/导出同源，便于在 clash-verge 中 1:1 比对）">Y</button><button class="btn btn-del-node" data-sub="${escapeHtml(p.sub_id)}" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" title="删除该节点">✕</button></td>
     </tr>`;
   };
 
@@ -980,6 +980,26 @@ document.querySelector("#nodes-table thead").addEventListener("click", (e) => {
 // delegated delete handler for the per-node "✕" buttons (rows are re-rendered
 // on every load, so we listen on the stable table element instead).
 document.getElementById("nodes-table").addEventListener("click", async (e) => {
+  // 复制该节点原始 clash-meta YAML：与 SubHub 测速/导出同源，便于在 clash-verge 等
+  // 客户端 1:1 比对。若这份 YAML 在 clash-verge 也通，则分歧在其订阅预处理/缓存；
+  // 若也不通，则该节点本身在对应核心下确有协议层问题（提供可复现样本）。
+  const ybtn = e.target.closest(".btn-copy-yaml");
+  if (ybtn) {
+    const fp = ybtn.dataset.fp;
+    const name = ybtn.dataset.name || "该节点";
+    try {
+      const r = await api(`/api/proxy-yaml?fp=${encodeURIComponent(fp)}`);
+      if (r.yaml) {
+        try { await navigator.clipboard.writeText(r.yaml); } catch { /* 退化为 prompt */ }
+        window.prompt(`已复制「${name}」的 clash-meta YAML 到剪贴板，也可手动复制：`, r.yaml);
+      } else {
+        alert("未找到该节点（可能已删除，请刷新列表）。");
+      }
+    } catch (err) {
+      alert("获取节点 YAML 失败：" + err.message);
+    }
+    return;
+  }
   const btn = e.target.closest(".btn-del-node");
   if (!btn) return;
   const name = btn.dataset.name || "该节点";
