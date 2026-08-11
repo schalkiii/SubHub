@@ -640,4 +640,40 @@ mod tests {
         assert!(yaml.contains("1.1.1.1"), "原节点 A 必须保留");
         assert!(yaml.contains("2.2.2.2"), "原节点 B 必须保留");
     }
+
+    #[test]
+    fn vmess_export_emits_required_protocol_fields() {
+        // mihomo / clash-verge 的 VMess 节点必须带齐 uuid / alterId / cipher / tls
+        // 等字段才能完成真实协议握手。导出链路（to_clash_meta）与 SubHub 引擎测速
+        // 用的 build_engine_config 是同一份序列化产物，故导出 fidelity 是单一真相源
+        // —— 节点在 SubHub 引擎侧能通、在 clash-verge 侧不通，差异来自两侧使用的
+        // mihomo 核心二进制/版本，而非导出缺字段。这里锁定关键字段防回归。
+        let mut p = mk(ProxyType::Vmess, "tw.example.com", 443);
+        p.uuid = Some("uuid-1234".into());
+        p.alter_id = Some(0);
+        p.cipher = Some("auto".into());
+        p.tls = Some(true);
+        p.sni = Some("tw.example.com".into());
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(yaml.contains("type: vmess"), "type must be vmess");
+        assert!(yaml.contains("uuid: uuid-1234"));
+        assert!(yaml.contains("alterId: 0"));
+        assert!(yaml.contains("cipher: auto"));
+        assert!(yaml.contains("tls: true"), "vmess tls 必须导出");
+        assert!(yaml.contains("sni: tw.example.com"));
+    }
+
+    #[test]
+    fn trojan_export_emits_tls_true_and_sni() {
+        // Trojan 导出必须带 tls: true（to_clash_meta 对 Trojan 强制 tls），否则
+        // clash-verge 侧协议握手失败。锁定该行为。
+        let mut p = mk(ProxyType::Trojan, "tw2.example.com", 443);
+        p.password = Some("pw".into());
+        p.sni = Some("tw2.example.com".into());
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(yaml.contains("type: trojan"));
+        assert!(yaml.contains("password: pw"));
+        assert!(yaml.contains("tls: true"), "trojan 导出必须带 tls: true");
+        assert!(yaml.contains("sni: tw2.example.com"));
+    }
 }
