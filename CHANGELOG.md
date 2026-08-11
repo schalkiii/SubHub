@@ -12,6 +12,12 @@
 ### Changed
 - 消除「假绿」：此前只要 TCP 能连就标为可用，导致「SubHub 显示可达、clash-verge 却测不通」的节点被误判为可用。现当引擎活跃时，TCP 通但协议层（TLS/SNI/传输/代理握手）不通的节点会被正确判为不可用；引擎未配置或本批全部探测失败时退回 TCP 结果，避免误杀全量节点。
 
+## [P14] 单节点 YAML 复制（跨客户端 1:1 比对调试）
+
+### Added
+- **「复制节点 YAML」按钮**（节点表每行操作列「Y」）：调用 `GET /api/proxy-yaml?fp=<fingerprint>`，返回该节点经 `to_clash_meta` 序列化的 clash-meta 配置——与 SubHub 测速引擎、导出**同源同产物**。一键复制到剪贴板，可粘进 clash-verge-rev 等客户端直接测同一节点。
+- 用途：当「SubHub 能通、clash-verge 不通」且两侧使用同一 mihomo 二进制时，用这份精确 YAML 在 clash-verge 1:1 复现——若通，则分歧在 clash-verge 的订阅预处理/缓存；若仍不通，则提供可复现样本继续排查协议层问题。
+
 ## [P12] 导出质量筛选 + 进度条悬浮常驻
 
 ### Added

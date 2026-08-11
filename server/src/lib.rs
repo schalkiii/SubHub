@@ -1757,6 +1757,35 @@ async fn list_subscriptions(
 
 }
 
+/// Request for the single-node raw YAML endpoint: resolve one node by its
+/// stable `fingerprint` and return the exact clash-meta YAML SubHub feeds to the
+/// speed-test engine (and therefore exports). Lets the user copy the precise
+/// config into another client (e.g. clash-verge-rev) to 1:1 verify whether a
+/// "SubHub can use it but client X cannot" divergence is a config/version
+/// difference on the client side.
+#[derive(Deserialize)]
+struct SingleFp {
+    fp: String,
+}
+
+/// Return the raw clash-meta YAML for a single node (looked up by fingerprint
+/// across all subscriptions). `yaml` is `null` when no matching node exists.
+async fn proxy_yaml(
+    State(state): State<AppState>,
+    Query(q): Query<SingleFp>,
+) -> Json<serde_json::Value> {
+    let guard = state.store.lock_ok();
+    for sub in guard.iter() {
+        for p in &sub.proxies {
+            if p.fingerprint() == q.fp {
+                let yaml = subhub_core::to_clash_meta(std::slice::from_ref(p));
+                return Json(serde_json::json!({ "yaml": yaml, "name": p.name }));
+            }
+        }
+    }
+    Json(serde_json::json!({ "yaml": null, "name": null }))
+}
+
 
 
 /// Request to delete a single node from a subscription. `fingerprint` is the
@@ -3550,6 +3579,8 @@ pub async fn run_server() {
         .route("/sub/", get(sub_export))
 
         .route("/api/speedtest", get(speedtest))
+
+        .route("/api/proxy-yaml", get(proxy_yaml))
 
         .route("/api/proxy-test", post(proxy_test))
 

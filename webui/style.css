@@ -236,7 +236,13 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 /* danger button (cleanup) */
 .btn.danger { background: rgba(195,58,47,.14); color: var(--danger); border-color: rgba(195,58,47,.4); }
 .btn.danger:hover { background: rgba(195,58,47,.24); }
-.row-actions { width: 44px; text-align: center; }
+.row-actions { width: 64px; text-align: center; white-space: nowrap; }
+.btn-copy-yaml {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  width: 26px; height: 26px; line-height: 1; border-radius: 6px; cursor: pointer;
+  font-size: 12px; padding: 0; margin-right: 4px; transition: all .12s ease;
+}
+.btn-copy-yaml:hover { background: rgba(79,140,255,.16); color: var(--accent); border-color: rgba(79,140,255,.5); }
 .btn-del-node {
   background: transparent; border: 1px solid var(--border); color: var(--muted);
   width: 26px; height: 26px; line-height: 1; border-radius: 6px; cursor: pointer;
