@@ -856,10 +856,18 @@ function renderNodes(list) {
   const tbody = document.querySelector("#nodes-table tbody");
   const rowHtml = (p) => {
     const lat = p.latency_ms != null ? `${p.latency_ms} ms` : "—";
+    // 带宽只有配置 SUBHUB_ENGINE_BIN 后才是真实代理吞吐；否则 download_speed_bps
+    // 只是 TCP 连接吞吐估算，并非真实可用带宽。未实测时用「≈」标注，避免把
+    // 「TCP 能连」误当成「节点可用」（真实协议连通性需经引擎访问 gstatic）。
     const speed =
       p.download_speed_bps != null
-        ? `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`
+        ? (p.bandwidth_measured
+            ? `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`
+            : `≈${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`)
         : "—";
+    const speedTitle = p.bandwidth_measured
+      ? "真实代理下行带宽（经测速引擎实测）"
+      : "TCP 吞吐估算，非真实代理带宽（未配置测速引擎 SUBHUB_ENGINE_BIN）";
     const unlock = p.unlock ? summaryUnlock(p.unlock) : "—";
     const avail =
       p.available === false ? "down" : p.available === true ? "up" : "unknown";
@@ -879,7 +887,7 @@ function renderNodes(list) {
       <td>${escapeHtml(p.outbound_country || p.region || "OTHER")}</td>
       <td>${escapeHtml(p.outbound_country || "—")}</td>
       <td class="${latencyClass(p.latency_ms)}">${lat}</td>
-      <td>${speed}</td>
+      <td title="${speedTitle}">${speed}</td>
       <td class="unlock-cell">${escapeHtml(unlock)}</td>
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
