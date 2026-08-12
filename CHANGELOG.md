@@ -10,6 +10,10 @@
 ### Added
 - 实证验证：以真实 verge-mihomo 引擎对 TWN vless 节点做 gstatic 探测，结果为 `None`（不可用），确认误报来自 TCP 回退而非引擎判定错误。
 
+### Fixed（同轮补充）
+- **「测速选中」对含逗号 fingerprint 的节点静默失效**：`/api/speedtest` 的 `ids` 原用逗号拼接分隔，而 vless+ws 等节点的 fingerprint 本身含逗号（如 `path` 字段），被逗号切碎后永远匹配不到，导致这类节点「选中测速」实际测了 0 个、残留旧绿。`ids` 改为 URL 编码的 **JSON 数组**（`ids=["<fp1>","<fp2>"]`），WebUI 侧同步改为 `JSON.stringify(选中的指纹列表)`，彻底规避分隔符冲突。
+- **判定不可用时清除旧 ping/带宽**：节点被判定为不可用（尤其是修复后由引擎实测纠正的「旧绿」节点）后，立即清空 `latency_ms` / `download_speed_bps` / `bandwidth_measured`，避免上一轮 TCP 回退留下的假延迟、假速度继续误导界面。仅当本次确有测量值（引擎带宽 / 延迟）时才写回。
+
 ## [P13] 节点多选测速 + 上次测速列 + 可用性对齐 gstatic
 
 ### Added
