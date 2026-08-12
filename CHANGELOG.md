@@ -2,6 +2,18 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P16] 关闭最小化到托盘 + 修复任务栏图标
+
+### Added
+- **系统托盘常驻**：应用启动后在系统托盘显示图标，左键单击恢复窗口；右键菜单含「显示 SubHub / 退出」。
+- **关闭最小化到托盘（非退出）**：点右上角关闭按钮不再结束进程，而是隐藏窗口到托盘（`on_window_event` 拦截 `WindowEvent::CloseRequested`，`prevent_close()` + `window.hide()`）；仅托盘菜单的「退出」会真正终止应用（含后台测速引擎线程）。
+
+### Fixed
+- **任务栏图标显示不正常**：根因是 `app/icons/` 下 `icon.ico` / `icon.png` / `icon_preview.png` 三个图标文件**均为 0 字节空文件**，Tauri 无可加载图标，只能回退为默认/空白图标。已用 `tauri icon` 从源图重新生成全套有效图标（`icon.ico` 8561B、`icon.png` 4891B、`icon_preview.png` 19948B 等），并在 `WebviewWindowBuilder` 上显式 `.icon(app.default_window_icon())` 关联应用默认图标，确保 Windows 任务栏图标正常显示。同时清理了与桌面程序无关的 `android/`、`ios/` 移动端图标目录。
+
+### Changed
+- `app/Cargo.toml`：`tauri` 启用 `tray-icon` feature（托盘所需）。
+
 ## [P15] 修复已配置引擎时的「假绿」误报（TCP 回退）
 
 ### Fixed
@@ -14,6 +26,12 @@
 ### Fixed（同轮补充）
 - **「测速选中」对含逗号 fingerprint 的节点静默失效**：`/api/speedtest` 的 `ids` 原用逗号拼接分隔，而 vless+ws 等节点的 fingerprint 本身含逗号（如 `path` 字段），被逗号切碎后永远匹配不到，导致这类节点「选中测速」实际测了 0 个、残留旧绿。`ids` 改为 URL 编码的 **JSON 数组**（`ids=["<fp1>","<fp2>"]`），WebUI 侧同步改为 `JSON.stringify(选中的指纹列表)`，彻底规避分隔符冲突。
 - **判定不可用时清除旧 ping/带宽**：节点被判定为不可用（尤其是修复后由引擎实测纠正的「旧绿」节点）后，立即清空 `latency_ms` / `download_speed_bps` / `bandwidth_measured`，避免上一轮 TCP 回退留下的假延迟、假速度继续误导界面。仅当本次确有测量值（引擎带宽 / 延迟）时才写回。
+
+### Fixed（同轮补充 · 进度条体验）
+- **根因：前端改动一直「看似不生效」**：WebUI 由后台 axum 在运行时通过 `ServeDir` 直接从 `webui/` 目录提供（**不嵌入 exe**）。此前多轮改 CSS/JS 后「问题依旧」，真实原因是 **app 进程始终未关闭**（编译时报「拒绝访问、无法覆盖 exe」即为旧进程锁文件的铁证），旧进程持续加载旧前端，与代码改动无关。已让用户关闭并重启后生效。
+- **加固：静态响应加 `no-cache`**：在 `ServeDir`（fallback 静态服务）外层包 `SetResponseHeaderLayer`（`Cache-Control: no-cache`），避免 webview 缓存旧 `app.js/style.css`，确保修改后重启必加载新前端。注意：该头加在 Router 顶层对 `fallback_service` 的响应**不生效**，必须直接包在 `ServeDir` 之上。
+- **进度条悬浮失效（滚动后看不到）**：P12 用 `position: sticky`，但 `.content` 自身是滚动容器（`overflow:auto`），sticky 会随内容滚出视口。改为 `position: fixed` 悬浮视口顶部（`top:0`），并给 `body.has-progress .content` 加 `padding-top` 避让（JS 在显示/收起进度条时切换 `body` 的 `has-progress` 类）。
+- **进度条来回跳（三千多↔八千多）**：后端三阶段（TCP / HTTP / BW）`done` 严格单调、分母 `total` 恒定，不会回退；观感「来回跳」主要来自横幅里那个 CSS 无限左右滑动的「不确定进度条」动画（`@keyframes prog`）。已改为测速时隐藏该动画条，仅保留确定性进度条；并额外让前端进度只增不减（记录「已见最大 `done`」与首次确定的 `total`）作为保险。
 
 ## [P13] 节点多选测速 + 上次测速列 + 可用性对齐 gstatic
 
