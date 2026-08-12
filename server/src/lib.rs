@@ -925,15 +925,17 @@ fn persist_results(
 
         .collect();
 
-    // 可用性判定（对齐 clash-verge）：引擎「已配置」时，以引擎对节点的
-    // gstatic generate_204 实测为唯一权威，逐节点用 h.is_some() 判定，
-    // 不再回退裸 TCP——否则会出现「TCP 能连上端口、但代理隧道不通」的误报
-    // （本仓库 TWN vless 节点即此类：35.187.156.27:443 是 Google 的 443 端口，
-    // TCP 一定可连，但代理本身不可用）。仅当引擎完全未配置时，才退而使用
-    // 裸 TCP 可用性作为唯一可用信号。
+    // 可用性判定（对齐 clash-verge）：引擎「已配置且本批确有节点经 gstatic
+    // generate_204 实测成功」(engine_usable) 时，逐节点以引擎结果 h.is_some()
+    // 为权威——TCP 能连端口但代理隧道不通的节点会被正确判红（如
+    // 35.187.156.27:443 这类 Google 443 端口）。而当「引擎未配置」或
+    // 「本批 0 个节点探测成功（引擎可能整体故障/超时过严）」时，回退裸 TCP，
+    // 避免 mass-red 让用户完全无法使用（这是引擎临时起进程测速的兜底，区别于
+    // clash-verge 那种常驻引擎不会整体故障的场景）。
     let engine_configured = engine_bin_of(state)
         .map(|b| std::path::Path::new(&b).exists())
         .unwrap_or(false);
+    let engine_usable = engine_configured && http.iter().any(|x| x.is_some());
 
     // (latency_ms, tcp_available, engine_http_ms, download_speed_bps, bandwidth_measured)
     type PersistRow = (Option<u64>, bool, Option<u64>, Option<f64>, bool);
@@ -978,10 +980,9 @@ fn persist_results(
 
             if let Some((lat, tcp_avail, h, dl, measured)) = by_fp.get(&p.fingerprint()) {
 
-                // 引擎已配置 → 以引擎 gstatic 实测为权威（逐节点 h.is_some()）；
-                // 引擎未配置 → 使用裸 TCP 可用性。不再在「引擎已配置但本次
-                // 全部探测失败」时回退 TCP，避免已连端口却代理不可用的误报。
-                let avail = if engine_configured {
+                // engine_usable: 引擎本批确有成功探测 → 信任逐节点引擎结果；
+                // 否则回退 TCP（引擎未配置，或整体故障/全超时 → 不能 mass-red）。
+                let avail = if engine_usable {
                     h.is_some()
                 } else {
                     *tcp_avail
