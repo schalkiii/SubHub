@@ -283,17 +283,19 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 .switch-label { color: var(--text); font-size: 13px; white-space: nowrap; }
 
-/* global progress / hint banner（悬浮：滚动页面时始终固定在内容区顶部可见） */
+/* global progress / hint banner（悬浮：脱离内容区滚动流，始终固定在视口顶部可见） */
 .progress {
-  position: sticky; top: 0; z-index: 50;
+  position: fixed; left: 0; right: 0; top: 0; z-index: 100;
   display: flex; align-items: center; gap: 12px;
-  padding: 11px 16px; margin-bottom: 14px;
+  padding: 11px 16px;
   background: linear-gradient(90deg, rgba(79,140,255,.18), rgba(79,140,255,.10));
-  border: 1px solid rgba(79,140,255,.5); border-radius: 12px;
+  border-bottom: 1px solid rgba(79,140,255,.5);
   color: var(--text); font-size: 14px;
   box-shadow: 0 8px 22px rgba(0,0,0,.45);
   backdrop-filter: blur(2px);
 }
+/* 悬浮条出现时，给内容区顶部留出避让空间，避免遮挡首行内容 */
+body.has-progress .content { padding-top: 56px; }
 .progress.hidden { display: none; }
 .progress #progress-text { font-weight: 600; letter-spacing: .2px; }
 .progress .bar {
@@ -306,6 +308,9 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
   animation: prog 1.15s ease-in-out infinite;
 }
 @keyframes prog { 0% { margin-left: -42%; } 100% { margin-left: 100%; } }
+/* 测速时 #progress-detail 展开、确定性进度条已可见，隐藏横幅里这个左右滑动的
+   “不确定进度条”动画，避免被误认为“进度来回跳” */
+.progress:has(#progress-detail:not(.hidden)) .bar { display: none; }
 .spinner {
   width: 18px; height: 18px; flex: 0 0 auto;
   border: 3px solid rgba(126,176,255,.35); border-top-color: var(--accent);

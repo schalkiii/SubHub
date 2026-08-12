@@ -32,21 +32,41 @@ function hideProgress() {
   // 收起测速专用的实时进度区（仅测速时短暂显示）
   const detail = document.getElementById("progress-detail");
   if (detail) detail.classList.add("hidden");
+  document.body.classList.remove("has-progress");
 }
+// 测速进度状态：记录已见过的“最大完成数”与首次确定的总数，保证进度条
+// 只增不减——后端三阶段（tcp/http/bw）并发回调时 done 可能乱序到达，
+// 直接按 done/total 算百分比会导致进度条来回跳。
+const _speedState = { maxDone: 0, total: 0, seenTotal: false };
+
 // 测速专用：显示实时进度条 + 当前被测节点区，并重置进度
 function showSpeedProgress(text) {
   showProgress(text);
+  // 标记 body，让 CSS 给内容区顶部留出避让空间（见 style.css 的 body.has-progress）
+  document.body.classList.add("has-progress");
   const detail = document.getElementById("progress-detail");
   if (detail) detail.classList.remove("hidden");
   const fill = document.getElementById("progress-fill");
   if (fill) fill.style.width = "0%";
   const cur = document.getElementById("progress-current");
   if (cur) cur.textContent = "";
+  _speedState.maxDone = 0;
+  _speedState.total = 0;
+  _speedState.seenTotal = false;
 }
 // 根据单个 Progress 事件刷新进度条与“当前节点”行
 function updateSpeedProgress(ev) {
   const { done, total, name, available, latency_ms, bandwidth_bps, phase } = ev;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  // 总数只在首次确定（后端 unit_total = N*3，阶段间保持不变），
+  // 后续事件即使 total 偶发为 0 也以首个有效值为准，避免分母跳变。
+  if (total > 0 && !_speedState.seenTotal) {
+    _speedState.total = total;
+    _speedState.seenTotal = true;
+  }
+  // 进度单调：取“已完成数”与历史最大值的最大值，杜绝回退观感。
+  if (done > _speedState.maxDone) _speedState.maxDone = done;
+  const effTotal = _speedState.total || total || 1;
+  const pct = Math.min(100, Math.round((_speedState.maxDone / effTotal) * 100));
   const fill = document.getElementById("progress-fill");
   if (fill) fill.style.width = pct + "%";
   const cur = document.getElementById("progress-current");
@@ -59,7 +79,7 @@ function updateSpeedProgress(ev) {
       ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s"
       : (phase === "bw" ? "测速中" : "—");
     const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
-    cur.textContent = `(${done}/${total}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
+    cur.textContent = `(${_speedState.maxDone}/${effTotal}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
   }
 }
 

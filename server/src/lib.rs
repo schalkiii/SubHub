@@ -13,6 +13,8 @@ use axum::{
 };
 
 use serde::{Deserialize, Serialize};
+// `SetResponseHeaderLayer` 的 `.layer()` 需要 tower 的 `Layer` trait 在作用域。
+use tower::Layer;
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -3605,12 +3607,19 @@ pub async fn run_server() {
 
         .with_state(state)
 
+        // ServeDir 提供 WebUI 静态文件（运行时直接从 webui/ 读取，非嵌入 exe）。
+        // 包一层 `no-cache`，避免 webview 缓存旧的 app.js/style.css，导致修改
+        // 前端后重启仍“看似没生效”。（注：把该 header 加在 Router 顶层对
+        // fallback_service 的响应不生效，必须直接包在 ServeDir 之上。）
         .fallback_service(
-
-            tower_http::services::ServeDir::new(static_dir)
-
-                .append_index_html_on_directories(true),
-
+            tower_http::set_header::SetResponseHeaderLayer::overriding(
+                axum::http::HeaderName::from_static("cache-control"),
+                axum::http::HeaderValue::from_static("no-cache"),
+            )
+            .layer(
+                tower_http::services::ServeDir::new(static_dir)
+                    .append_index_html_on_directories(true),
+            ),
         );
 
 
