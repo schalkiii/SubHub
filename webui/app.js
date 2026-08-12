@@ -1094,7 +1094,10 @@ document.getElementById("btn-speedtest-selected").addEventListener("click", asyn
   if (resultEl) resultEl.textContent = "";
   showSpeedProgress(`正在测速选中的 ${ids.length} 个节点（TCP 延迟 → 引擎 HTTP 延迟 → 带宽）…`);
   const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20 });
-  params.set("ids", ids.join(","));
+  // fingerprint 本身含逗号（常见于 vless+ws 的 path），不能用逗号拼接，
+  // 否则服务端按逗号切割会把 fingerprint 切碎、静默匹配不到。改为把选中
+  // 的 fingerprint 列表作为一个 URL 编码的 JSON 数组传给 ids 参数。
+  params.set("ids", JSON.stringify(ids));
   try {
     const summary = await runSpeedtest(params);
     await loadNodes();

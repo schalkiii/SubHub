@@ -389,10 +389,13 @@ pub struct SpeedTestReq {
     pub mode: Option<String>,
 
     /// Restrict the manual speedtest to specific nodes, identified by their
-    /// `fingerprint` (comma-separated). Optional — when present, only the listed
-    /// nodes are tested. Backs the WebUI's "测速选中节点" multi-select so users
-    /// can re-test a handful of chosen nodes without hammering the whole list.
-    /// Fingerprints not found in the current store are silently ignored.
+    /// `fingerprint`. The value is a **URL-encoded JSON array** of fingerprints
+    /// (`ids=["<fp1>","<fp2>"]`), NOT a comma-joined string: fingerprints
+    /// themselves contain commas (e.g. a vless+ws `path` field), so a comma
+    /// delimiter would fragment them and silently match nothing — breaking the
+    /// WebUI "测速选中节点" multi-select for exactly those nodes. When absent or
+    /// empty, every node is tested. Fingerprints not found in the store are
+    /// silently ignored.
     pub ids: Option<String>,
 
 }
@@ -975,8 +978,6 @@ fn persist_results(
 
             if let Some((lat, tcp_avail, h, dl, measured)) = by_fp.get(&p.fingerprint()) {
 
-                p.latency_ms = *lat;
-
                 // 引擎已配置 → 以引擎 gstatic 实测为权威（逐节点 h.is_some()）；
                 // 引擎未配置 → 使用裸 TCP 可用性。不再在「引擎已配置但本次
                 // 全部探测失败」时回退 TCP，避免已连端口却代理不可用的误报。
@@ -989,13 +990,23 @@ fn persist_results(
 
                 p.last_tested_at = Some(now);
 
-                if let Some(b) = dl {
-
-                    p.download_speed_bps = Some(*b);
-
+                // 判定不可用时，清除上一轮残留的延迟/带宽，避免「旧绿数据」
+                // 继续误导（例如修复前 TCP 回退留下的假 ping / 假速度）。
+                // 仅当本次确有测量值（引擎带宽 / 延迟）时才写回，未测出的
+                // 字段一律清空。
+                if avail {
+                    p.latency_ms = *lat;
+                    if let Some(b) = dl {
+                        p.download_speed_bps = Some(*b);
+                    } else {
+                        p.download_speed_bps = None;
+                    }
+                    p.bandwidth_measured = *measured;
+                } else {
+                    p.latency_ms = None;
+                    p.download_speed_bps = None;
+                    p.bandwidth_measured = false;
                 }
-
-                p.bandwidth_measured = *measured;
 
                 // Consecutive-failure tracking for the auto-remove feature.
                 // Only a *tested* failure (`Some(false)`) counts; an untested
@@ -3027,22 +3038,26 @@ async fn speedtest(
     };
 
     // 可选「选中节点」过滤（WebUI 的多选测速）：只保留列出的 fingerprint。
-    let proxies = if let Some(ids) = &req.ids {
-        let want: std::collections::HashSet<String> = ids
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if want.is_empty() {
-            proxies
-        } else {
-            proxies
-                .into_iter()
-                .filter(|p| want.contains(&p.fingerprint()))
+    // `ids` 是 URL 编码的 JSON 数组字符串，按 JSON 解析，避免 fingerprint 内
+    // 逗号（常见于 vless+ws 的 path）被分隔符误切导致静默匹配不到。
+    let selected: std::collections::HashSet<String> = req
+        .ids
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .map(|v| {
+            v.into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect()
-        }
+        })
+        .unwrap_or_default();
+    let proxies = if selected.is_empty() {
+        proxies
     } else {
         proxies
+            .into_iter()
+            .filter(|p| selected.contains(&p.fingerprint()))
+            .collect()
     };
 
 
