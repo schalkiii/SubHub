@@ -922,19 +922,15 @@ fn persist_results(
 
         .collect();
 
-    // When an external engine is configured AND it actually produced at least
-    // one successful probe this run, treat the engine's real HTTP probe to
-    // gstatic generate_204 as the availability authority — mirroring how
-    // clash-verge tests connectivity (it IS mihomo, which hits generate_204
-    // through the node's tunnel). A node that opens a TCP connection but fails
-    // the real proxy-level HTTP check is then correctly marked unavailable
-    // instead of showing a false "green". When the engine is absent or broken
-    // (no successful probe at all), we fall back to the raw TCP result so a
-    // misconfigured engine can never mass-flag every node.
+    // 可用性判定（对齐 clash-verge）：引擎「已配置」时，以引擎对节点的
+    // gstatic generate_204 实测为唯一权威，逐节点用 h.is_some() 判定，
+    // 不再回退裸 TCP——否则会出现「TCP 能连上端口、但代理隧道不通」的误报
+    // （本仓库 TWN vless 节点即此类：35.187.156.27:443 是 Google 的 443 端口，
+    // TCP 一定可连，但代理本身不可用）。仅当引擎完全未配置时，才退而使用
+    // 裸 TCP 可用性作为唯一可用信号。
     let engine_configured = engine_bin_of(state)
         .map(|b| std::path::Path::new(&b).exists())
         .unwrap_or(false);
-    let engine_active = engine_configured && http.iter().any(|x| x.is_some());
 
     // (latency_ms, tcp_available, engine_http_ms, download_speed_bps, bandwidth_measured)
     type PersistRow = (Option<u64>, bool, Option<u64>, Option<f64>, bool);
@@ -981,10 +977,10 @@ fn persist_results(
 
                 p.latency_ms = *lat;
 
-                // 可用性：引擎活跃时，对「引擎可表示」的节点以引擎的 gstatic
-                // generate_204 实测为准（对齐 clash-verge）；不可导出节点
-                // （Other / 缺字段）引擎测不了，退回 TCP 结果，避免误杀。
-                let avail = if engine_active && p.is_exportable() {
+                // 引擎已配置 → 以引擎 gstatic 实测为权威（逐节点 h.is_some()）；
+                // 引擎未配置 → 使用裸 TCP 可用性。不再在「引擎已配置但本次
+                // 全部探测失败」时回退 TCP，避免已连端口却代理不可用的误报。
+                let avail = if engine_configured {
                     h.is_some()
                 } else {
                     *tcp_avail
