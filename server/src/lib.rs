@@ -6,7 +6,7 @@ use axum::{
 
     response::sse::{Event, Sse},
 
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 
     Json, Router,
 
@@ -173,6 +173,27 @@ pub struct AppState {
     /// (manual speedtest, post-add test, refresh, scheduler).
     pub remove_after_fails: Arc<Mutex<u64>>,
 
+    /// 服务器监听地址（默认 0.0.0.0，允许局域网 / 公网其他设备访问 /sub 订阅）。
+    /// 可用环境变量 `SUBHUB_BIND` 覆盖（如设为 127.0.0.1 仅本机）。
+    pub bind_addr: Arc<Mutex<String>>,
+
+    /// 生成订阅网址时使用的「外部可达主机」（如 192.168.10.111）。为空时 WebUI
+    /// 回退到本机探测到的局域网 IP 或 localhost。让其他设备能用局域网 / 公网地址拉取。
+    pub external_host: Arc<Mutex<Option<String>>>,
+
+    /// GitHub 用户名（用于上传 Gist 远程订阅，持久化；token 不通过 get_settings 明文返回）。
+    pub github_user: Arc<Mutex<Option<String>>>,
+
+    /// GitHub personal access token（持久化；get_settings 只回传「是否已配置」）。
+    pub github_token: Arc<Mutex<Option<String>>>,
+
+    /// 已上传 Gist 的 id（持久化）。再次上传时更新同一 Gist（类似 sub-store 行为），
+    /// 远程设备拿到的是稳定不变的拉取地址。
+    pub gist_id: Arc<Mutex<Option<String>>>,
+
+    /// 启动时探测到的本机局域网 IP（只读，供 WebUI 预填外部访问地址）。
+    pub lan_ip: Option<String>,
+
     /// Serializes DB writes so two `save_all` transactions (each a
     /// DELETE + full re-INSERT of the subscription set) can never interleave
     /// and corrupt — or partially clobber — the persisted data. Mutations
@@ -192,6 +213,23 @@ fn engine_bin_of(state: &AppState) -> Option<String> {
         .lock_ok()
         .clone()
         .filter(|v| !v.trim().is_empty())
+}
+
+/// 探测本机用于访问公网 / 局域网的出口 IP（供 WebUI 预填「外部访问地址」）。
+/// 通过 UDP 连接一个公网地址并读取本地侧地址——UDP connect 不会真正发包，
+/// 仅由系统选择默认出口网卡，因此瞬时且无网络开销。多网卡环境返回默认路由网卡 IP。
+fn detect_lan_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    let ip = addr.ip().to_string();
+    // 排除回环与未分配地址
+    if ip == "0.0.0.0" || ip.starts_with("127.") {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 
@@ -247,6 +285,13 @@ pub struct ImportReq {
     /// when absent a name is auto-derived ("本地导入 N").
     pub name: Option<String>,
 
+}
+
+
+#[derive(Deserialize)]
+pub struct RenameSubReq {
+    /// new display name for the subscription (trimmed; must be non-empty).
+    pub name: String,
 }
 
 
@@ -490,6 +535,21 @@ pub struct SettingsResp {
     /// (0 = disabled)
     pub remove_after_fails: u64,
 
+    /// 服务器监听地址（默认 0.0.0.0，允许局域网 / 公网访问）
+    pub bind_addr: String,
+
+    /// 生成订阅网址时使用的外部可达主机（如 192.168.10.111）；为空表示使用本机 IP
+    pub external_host: Option<String>,
+
+    /// GitHub 用户名（用于上传 Gist 远程订阅）
+    pub github_user: Option<String>,
+
+    /// 是否已配置 GitHub token（true = 已保存；出于安全不返回明文）
+    pub has_github_token: bool,
+
+    /// 启动时探测到的本机局域网 IP（只读，供 WebUI 预填外部访问地址）
+    pub lan_ip: Option<String>,
+
 }
 
 
@@ -522,6 +582,22 @@ pub struct SettingsReq {
     /// optional: when present, updates the "auto-remove after N consecutive
     /// failed speed tests" threshold (0 = disabled)
     pub remove_after_fails: Option<u64>,
+
+    /// optional: when present, updates the server bind address (e.g. "0.0.0.0"
+    /// for LAN / "127.0.0.1" for localhost only). Takes effect after restart.
+    pub bind_addr: Option<String>,
+
+    /// optional: when present, updates the external host used in generated
+    /// subscription URLs (e.g. "192.168.10.111"). Empty string clears it.
+    pub external_host: Option<String>,
+
+    /// optional: when present, updates the GitHub username for Gist upload.
+    /// Empty string clears it.
+    pub github_user: Option<String>,
+
+    /// optional: when present, updates the GitHub personal access token for
+    /// Gist upload. Empty string clears it. Never returned in get_settings.
+    pub github_token: Option<String>,
 
 }
 
@@ -1898,6 +1974,47 @@ async fn delete_subscription(
 
 
 
+/// Rename a single subscription. Accepts a non-empty `name`; blanks are
+/// rejected so a subscription never ends up with an empty display name.
+/// Returns 404 when the id matches nothing.
+async fn rename_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameSubReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = req.name.trim();
+
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "empty_name" })),
+        );
+    }
+
+    let mut found = false;
+    {
+        let mut guard = state.store.lock_ok();
+        if let Some(sub) = guard.iter_mut().find(|s| s.id == id) {
+            sub.name = name.to_string();
+            found = true;
+        }
+    }
+
+    if found {
+        persist_all(&state);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "id": id, "name": name })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "status": "not_found", "id": id })),
+        )
+    }
+}
+
+
 /// Refresh a remote subscription: re-fetch it and update its nodes + health.
 /// Local (pasted) subscriptions just get re-stamped. `None` is returned when
 /// the subscription id is unknown (so callers can 404).
@@ -2591,6 +2708,11 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
 
         engine_bin: state.engine_bin.lock_ok().clone(),
         remove_after_fails: *state.remove_after_fails.lock_ok(),
+        bind_addr: state.bind_addr.lock_ok().clone(),
+        external_host: state.external_host.lock_ok().clone(),
+        github_user: state.github_user.lock_ok().clone(),
+        has_github_token: state.github_token.lock_ok().as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false),
+        lan_ip: state.lan_ip.clone(),
     })
 
 }
@@ -2674,6 +2796,47 @@ async fn set_settings(
             }
         }
 
+        // 外部访问主机：空字符串清除（回退到本机 IP / localhost）。
+        if let Some(h) = &req.external_host {
+            let val = h.trim();
+            let next = if val.is_empty() { None } else { Some(val.to_string()) };
+            *state.external_host.lock_ok() = next.clone();
+            if let Some(db) = &state.db {
+                db.meta_set("external_host", if next.is_some() { val } else { "" });
+            }
+        }
+
+        // 绑定地址：仅记录，需重启生效（重启时由 SUBHUB_BIND / 持久化值决定监听网卡）。
+        if let Some(b) = &req.bind_addr {
+            let val = b.trim();
+            if !val.is_empty() {
+                *state.bind_addr.lock_ok() = val.to_string();
+                if let Some(db) = &state.db {
+                    db.meta_set("bind_addr", val);
+                }
+            }
+        }
+
+        // GitHub 账号：空字符串清除。
+        if let Some(u) = &req.github_user {
+            let val = u.trim();
+            let next = if val.is_empty() { None } else { Some(val.to_string()) };
+            *state.github_user.lock_ok() = next.clone();
+            if let Some(db) = &state.db {
+                db.meta_set("github_user", if next.is_some() { val } else { "" });
+            }
+        }
+
+        // GitHub token：空字符串清除。出于安全，get_settings 只回传「是否已配置」。
+        if let Some(t) = &req.github_token {
+            let val = t.trim();
+            let next = if val.is_empty() { None } else { Some(val.to_string()) };
+            *state.github_token.lock_ok() = next.clone();
+            if let Some(db) = &state.db {
+                db.meta_set("github_token", if next.is_some() { val } else { "" });
+            }
+        }
+
         Json(SettingsResp {
 
             use_proxy: *state.use_proxy.lock_ok(),
@@ -2688,6 +2851,11 @@ async fn set_settings(
 
         engine_bin: state.engine_bin.lock_ok().clone(),
         remove_after_fails: *state.remove_after_fails.lock_ok(),
+        bind_addr: state.bind_addr.lock_ok().clone(),
+        external_host: state.external_host.lock_ok().clone(),
+        github_user: state.github_user.lock_ok().clone(),
+        has_github_token: state.github_token.lock_ok().as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false),
+        lan_ip: state.lan_ip.clone(),
     })
 
 }
@@ -2936,34 +3104,42 @@ async fn sub_export(
 
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
 
+    let (content, ct) = build_sub_content(&state, &q)?;
+
+    Ok((
+
+        [(header::CONTENT_TYPE, HeaderValue::from_static(ct))],
+
+        content,
+
+    ))
+
+}
+
+/// 根据订阅查询参数（格式 / 筛选 / 排序 / 重命名 / Top-N / 质量阈值）生成订阅文本
+/// 与其 Content-Type。被 `GET /sub`（本地 / 局域网拉取）与 `POST /api/gist/upload`
+/// （上传到 GitHub Gist 供远程设备拉取）共用，保证两种分发渠道产物完全一致。
+fn build_sub_content(
+    state: &AppState,
+    q: &SubQuery,
+) -> Result<(String, &'static str), (StatusCode, String)> {
     let only: Option<Vec<String>> = q.sub.as_ref().map(|s| {
-
         s.split(',')
-
             .map(|x| x.trim().to_string())
-
             .filter(|x| !x.is_empty())
-
             .collect()
-
     });
 
     let base = {
-
         let guard = state.store.lock_ok();
-
         flatten_dedup(&guard, only.as_deref())
-
     };
 
-    let t = transform_from_sub_query(&q);
+    let t = transform_from_sub_query(q);
 
     let transformed = match &t {
-
         Some(t) => apply_transform(&base, t).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
-
         None => base,
-
     };
 
     // Top-N trim on the standing subscription URL. A `top_n` in the URL
@@ -2993,28 +3169,149 @@ async fn sub_export(
     let content = export_str(&transformed, &fmt);
 
     // JSON-ish formats get application/json; everything else is plain text
-
     // (clients parse by content, not by content-type, so text/plain is safe).
-
     let ct: &'static str = match fmt.as_str() {
-
         "v2ray" | "sing-box" | "singbox" => "application/json; charset=utf-8",
-
         _ => "text/plain; charset=utf-8",
-
     };
 
-    Ok((
-
-        [(header::CONTENT_TYPE, HeaderValue::from_static(ct))],
-
-        content,
-
-    ))
-
+    Ok((content, ct))
 }
 
 
+
+/// 上传 / 更新订阅到 GitHub Gist，供远程设备拉取（类似 sub-store 的 Gist 同步）。
+/// 首次创建 Gist，之后复用 `state.gist_id` 更新同一 Gist，远程拉取地址保持稳定。
+#[derive(Deserialize)]
+struct GistUploadReq {
+    // 与 SubQuery 同款的订阅生成参数
+    format: Option<String>,
+    sub: Option<String>,
+    sort: Option<String>,
+    desc: Option<String>,
+    rename_pat: Option<String>,
+    rename_rep: Option<String>,
+    q: Option<String>,
+    region: Option<String>,
+    r#type: Option<String>,
+    top_n: Option<String>,
+    min_bw: Option<String>,
+    max_lat: Option<String>,
+    // 可选凭据覆盖（缺省时回退到「设置」页持久化的值）
+    github_user: Option<String>,
+    github_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GistUploadResp {
+    ok: bool,
+    /// 远程设备直接拉取的原始地址（始终取最新版本）
+    url: String,
+    gist_id: String,
+    html_url: String,
+}
+
+async fn gist_upload(
+    State(state): State<AppState>,
+    Json(req): Json<GistUploadReq>,
+) -> Result<Json<GistUploadResp>, (StatusCode, String)> {
+    // 1) 与 /sub 完全相同的产物，保证两种分发渠道一致。
+    let q = SubQuery {
+        format: req.format.clone(),
+        sub: req.sub.clone(),
+        sort: req.sort.clone(),
+        desc: req.desc.clone(),
+        rename_pat: req.rename_pat.clone(),
+        rename_rep: req.rename_rep.clone(),
+        q: req.q.clone(),
+        region: req.region.clone(),
+        r#type: req.r#type.clone(),
+        top_n: req.top_n.clone(),
+        min_bw: req.min_bw.clone(),
+        max_lat: req.max_lat.clone(),
+    };
+    let (content, _ct) = build_sub_content(&state, &q).map_err(|(s, e)| (s, e))?;
+
+    // 2) 解析 GitHub 凭据（请求体 > 持久化设置）。
+    let user = req
+        .github_user
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| state.github_user.lock_ok().clone().filter(|v| !v.trim().is_empty()))
+        .ok_or((StatusCode::BAD_REQUEST, "未配置 GitHub 用户名（请在「设置」页填写）".into()))?;
+    let token = req
+        .github_token
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| state.github_token.lock_ok().clone().filter(|v| !v.trim().is_empty()))
+        .ok_or((StatusCode::BAD_REQUEST, "未配置 GitHub token（请在「设置」页填写）".into()))?;
+
+    // 3) 创建 / 更新 Gist（沿用 state.gist_id；若 PATCH 返回 404 说明 Gist 已被删，自动重建）。
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建 HTTP 客户端失败：{e}")))?;
+    let body = serde_json::json!({
+        "description": "SubHub subscription",
+        "public": false,
+        "files": { "subscription.yaml": { "content": content } }
+    });
+
+    let mut id_opt = state.gist_id.lock_ok().clone();
+    let (final_id, html_url) = loop {
+        let (path, is_patch) = match &id_opt {
+            Some(id) => (format!("https://api.github.com/gists/{id}"), true),
+            None => ("https://api.github.com/gists".to_string(), false),
+        };
+        let builder = if is_patch {
+            client.patch(path.as_str())
+        } else {
+            client.post(path.as_str())
+        };
+        let resp = builder
+            .bearer_auth(token.as_str())
+            .header("User-Agent", "subhub")
+            .header("Accept", "application/vnd.github+json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("GitHub 请求失败：{e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 复用旧 id 但 Gist 已被删除 → 放弃旧 id 重新创建
+            if status == StatusCode::NOT_FOUND && id_opt.is_some() {
+                id_opt = None;
+                continue;
+            }
+            let msg = resp.text().await.unwrap_or_default();
+            return Err((StatusCode::BAD_GATEWAY, format!("GitHub 上传失败 (HTTP {status}): {msg}")));
+        }
+        let j: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("解析 GitHub 响应失败：{e}")))?;
+        let id = j.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let hu = j
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        break (id, hu);
+    };
+
+    // 4) 持久化 gist_id，保证下次更新同一 Gist。
+    *state.gist_id.lock_ok() = Some(final_id.clone());
+    if let Some(db) = &state.db {
+        db.meta_set("gist_id", &final_id);
+    }
+
+    let raw_url = format!("https://gist.githubusercontent.com/{user}/{final_id}/raw");
+    Ok(Json(GistUploadResp {
+        ok: true,
+        url: raw_url,
+        gist_id: final_id,
+        html_url,
+    }))
+}
 
 async fn speedtest(
 
@@ -3402,6 +3699,42 @@ pub async fn run_server() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(remove_after_fails_default);
 
+    // 绑定地址：env `SUBHUB_BIND` 设默认值（默认 0.0.0.0 = 允许局域网 / 公网访问）；
+    // 持久化在 meta 的值（来自 UI）优先于默认值。
+    let bind_addr_default = std::env::var("SUBHUB_BIND")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_addr = db
+        .as_ref()
+        .and_then(|d| d.meta_get("bind_addr"))
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(bind_addr_default);
+
+    // 外部访问主机（生成订阅网址用）：持久化在 meta，无则空（回退本机 IP）。
+    let external_host = db
+        .as_ref()
+        .and_then(|d| d.meta_get("external_host"))
+        .filter(|v| !v.trim().is_empty());
+
+    let github_user = db
+        .as_ref()
+        .and_then(|d| d.meta_get("github_user"))
+        .filter(|v| !v.trim().is_empty());
+
+    let github_token = db
+        .as_ref()
+        .and_then(|d| d.meta_get("github_token"))
+        .filter(|v| !v.trim().is_empty());
+
+    let gist_id = db
+        .as_ref()
+        .and_then(|d| d.meta_get("gist_id"))
+        .filter(|v| !v.trim().is_empty());
+
+    // 探测本机局域网出口 IP（只读，供 WebUI 预填外部访问地址）。
+    let lan_ip = detect_lan_ip();
+
     let state = AppState {
 
         store: Arc::new(Mutex::new(initial)),
@@ -3422,6 +3755,12 @@ pub async fn run_server() {
 
         engine_bin: Arc::new(Mutex::new(engine_bin_default)),
         remove_after_fails: Arc::new(Mutex::new(remove_after_fails)),
+        bind_addr: Arc::new(Mutex::new(bind_addr)),
+        external_host: Arc::new(Mutex::new(external_host)),
+        github_user: Arc::new(Mutex::new(github_user)),
+        github_token: Arc::new(Mutex::new(github_token)),
+        gist_id: Arc::new(Mutex::new(gist_id)),
+        lan_ip,
         persist_lock: Arc::new(Mutex::new(())),
 
 
@@ -3567,6 +3906,8 @@ pub async fn run_server() {
 
         .route("/api/subscriptions/:id", delete(delete_subscription))
 
+        .route("/api/subscriptions/:id", patch(rename_subscription))
+
         .route("/api/subscriptions/:id/refresh", post(refresh_subscription))
 
         .route("/api/subscriptions/export", get(export_subscriptions))
@@ -3604,10 +3945,8 @@ pub async fn run_server() {
 
         .route("/api/nodes/cleanup", post(cleanup_bad))
         .route("/api/nodes/top", get(nodes_top))
+        .route("/api/gist/upload", post(gist_upload))
 
-        .with_state(state)
-
-        // ServeDir 提供 WebUI 静态文件（运行时直接从 webui/ 读取，非嵌入 exe）。
         // 包一层 `no-cache`，避免 webview 缓存旧的 app.js/style.css，导致修改
         // 前端后重启仍“看似没生效”。（注：把该 header 加在 Router 顶层对
         // fallback_service 的响应不生效，必须直接包在 ServeDir 之上。）
@@ -3620,7 +3959,11 @@ pub async fn run_server() {
                 tower_http::services::ServeDir::new(static_dir)
                     .append_index_html_on_directories(true),
             ),
-        );
+        )
+        .with_state(state.clone());
+
+    // 取出监听地址（state 已通过上面的 clone 移入 Router，这里读取原 state 副本）。
+    let bind_addr_str = state.bind_addr.lock_ok().clone();
 
 
 
@@ -3632,9 +3975,13 @@ pub async fn run_server() {
 
         .unwrap_or(3005);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    // 监听地址：默认 0.0.0.0（允许局域网 / 公网其他设备访问 /sub）；
+    // 可用 SUBHUB_BIND 或「设置」页设为 127.0.0.1 仅本机。解析失败回退 0.0.0.0。
+    let addr: SocketAddr = format!("{bind_addr_str}:{port}")
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
 
-    println!("SubHub server listening on http://{addr}");
+    println!("SubHub server listening on http://{addr} (bind: {bind_addr_str})");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -3728,6 +4075,12 @@ mod tests {
             top_n: Arc::new(Mutex::new(0)),
             engine_bin: Arc::new(Mutex::new(None)),
             remove_after_fails: Arc::new(Mutex::new(3)),
+            bind_addr: Arc::new(Mutex::new("127.0.0.1".to_string())),
+            external_host: Arc::new(Mutex::new(None)),
+            github_user: Arc::new(Mutex::new(None)),
+            github_token: Arc::new(Mutex::new(None)),
+            gist_id: Arc::new(Mutex::new(None)),
+            lan_ip: None,
             persist_lock: Arc::new(Mutex::new(())),
         };
 
