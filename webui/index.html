@@ -50,7 +50,10 @@
           </div>
         <div class="panel">
           <h2>地区分布</h2>
-          <div id="by-region" class="bars"></div>
+          <div class="donut-wrap">
+            <div class="donut" id="region-donut"></div>
+            <div class="legend" id="region-legend"></div>
+          </div>
         </div>
       </div>
       <div class="panel">
@@ -226,8 +229,14 @@
             <input id="sub-url" class="grow" readonly placeholder="点击右侧「生成地址」" />
             <button class="btn primary" id="btn-gen-url">生成地址</button>
             <button class="btn" id="btn-copy-url">复制</button>
+            <button class="btn" id="btn-gist-upload" title="上传当前订阅到 GitHub Gist，供远程设备拉取">上传到 Gist</button>
           </div>
           <div class="row"><span id="sub-url-info" class="result"></span></div>
+          <div class="row">
+            <input id="gist-url" class="grow" readonly placeholder="上传后显示远程拉取地址（GitHub Gist raw）" />
+            <button class="btn" id="btn-copy-gist">复制</button>
+            <span id="gist-result" class="result"></span>
+          </div>
         </div>
       </section>
 
@@ -303,6 +312,30 @@
             <span class="unit">个节点</span>
             <span id="topn-save-result" class="result"></span>
             <span class="hint" style="margin:0">按延迟 / 带宽 / 解锁综合打分，取前 N 个。在此统一设置后，「合并并导出」与「本地订阅地址（/sub）」都遵循此值（关闭 = 全部节点）。订阅 URL 上带 top_n 可临时覆盖。</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>外部访问（局域网 / 公网）</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">外部地址</label>
+            <input id="external-host" type="text" placeholder="如 192.168.10.111（留空则用本机 IP）" style="flex:1; min-width:260px;" />
+            <button class="btn" id="btn-save-external" type="button">保存</button>
+            <span id="external-save-result" class="result"></span>
+            <span class="hint" style="margin:0">本机局域网 IP：<b id="lan-ip-hint">检测中…</b>。生成的订阅地址会用此外部地址，其他设备（同局域网 / 公网映射）即可直接拉取。服务器已监听 0.0.0.0，请确保防火墙放行 3005 端口。</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>GitHub Gist 远程同步</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">GitHub 账号</label>
+            <input id="github-user" type="text" placeholder="GitHub 用户名" style="flex:1; min-width:200px;" />
+          </div>
+          <div class="row refresh-settings">
+            <label class="lbl">Token</label>
+            <input id="github-token" type="password" placeholder="ghp_…（仅本地保存，不在接口回传）" style="flex:1; min-width:260px;" />
+            <button class="btn" id="btn-save-github" type="button">保存凭据</button>
+            <span id="github-save-result" class="result"></span>
+            <span class="hint" style="margin:0">需 <b>repo</b> 或 <b>gist</b> 权限的 personal access token。保存后用于「合并 / 导出」页的「上传到 Gist」。出于安全，token 不通过接口明文回传，仅显示是否已配置。</span>
           </div>
         </div>
       </section>

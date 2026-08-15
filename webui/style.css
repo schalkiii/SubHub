@@ -159,6 +159,19 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 .sub-card-actions { display: flex; gap: 8px; margin-top: 12px; }
 .sub-card-actions .btn { flex: 1; padding: 7px 10px; }
 
+/* compact variant used by the dashboard "当前订阅" — denser, no foot/error rows */
+#sub-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.sub-card.compact { padding: 11px 12px; }
+.sub-card.compact .sub-card-meta { margin: 5px 0 8px; }
+.sub-card.compact .sub-card-stats { gap: 10px; }
+.sub-card.compact .sub-card-stats b { font-size: 14px; }
+.sub-card.compact .health-bar-wrap { margin-top: 8px; }
+.sub-rename-input {
+  flex: 1; min-width: 0; font: inherit; font-weight: 600;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 6px; padding: 3px 6px;
+}
+
 /* subscription quick-search box (panel head) */
 .sub-search {
   flex: 1 1 auto; min-width: 140px; max-width: 320px;

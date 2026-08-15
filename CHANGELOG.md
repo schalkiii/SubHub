@@ -2,6 +2,29 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P17] 订阅改名 + 仪表盘紧凑化与地区饼图
+
+### Added
+- **订阅重命名**：订阅管理页每张卡片新增「重命名」按钮，点击后名称原地变为输入框，支持「保存 / 取消」（回车提交、Esc 取消），通过新增 `PATCH /api/subscriptions/:id` 提交新名称；空名称被后端拒绝（`400 empty_name`），不存在的 id 返回 `404`。
+- **仪表盘「当前订阅」紧凑排布**：仪表盘的订阅列表复用订阅管理页卡片结构，改为紧凑网格（`.sub-card.compact`，省略时间脚注与错误行），与订阅管理页视觉一致。
+- **仪表盘「地区分布」改为饼图**：地区分布由横向条形图改为与「类型分布」一致的圆环饼图（`conic-gradient` + 图例），新增 `region-donut` / `region-legend` 渲染，按地区节点数降序着色。
+
+### Changed
+- 新增 `patchJson` 前端请求辅助（与 `postJson` 对称）。
+- 抽象 `renderDonut(donutId, legendId, obj, colorMap)` 复用类型/地区两种饼图渲染；移除不再使用的 `renderBars`。
+
+## [P18] 局域网访问 + GitHub Gist 远程同步
+
+### Added
+- **局域网 / 公网绑定**：服务默认绑定 `0.0.0.0`（可用环境变量 `SUBHUB_BIND` 覆盖），其他设备可直接通过本机局域网 IP（如 `192.168.10.111:3005`）拉取订阅。
+- **外部访问地址设置**：设置页新增「外部访问（局域网/公网）」面板，可填写对外可达主机；生成订阅网址时按 `external_host → 本机局域网 IP（UDP 探测出口）→ 当前窗口主机` 回退，保证局域网/公网设备可拉取。
+- **GitHub Gist 远程同步**：设置页新增「GitHub Gist 远程同步」面板（账号 + token，token 不回传明文）；「合并导出」页新增「上传到 Gist」按钮，将当前订阅（与 `/sub` 完全一致）上传到 Gist，返回 `gist.githubusercontent.com/.../raw` 远程拉取地址，供远程设备直接订阅。
+- **`POST /api/gist/upload`**：复用 `build_sub_content` 保证产物与 `/sub` 一致；凭据取「请求体 > 设置页持久化值」；首次创建、之后复用 `state.gist_id` 更新同一 Gist（PATCH 返回 404 自动重建），并持久化 `gist_id`。
+
+### Changed
+- `SettingsReq`/`SettingsResp` 新增 `bind_addr`、`external_host`、`github_user`、`has_github_token`、`lan_ip` 字段；`AppState` 新增对应状态与 `detect_lan_ip()` 出口 IP 探测。
+- 抽象 `buildSubParams()` 供「生成地址」与「上传 Gist」复用同一份 `/sub` 查询参数；新增 `btn-gist-upload`、`btn-copy-gist` 前端处理器。
+
 ## [P16] 关闭最小化到托盘 + 修复任务栏图标
 
 ### Added

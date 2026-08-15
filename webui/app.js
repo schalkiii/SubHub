@@ -15,6 +15,13 @@ const postJson = (path, body) =>
     body: JSON.stringify(body),
   });
 
+const patchJson = (path, body) =>
+  api(path, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
 const del = (path) => api(path, { method: "DELETE" });
 
 // ---- global progress / hint banner ----
@@ -128,6 +135,56 @@ const TYPE_COLORS = {
   other: "#64748b",
 };
 
+// Fallback palette for region slices (alpha-2 country codes like US/HK/JP).
+// Slices beyond the listed set cycle through the tail colors.
+const REGION_COLORS = {
+  US: "#4f8cff",
+  HK: "#16a34a",
+  JP: "#d97706",
+  SG: "#a855f7",
+  TW: "#06b6d4",
+  KR: "#ec4899",
+  CN: "#ef4444",
+  GB: "#f59e0b",
+  DE: "#10b981",
+  NL: "#8b5cf6",
+  FR: "#0ea5e9",
+  CA: "#e11d48",
+  RU: "#22c55e",
+  AU: "#84cc16",
+  OTHER: "#64748b",
+};
+
+const REGION_PALETTE = [
+  "#4f8cff", "#16a34a", "#d97706", "#a855f7", "#06b6d4", "#ec4899",
+  "#ef4444", "#f59e0b", "#10b981", "#8b5cf6", "#0ea5e9", "#e11d48",
+  "#22c55e", "#84cc16", "#64748b",
+];
+
+// Render a conic-gradient donut + legend from a {label: count} map.
+function renderDonut(donutId, legendId, obj, colorMap) {
+  const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
+  const total = Math.max(1, entries.reduce((s, [, v]) => s + v, 0));
+  let acc = 0;
+  const segs = entries
+    .map(([k, v], i) => {
+      const start = (acc / total) * 360;
+      acc += v;
+      const end = (acc / total) * 360;
+      const color = colorMap[k] || REGION_PALETTE[i % REGION_PALETTE.length];
+      return `${color} ${start}deg ${end}deg`;
+    })
+    .join(", ");
+  const donut = document.getElementById(donutId);
+  donut.style.background = `conic-gradient(${segs || "#272d3a 0deg 360deg"})`;
+  document.getElementById(legendId).innerHTML = entries
+    .map(([k, v], i) => {
+      const color = colorMap[k] || REGION_PALETTE[i % REGION_PALETTE.length];
+      return `<div class="legend-row"><span class="dotc" style="background:${color}"></span>${k}<b>${v}</b></div>`;
+    })
+    .join("");
+}
+
 async function loadDashboard() {
   let d;
   try {
@@ -158,32 +215,11 @@ async function loadDashboard() {
     <div class="card"><div class="num">${latTxt(d.avg_latency_ms)}</div><div class="label">平均延迟</div></div>
     <div class="card"><div class="num">${latTxt(d.best_latency_ms)}</div><div class="label">最佳延迟</div></div>`;
 
-  // type donut
-  const entries = Object.entries(d.by_type || {}).sort((a, b) => b[1] - a[1]);
-  const total = Math.max(1, d.total || 1);
-  let acc = 0;
-  const segs = entries
-    .map(([k, v]) => {
-      const start = (acc / total) * 360;
-      acc += v;
-      const end = (acc / total) * 360;
-      const color = TYPE_COLORS[k] || "#64748b";
-      return `${color} ${start}deg ${end}deg`;
-    })
-    .join(", ");
-  const donut = document.getElementById("type-donut");
-  donut.style.background = `conic-gradient(${segs || "#272d3a 0deg 360deg"})`;
-  document.getElementById("type-legend").innerHTML = entries
-    .map(
-      ([k, v]) =>
-        `<div class="legend-row"><span class="dotc" style="background:${
-          TYPE_COLORS[k] || "#64748b"
-        }"></span>${k}<b>${v}</b></div>`
-    )
-    .join("");
+  // type donut + region donut (both pie charts with legends)
+  renderDonut("type-donut", "type-legend", d.by_type, TYPE_COLORS);
+  renderDonut("region-donut", "region-legend", d.by_region, REGION_COLORS);
 
-  renderBars("by-region", d.by_region);
-  loadSubs("sub-list", false);
+  loadSubs("sub-list", false, true);
   loadTrends();
 }
 
@@ -276,22 +312,6 @@ window.addEventListener("resize", () => {
     if (_trendPts.length) drawTrend(_trendPts);
   }, 150);
 });
-
-function renderBars(id, obj) {
-  const el = document.getElementById(id);
-  const entries = Object.entries(obj).sort((a, b) => b[1] - a[1]);
-  const max = Math.max(1, ...entries.map((e) => e[1]));
-  el.innerHTML = entries
-    .map(
-      ([k, v]) => `
-      <div class="bar-row">
-        <div class="bar-label">${escapeHtml(k)}</div>
-        <div class="bar-track"><div class="bar-fill" style="width:${(v / max) * 100}%"></div></div>
-        <div class="bar-val">${v}</div>
-      </div>`
-    )
-    .join("");
-}
 
 // ---- subscriptions (per-subscription health) ----
 const STATUS_META = {
@@ -413,7 +433,7 @@ function relTime(ms) {
   return `${Math.floor(h / 24)} 天前`;
 }
 
-async function loadSubs(targetId, withManage) {
+async function loadSubs(targetId, withManage, compact) {
   let list = [];
   try {
     const params = new URLSearchParams();
@@ -437,7 +457,7 @@ async function loadSubs(targetId, withManage) {
     .map((s) => {
       const meta = STATUS_META[s.status] || STATUS_META.pending;
       return `
-      <div class="sub-card" data-id="${s.id}">
+      <div class="sub-card${compact ? " compact" : ""}" data-id="${s.id}">
         <div class="sub-card-top">
           <span class="dot ${meta.cls}"></span>
           <div class="sub-name">${escapeHtml(s.name)}</div>
@@ -457,15 +477,22 @@ async function loadSubs(targetId, withManage) {
           <span class="health-pct">${s.health_pct == null ? "—" : s.health_pct + "%"}</span>
         </div>
         ${usageHtml(s)}
-        <div class="sub-card-foot">
+        ${
+          compact
+            ? ""
+            : `<div class="sub-card-foot">
           <span>检测 ${relTime(s.last_checked_at)}</span>
           <span>更新 ${relTime(s.last_updated_at)}</span>
         </div>
-        ${s.last_error ? `<div class="sub-err">⚠ ${escapeHtml(s.last_error)}</div>` : ""}
+        ${s.last_error ? `<div class="sub-err">⚠ ${escapeHtml(s.last_error)}</div>` : ""}`
+        }
         ${
           withManage
             ? `<div class="sub-card-actions">
                  <button class="btn sub-refresh" data-id="${s.id}">刷新</button>
+                 <button class="btn sub-rename" data-id="${s.id}" data-name="${escapeHtml(
+                s.name
+              )}">重命名</button>
                  <button class="btn sub-del" data-id="${s.id}">删除</button>
                </div>`
             : ""
@@ -496,7 +523,65 @@ async function loadSubs(targetId, withManage) {
         loadDashboard();
       })
     );
+    el.querySelectorAll(".sub-rename").forEach((b) =>
+      b.addEventListener("click", () => startRename(b.dataset.id, b.dataset.name, el, targetId))
+    );
   }
+}
+
+// Inline rename for a subscription card. Swaps the name text for an input
+// with 保存/取消; commits via PATCH /api/subscriptions/:id and re-renders.
+function startRename(id, currentName, container, targetId) {
+  const card = container.querySelector(`.sub-card[data-id="${id}"]`);
+  if (!card) return;
+  const nameEl = card.querySelector(".sub-name");
+  if (!nameEl || card.querySelector(".sub-rename-input")) return;
+
+  const input = document.createElement("input");
+  input.className = "sub-rename-input";
+  input.type = "text";
+  input.value = currentName;
+  input.maxLength = 64;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  const save = document.createElement("button");
+  save.className = "btn sub-rename-save";
+  save.textContent = "保存";
+  const cancel = document.createElement("button");
+  cancel.className = "btn sub-rename-cancel";
+  cancel.textContent = "取消";
+
+  const actions = card.querySelector(".sub-card-actions");
+  actions.prepend(cancel);
+  actions.prepend(save);
+
+  const commit = async () => {
+    const newName = input.value.trim();
+    if (!newName) {
+      input.focus();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    try {
+      await patchJson("/api/subscriptions/" + id, { name: newName });
+      loadSubs(targetId, true);
+      loadDashboard();
+    } catch (e) {
+      alert("重命名失败：" + e.message);
+      save.disabled = false;
+      cancel.disabled = false;
+    }
+  };
+
+  save.addEventListener("click", commit);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") commit();
+    else if (ev.key === "Escape") loadSubs(targetId, true);
+  });
+  cancel.addEventListener("click", () => loadSubs(targetId, true));
 }
 
 // ---- subscriptions add / import ----
@@ -642,6 +727,9 @@ document.getElementById("btn-proxy-test").addEventListener("click", async (e) =>
 // ---- global "use proxy" master switch ----
 // Backend is the source of truth: we load the current value on startup and
 // push changes to /api/settings (persisted to the SQLite meta table).
+// 跨函数共享的本机设置快照（生成订阅网址时要用到外部地址 / 局域网 IP）。
+const G_SETTINGS = { external_host: "", lan_ip: "" };
+
 async function loadSettings() {
   try {
     const s = await api("/api/settings");
@@ -670,6 +758,18 @@ async function loadSettings() {
     // Prefill the auto-remove threshold (persisted setting).
     const removeAfter = document.getElementById("remove-after");
     if (removeAfter) removeAfter.value = s.remove_after_fails != null ? s.remove_after_fails : 0;
+    // 外部访问地址（生成订阅网址用）：回显已保存值，并记录本机局域网 IP 供预填。
+    G_SETTINGS.external_host = s.external_host || "";
+    G_SETTINGS.lan_ip = s.lan_ip || "";
+    const extInput = document.getElementById("external-host");
+    if (extInput) extInput.value = G_SETTINGS.external_host;
+    const lanHint = document.getElementById("lan-ip-hint");
+    if (lanHint) lanHint.textContent = G_SETTINGS.lan_ip || "（未检测到）";
+    // GitHub 账号 / token 状态（出于安全，token 明文不回传，只回传是否已配置）。
+    const ghUser = document.getElementById("github-user");
+    if (ghUser) ghUser.value = s.github_user || "";
+    const ghResult = document.getElementById("github-save-result");
+    if (ghResult) ghResult.textContent = s.has_github_token ? "（token 已配置）" : "（尚未配置 token）";
   } catch {
     /* keep default (checked) if the API is unreachable */
   }
@@ -787,6 +887,41 @@ document.getElementById("btn-save-remove").addEventListener("click", async () =>
     el.textContent = r.remove_after_fails > 0
       ? `已保存：连续不可用 ${r.remove_after_fails} 次后自动移除`
       : "已保存：已关闭自动移除";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "保存失败：" + err.message;
+  }
+});
+
+// 保存「外部访问地址」：生成订阅网址时使用的外部可达主机（如 192.168.10.111）。
+document.getElementById("btn-save-external").addEventListener("click", async () => {
+  const raw = document.getElementById("external-host").value || "";
+  const val = raw.trim();
+  const el = document.getElementById("external-save-result");
+  try {
+    const r = await postJson("/api/settings", { external_host: val });
+    G_SETTINGS.external_host = r.external_host || "";
+    el.style.color = "";
+    el.textContent = G_SETTINGS.external_host
+      ? `已保存：外部地址 ${G_SETTINGS.external_host}`
+      : "已保存：未设置外部地址（生成网址回退到本机 IP）";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "保存失败：" + err.message;
+  }
+});
+
+// 保存 GitHub 账号与 token（token 仅本地保存，不通过接口明文回传）。
+document.getElementById("btn-save-github").addEventListener("click", async () => {
+  const user = (document.getElementById("github-user").value || "").trim();
+  const token = (document.getElementById("github-token").value || "").trim();
+  const el = document.getElementById("github-save-result");
+  try {
+    const r = await postJson("/api/settings", { github_user: user, github_token: token });
+    el.style.color = "";
+    el.textContent = r.has_github_token ? "已保存 GitHub 凭据（token 已配置）" : "已保存：未配置 token";
+    // 清空 token 输入框，避免明文驻留页面
+    document.getElementById("github-token").value = "";
   } catch (err) {
     el.style.color = "var(--danger, #ef4444)";
     el.textContent = "保存失败：" + err.message;
@@ -1281,9 +1416,9 @@ document.getElementById("pg-size").addEventListener("change", (e) => {
 });
 
 // ---- local subscription URL (direct pull) ----
-// Build a GET /sub URL that encodes the current format + operator transform,
-// so it can be pasted straight into a proxy client's "subscription" field.
-function buildShareUrl() {
+// 构造 /sub 查询参数（不含主机/端口），供「生成地址」与「上传 Gist」复用，
+// 保证两种分发渠道生成的订阅完全一致。
+function buildSubParams() {
   const format = document.getElementById("exp-format").value;
   const params = new URLSearchParams();
   params.set("format", format);
@@ -1321,7 +1456,18 @@ function buildShareUrl() {
   const lat = parseInt(document.getElementById("op-max-lat").value, 10);
   if (!isNaN(mb) && mb > 0) params.set("min_bw", String(Math.round(mb * 1048576)));
   if (!isNaN(lat) && lat > 0) params.set("max_lat", String(lat));
-  return { url: window.location.origin + "/sub?" + params.toString(), unsupported };
+  return { params, unsupported };
+}
+
+// Build a GET /sub URL that encodes the current format + operator transform,
+// so it can be pasted straight into a proxy client's "subscription" field.
+function buildShareUrl() {
+  const { params, unsupported } = buildSubParams();
+  // 生成订阅网址：优先用「外部访问地址」（如 192.168.10.111），其次本机局域网 IP，
+  // 均无效时回退到当前窗口所在主机。这样局域网 / 公网的其他设备也能直接拉取。
+  const host = G_SETTINGS.external_host || G_SETTINGS.lan_ip || window.location.hostname;
+  const port = window.location.port || "3005";
+  return { url: `http://${host}:${port}/sub?` + params.toString(), unsupported };
 }
 
 document.getElementById("btn-gen-url").addEventListener("click", () => {
@@ -1340,6 +1486,46 @@ document.getElementById("btn-copy-url").addEventListener("click", async () => {
     document.getElementById("sub-url-info").textContent = "已复制到剪贴板。";
   } catch {
     document.getElementById("sub-url-info").textContent = "复制失败，请手动选择地址复制。";
+  }
+});
+
+// 上传当前订阅到 GitHub Gist：复用 buildSubParams() 保证产物与 /sub 完全一致，
+// 服务端回退到「设置」页持久化的 GitHub 账号 / token。
+document.getElementById("btn-gist-upload").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-gist-upload");
+  const resEl = document.getElementById("gist-result");
+  const urlEl = document.getElementById("gist-url");
+  const { params } = buildSubParams();
+  // URLSearchParams → 服务端 GistUploadReq 期望的单值对象（每 key 取首值）。
+  const body = {};
+  for (const key of new Set(params.keys())) body[key] = params.get(key);
+  btn.disabled = true;
+  resEl.style.color = "";
+  resEl.textContent = "上传中…";
+  try {
+    const r = await postJson("/api/gist/upload", body);
+    urlEl.value = r.url;
+    resEl.textContent = r.ok
+      ? "已上传到 Gist，远程地址可在其他设备直接拉取。"
+      : "上传完成但状态异常，请检查 GitHub 凭据。";
+  } catch (err) {
+    resEl.style.color = "var(--danger, #ef4444)";
+    resEl.textContent = "上传失败：" + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("btn-copy-gist").addEventListener("click", async () => {
+  const v = document.getElementById("gist-url").value;
+  if (!v) return;
+  try {
+    await navigator.clipboard.writeText(v);
+    const resEl = document.getElementById("gist-result");
+    resEl.style.color = "";
+    resEl.textContent = "Gist 地址已复制到剪贴板。";
+  } catch {
+    document.getElementById("gist-result").textContent = "复制失败，请手动选择地址复制。";
   }
 });
 
