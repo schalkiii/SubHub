@@ -466,7 +466,17 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     let server = v.get("add")?.as_str()?.to_string();
     let port: u16 = v.get("port").and_then(|x| {
-        x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64().map(|n| n as u16))
+        x.as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                x.as_u64().and_then(|n| {
+                    if (1..=65535).contains(&n) {
+                        Some(n as u16)
+                    } else {
+                        None
+                    }
+                })
+            })
     })?;
     let pname = name.unwrap_or_else(|| v.get("ps").and_then(|x| x.as_str()).unwrap_or(&server).to_string());
     let mut p = Proxy::new(pname, ProxyType::Vmess, server, port);
@@ -569,23 +579,13 @@ fn decode_ss_userinfo(u: &str) -> (String, String) {
     (String::new(), u.to_string())
 }
 
-fn parse_ssr(body: &str, name: Option<String>) -> Option<Proxy> {
-    // ssr://base64(host:port:protocol:method:obfs:base64pass/?params)
-    let decoded = b64_decode(body).ok()?;
-    let s = String::from_utf8_lossy(&decoded);
-    let (head, _params) = s.split_once("/?").unwrap_or((&s, ""));
-    let parts: Vec<&str> = head.split(':').collect();
-    if parts.len() < 6 {
-        return None;
-    }
-    let server = parts[0].to_string();
-    let port: u16 = parts[1].parse().ok().filter(|p| (1..=65535).contains(p))?;
-    let method = parts[3].to_string();
-    let password = b64_decode(parts[5]).ok().map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
-    let mut p = Proxy::new(name.unwrap_or_else(|| server.clone()), ProxyType::Ss, server, port);
-    p.method = Some(method);
-    p.password = Some(password);
-    Some(p)
+fn parse_ssr(_body: &str, _name: Option<String>) -> Option<Proxy> {
+    // SSR is NOT supported by mihomo/Clash.Meta. Parsing it as `ProxyType::Ss`
+    // would emit a `type: ss` node that fails to connect with no obvious cause,
+    // so we drop every SSR node up front and log why it went missing.
+    // (We don't even bother decoding — there is nothing usable to keep.)
+    eprintln!("[subhub] 跳过 SSR 节点（mihomo/Clash.Meta 不支持 SSR，已忽略）");
+    None
 }
 
 fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {

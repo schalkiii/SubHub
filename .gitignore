@@ -10,6 +10,7 @@ nul
 
 # Agent / workspace metadata (not part of the project)
 .workbuddy
+.codebuddy
 
 # OS / editor junk
 .DS_Store

@@ -215,7 +215,12 @@ pub fn to_v2ray_json(proxies: &[Proxy]) -> String {
     // (hysteria2 / tuic / socks5 / http / wireguard) — emitting a `freedom`
     // (direct) outbound for them would silently break connectivity, so we
     // skip them instead.
+    let total = proxies.len();
     let arr: Vec<serde_json::Value> = proxies.iter().filter_map(v2ray_outbound).collect();
+    let skipped = total - arr.len();
+    if skipped > 0 {
+        eprintln!("[subhub] v2ray 导出跳过 {skipped} 个不支持的节点（hysteria2/tuic/socks5/http/wireguard 等 v2ray-core 无法表示）");
+    }
     serde_json::to_string_pretty(&json!(arr)).unwrap_or_default()
 }
 

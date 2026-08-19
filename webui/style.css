@@ -134,10 +134,22 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
   content: ""; position: absolute; inset: 30px; border-radius: 50%;
   background: var(--panel);
 }
-.legend { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
-.legend-row { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.legend {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+  gap: 3px 14px; font-size: 12.5px; align-content: start; flex: 1 1 auto;
+}
+.legend-row { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 1px 4px; border-radius: 4px; }
+.legend-row.active { color: var(--text); background: rgba(255, 255, 255, 0.07); }
 .legend-row b { color: var(--text); margin-left: auto; }
-.dotc { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.dotc { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: 0 0 auto; }
+
+/* donut hover tooltip (shows e.g. "US  1032  (37%)") */
+.donut-tip {
+  position: fixed; display: none; z-index: 9999; pointer-events: none;
+  background: #0b0f17; color: #e6eaf2; border: 1px solid var(--border);
+  padding: 4px 8px; border-radius: 6px; font-size: 12px; white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
 
 /* subscription health cards (per-subscription health) */
 .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }

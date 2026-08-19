@@ -191,6 +191,11 @@ pub struct AppState {
     /// 远程设备拿到的是稳定不变的拉取地址。
     pub gist_id: Arc<Mutex<Option<String>>>,
 
+    /// 串行化 Gist 上传，避免并发上传创建出多个孤儿 Gist / 让稳定地址漂移。
+    /// 用 tokio Mutex 是因为 gist_upload 在持有该锁期间会 await 网络请求
+    /// （std MutexGuard 非 Send，跨 await 会导致 axum Handler 不满足）。
+    pub gist_lock: Arc<tokio::sync::Mutex<()>>,
+
     /// 启动时探测到的本机局域网 IP（只读，供 WebUI 预填外部访问地址）。
     pub lan_ip: Option<String>,
 
@@ -1257,6 +1262,13 @@ pub struct DashboardResp {
 
     pub best_latency_ms: Option<u64>,
 
+    /// 平均带宽（bps）；仅统计已测速且有带宽数据的节点。未配置测速引擎时
+    /// 该值为 TCP 吞吐估算，并非真实代理带宽。
+    pub avg_bandwidth_bps: Option<f64>,
+
+    /// 最佳（最大）带宽（bps），取所有已测速节点中的最大值。
+    pub best_bandwidth_bps: Option<f64>,
+
     pub per_sub: Vec<SubSummary>,
 
 }
@@ -1991,6 +2003,15 @@ async fn rename_subscription(
         );
     }
 
+    // 限制长度，避免异常超长 / 仅由控制字符构成的非空名写入（虽仅作展示，
+    // 但仍防止存储与导出时被滥用）。与 set_settings 的字段上限保持一致量级。
+    if name.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "name_too_long" })),
+        );
+    }
+
     let mut found = false;
     {
         let mut guard = state.store.lock_ok();
@@ -2580,6 +2601,12 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 
     let mut best: Option<u64> = None;
 
+    let mut bw_sum = 0f64;
+
+    let mut bw_n = 0u64;
+
+    let mut best_bw: Option<f64> = None;
+
     for p in &all {
 
         *by_type.entry(p.type_.as_str().to_string()).or_insert(0) += 1;
@@ -2606,11 +2633,29 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 
         }
 
+        // 带宽统计：仅纳入「已实测（真实引擎）或 TCP 估算」且有数值的节点。
+        // NaN guard 避免个别脏数据污染聚合结果。
+        if let Some(b) = p.download_speed_bps {
+
+            if b.is_finite() && b > 0.0 {
+
+                bw_sum += b;
+
+                bw_n += 1;
+
+                best_bw = Some(best_bw.map_or(b, |x| x.max(b)));
+
+            }
+
+        }
+
     }
 
     let per_sub = guard.iter().map(sub_to_summary).collect();
 
     let avg_latency_ms = lat_sum.checked_div(lat_n);
+
+    let avg_bandwidth_bps = if bw_n > 0 { Some(bw_sum / bw_n as f64) } else { None };
 
 
 
@@ -2634,39 +2679,53 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
 
         best_latency_ms: best,
 
+        avg_bandwidth_bps,
+
+        best_bandwidth_bps: best_bw,
+
         per_sub,
 
     };
 
 
 
-    // record a rolling trend point
+    // record a rolling trend point — but throttle to at most once per 60s so
+    // high-frequency dashboard polling doesn't pollute the trend timeline.
+    // (Trend sampling is an event, not a per-render side effect.)
 
     {
 
+        let now = now_ms();
+
         let mut h = state.history.lock_ok();
 
-        h.push_back(TrendPoint {
+        let recent = h.back().map_or(false, |p| now.saturating_sub(p.t) < 60_000);
 
-            t: now_ms(),
+        if !recent {
 
-            total: resp.total,
+            h.push_back(TrendPoint {
 
-            available: resp.available,
+                t: now,
 
-            unavailable: resp.unavailable,
+                total: resp.total,
 
-            untested: resp.untested,
+                available: resp.available,
 
-            avg_latency_ms: resp.avg_latency_ms,
+                unavailable: resp.unavailable,
 
-            best_latency_ms: resp.best_latency_ms,
+                untested: resp.untested,
 
-        });
+                avg_latency_ms: resp.avg_latency_ms,
 
-        while h.len() > 240 {
+                best_latency_ms: resp.best_latency_ms,
 
-            h.pop_front();
+            });
+
+            while h.len() > 240 {
+
+                h.pop_front();
+
+            }
 
         }
 
@@ -3215,6 +3274,9 @@ async fn gist_upload(
     State(state): State<AppState>,
     Json(req): Json<GistUploadReq>,
 ) -> Result<Json<GistUploadResp>, (StatusCode, String)> {
+    // 串行化上传：避免并发上传各自用旧 gist_id 创建出多个孤儿 Gist，
+    // 或让「稳定的远程拉取地址」在新旧 id 之间漂移。
+    let _g = state.gist_lock.lock().await;
     // 1) 与 /sub 完全相同的产物，保证两种分发渠道一致。
     let q = SubQuery {
         format: req.format.clone(),
@@ -3252,7 +3314,7 @@ async fn gist_upload(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建 HTTP 客户端失败：{e}")))?;
     let body = serde_json::json!({
         "description": "SubHub subscription",
-        "public": false,
+        "public": true,
         "files": { "subscription.yaml": { "content": content } }
     });
 
@@ -3304,7 +3366,10 @@ async fn gist_upload(
         db.meta_set("gist_id", &final_id);
     }
 
-    let raw_url = format!("https://gist.githubusercontent.com/{user}/{final_id}/raw");
+    // 带上文件名，让 GitHub 直接以 subscription.yaml 返回（正确的 text/yaml
+    // Content-Type、且不必经过裸 /raw 的 302 跳转），避免部分移动端客户端
+    // （如 FIClash）不跟随跳转 / 无法从裸 URL 识别格式而拉到空订阅。
+    let raw_url = format!("https://gist.githubusercontent.com/{user}/{final_id}/raw/subscription.yaml");
     Ok(Json(GistUploadResp {
         ok: true,
         url: raw_url,
@@ -3760,6 +3825,7 @@ pub async fn run_server() {
         github_user: Arc::new(Mutex::new(github_user)),
         github_token: Arc::new(Mutex::new(github_token)),
         gist_id: Arc::new(Mutex::new(gist_id)),
+        gist_lock: Arc::new(tokio::sync::Mutex::new(())),
         lan_ip,
         persist_lock: Arc::new(Mutex::new(())),
 
@@ -4080,6 +4146,7 @@ mod tests {
             github_user: Arc::new(Mutex::new(None)),
             github_token: Arc::new(Mutex::new(None)),
             gist_id: Arc::new(Mutex::new(None)),
+            gist_lock: Arc::new(tokio::sync::Mutex::new(())),
             lan_ip: None,
             persist_lock: Arc::new(Mutex::new(())),
         };
