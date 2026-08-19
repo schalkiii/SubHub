@@ -162,27 +162,82 @@ const REGION_PALETTE = [
 ];
 
 // Render a conic-gradient donut + legend from a {label: count} map.
+// Stashes per-slice geometry on the element (donut._segs) so the shared
+// hover handler (ensureDonutTooltip) can show "US 1032 (37%)" on hover.
 function renderDonut(donutId, legendId, obj, colorMap) {
   const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
   const total = Math.max(1, entries.reduce((s, [, v]) => s + v, 0));
   let acc = 0;
-  const segs = entries
-    .map(([k, v], i) => {
-      const start = (acc / total) * 360;
-      acc += v;
-      const end = (acc / total) * 360;
-      const color = colorMap[k] || REGION_PALETTE[i % REGION_PALETTE.length];
-      return `${color} ${start}deg ${end}deg`;
-    })
-    .join(", ");
+  const segments = entries.map(([k, v], i) => {
+    const start = (acc / total) * 360;
+    acc += v;
+    const end = (acc / total) * 360;
+    const color = colorMap[k] || REGION_PALETTE[i % REGION_PALETTE.length];
+    return { label: k, value: v, color, start, end, pct: Math.round((v / total) * 100) };
+  });
   const donut = document.getElementById(donutId);
-  donut.style.background = `conic-gradient(${segs || "#272d3a 0deg 360deg"})`;
-  document.getElementById(legendId).innerHTML = entries
-    .map(([k, v], i) => {
-      const color = colorMap[k] || REGION_PALETTE[i % REGION_PALETTE.length];
-      return `<div class="legend-row"><span class="dotc" style="background:${color}"></span>${k}<b>${v}</b></div>`;
-    })
+  const segsStr = segments
+    .map((s) => `${s.color} ${s.start}deg ${s.end}deg`)
+    .join(", ");
+  donut.style.background = `conic-gradient(${segsStr || "#272d3a 0deg 360deg"})`;
+  donut._segs = segments;
+  document.getElementById(legendId).innerHTML = segments
+    .map(
+      (s) =>
+        `<div class="legend-row" data-label="${escapeHtml(s.label)}"><span class="dotc" style="background:${s.color}"></span>${escapeHtml(
+          s.label
+        )}<b>${s.value}</b></div>`
+    )
     .join("");
+  ensureDonutTooltip();
+}
+
+// Shared hover tooltip for donut slices (bound once to both dashboard donuts).
+// Computes the pointer angle from the donut center, maps it to a segment, and
+// shows its label/count/pct; also highlights the matching legend row.
+let _donutTipReady = false;
+function ensureDonutTooltip() {
+  if (_donutTipReady) return;
+  _donutTipReady = true;
+  const tip = document.createElement("div");
+  tip.className = "donut-tip";
+  document.body.appendChild(tip);
+  const hideTip = () => {
+    tip.style.display = "none";
+    document.querySelectorAll(".legend-row.active").forEach((n) => n.classList.remove("active"));
+  };
+  ["type-donut", "region-donut"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("mousemove", (ev) => {
+      const segs = el._segs;
+      if (!segs || !segs.length) return hideTip();
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const dx = ev.clientX - cx;
+      const dy = ev.clientY - cy;
+      const radius = Math.hypot(dx, dy);
+      // only react inside the visible ring (between the center hole and the rim)
+      if (radius < 28 || radius > r.width / 2 + 2) return hideTip();
+      // conic-gradient 0deg is at top, increasing clockwise
+      let a = (Math.atan2(dx, -dy) * 180) / Math.PI;
+      if (a < 0) a += 360;
+      const seg = segs.find((s) => a >= s.start && a < s.end) || segs[segs.length - 1];
+      if (!seg) return hideTip();
+      tip.textContent = `${seg.label}  ${seg.value}  (${seg.pct}%)`;
+      tip.style.display = "block";
+      tip.style.left = ev.clientX + 12 + "px";
+      tip.style.top = ev.clientY + 12 + "px";
+      const legend = el.parentElement.querySelector(".legend");
+      if (legend) {
+        legend.querySelectorAll(".legend-row").forEach((n) => {
+          n.classList.toggle("active", n.dataset.label === seg.label);
+        });
+      }
+    });
+    el.addEventListener("mouseleave", hideTip);
+  });
 }
 
 async function loadDashboard() {
@@ -207,13 +262,22 @@ async function loadDashboard() {
   }
   const cards = document.getElementById("dash-cards");
   const latTxt = (v) => (v == null ? "—" : `${v} ms`);
+  // 带宽（bps）→ 友好单位；嵌套三元避免 KB/s 区间，直接 Mbps 起跳更直观。
+  const bpsTxt = (v) => {
+    if (v == null || !isFinite(v) || v <= 0) return "—";
+    if (v >= 1e9) return `${(v / 1e9).toFixed(2)} Gbps`;
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1)} Mbps`;
+    return `${(v / 1e3).toFixed(0)} Kbps`;
+  };
   cards.innerHTML = `
     <div class="card"><div class="num">${d.total}</div><div class="label">节点总数</div></div>
     <div class="card"><div class="num">${d.subscriptions}</div><div class="label">订阅数</div></div>
     <div class="card"><div class="num up">${d.available}</div><div class="label">可用</div></div>
     <div class="card"><div class="num down">${d.unavailable}</div><div class="label">不可用</div></div>
     <div class="card"><div class="num">${latTxt(d.avg_latency_ms)}</div><div class="label">平均延迟</div></div>
-    <div class="card"><div class="num">${latTxt(d.best_latency_ms)}</div><div class="label">最佳延迟</div></div>`;
+    <div class="card"><div class="num">${latTxt(d.best_latency_ms)}</div><div class="label">最佳延迟</div></div>
+    <div class="card"><div class="num">${bpsTxt(d.avg_bandwidth_bps)}</div><div class="label">平均带宽</div></div>
+    <div class="card"><div class="num">${bpsTxt(d.best_bandwidth_bps)}</div><div class="label">最佳带宽</div></div>`;
 
   // type donut + region donut (both pie charts with legends)
   renderDonut("type-donut", "type-legend", d.by_type, TYPE_COLORS);

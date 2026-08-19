@@ -2,7 +2,23 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
-## [P17] 订阅改名 + 仪表盘紧凑化与地区饼图
+## [P19] 代码审计修复（R1 Round）
+
+### Fixed
+- **SSR 节点不再伪装成 SS 导出**：此前 `parse_ssr` 把 SSR 解析为 `ProxyType::Ss`，导出成 `type: ss` 后 mihomo/Clash.Meta 会按 SS 握手必然失败且无任何提示。现改为直接跳过 SSR 节点并打日志说明原因（mihomo 不支持 SSR）。
+- **vmess 端口范围校验**：`parse_vmess` 里端口 `as u16` 直接截断（如 70000 → 4464 仍当作合法节点导出）。现对端口加 `(1..=65535)` 范围检查，超范围丢弃该节点。
+- **v2ray 导出静默丢节点**：`to_v2ray_json` 过滤掉 hysteria2/tuic/socks5/http/wireguard 等 v2ray-core 无法表示的节点时没有任何提示，用户导出 v2ray 会发现节点凭空减少。现统计并 `eprintln!` 告警（与 sing-box 分支一致）。
+- **Gist 上传并发竞态**：并发 `POST /api/gist/upload` 各自用旧 `gist_id` 做 PATCH，可能创建出多个孤儿 Gist、或让「稳定的远程拉取地址」漂移。新增 `state.gist_lock`（`tokio::sync::Mutex`，因上传过程跨 await 网络请求，std MutexGuard 非 Send）串行化整个上传流程。
+- **订阅改名缺长度上限**：`PATCH /api/subscriptions/:id` 仅校验非空，未限制长度。现增加 256 字符上限，超长返回 `400 name_too_long`。
+- **仪表盘 GET 污染趋势时间轴**：`GET /api/dashboard` 每次调用都 push 一个趋势点，WebUI 高频轮询会把趋势图时间轴按轮询频率刷满。现限频为最多每 60 秒记录一个趋势点。
+
+### Audit（本次审计其余发现，暂未改动，记录备查）
+- `parse_hy2` / `parse_tuic` 未解析 `obfs`/`congestion-controller`/`alpn` 等参数，部分混淆/拥塞控制配置导出后可能连不上（改动面大，暂缓）。
+- `region()` 的 `NAME_TABLE` 用 `contains` 子串匹配，短词（如 `hong`）可能误判地区分组（暂缓，避免引入行为回归）。
+- GitHub token 明文持久化到 SQLite meta 表（未加密；`get_settings` 已不回传明文）。
+- `db.save_all` 采用 DELETE 全表 + 全量 INSERT，进程在中间崩溃有丢失窗口（有 `persist_lock` 串行保护）。
+
+
 
 ### Added
 - **订阅重命名**：订阅管理页每张卡片新增「重命名」按钮，点击后名称原地变为输入框，支持「保存 / 取消」（回车提交、Esc 取消），通过新增 `PATCH /api/subscriptions/:id` 提交新名称；空名称被后端拒绝（`400 empty_name`），不存在的 id 返回 `404`。
@@ -24,6 +40,11 @@
 ### Changed
 - `SettingsReq`/`SettingsResp` 新增 `bind_addr`、`external_host`、`github_user`、`has_github_token`、`lan_ip` 字段；`AppState` 新增对应状态与 `detect_lan_ip()` 出口 IP 探测。
 - 抽象 `buildSubParams()` 供「生成地址」与「上传 Gist」复用同一份 `/sub` 查询参数；新增 `btn-gist-upload`、`btn-copy-gist` 前端处理器。
+- **Gist 改为公开 + raw 带文件名**：`public` 改为 `true`（私密 Gist 的 raw 在手机端匿名拉取会被拒），raw URL 改为 `.../raw/subscription.yaml`（避免裸 `/raw` 的 302 跳转、并让 GitHub 返回正确 `text/yaml`，部分移动端客户端如 FIClash 才能识别格式）。
+
+### Added（同轮补充 · 仪表盘带宽）
+- **仪表盘展示平均带宽 / 最佳带宽**：`DashboardResp` 新增 `avg_bandwidth_bps` / `best_bandwidth_bps`，由 `dashboard()` 在聚合延迟的同时累加带宽（仅纳入有限正值、过滤脏 NaN），前端新增两张卡片并以 Mbps/Gbps 友好单位显示。
+
 
 ## [P16] 关闭最小化到托盘 + 修复任务栏图标
 
