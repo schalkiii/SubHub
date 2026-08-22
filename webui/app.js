@@ -834,6 +834,9 @@ async function loadSettings() {
     if (ghUser) ghUser.value = s.github_user || "";
     const ghResult = document.getElementById("github-save-result");
     if (ghResult) ghResult.textContent = s.has_github_token ? "（token 已配置）" : "（尚未配置 token）";
+    // 预填「连续 N 天无可用则删除订阅」阈值（0 = 关闭）。
+    const removeSubDays = document.getElementById("remove-sub-days");
+    if (removeSubDays) removeSubDays.value = s.remove_sub_after_days != null ? s.remove_sub_after_days : 0;
   } catch {
     /* keep default (checked) if the API is unreachable */
   }
@@ -1694,6 +1697,84 @@ document.getElementById("btn-download").addEventListener("click", () => {
   a.href = URL.createObjectURL(blob);
   a.download = `subhub.${ext}`;
   a.click();
+});
+
+// 保存「连续 N 天无可用则删除订阅」阈值
+document.getElementById("btn-save-remove-sub").addEventListener("click", async () => {
+  const days = parseInt(document.getElementById("remove-sub-days").value, 10);
+  const d = isNaN(days) ? 0 : Math.max(0, days);
+  const el = document.getElementById("remove-sub-save-result");
+  try {
+    const r = await postJson("/api/settings", { remove_sub_after_days: d });
+    el.style.color = "";
+    el.textContent = r.remove_sub_after_days > 0
+      ? `已保存：连续 ${r.remove_sub_after_days} 天无可用则删除订阅`
+      : "已保存：已关闭自动清理";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "保存失败：" + err.message;
+  }
+});
+
+// 立即清理「连续 N 天无可用」的订阅
+document.getElementById("btn-prune-now").addEventListener("click", async () => {
+  const el = document.getElementById("prune-result");
+  el.textContent = "清理中…";
+  try {
+    const r = await postJson("/api/subscriptions/prune", {});
+    el.style.color = "";
+    el.textContent = r.removed > 0 ? `已清理 ${r.removed} 个长期无可用节点的订阅` : "无需清理";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "清理失败：" + err.message;
+  }
+});
+
+// 导出配置（下载 JSON 文件）
+document.getElementById("btn-export-config").addEventListener("click", async () => {
+  const el = document.getElementById("config-result");
+  try {
+    const r = await fetch("/api/settings/export");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "subhub-settings.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    el.style.color = "";
+    el.textContent = "已导出配置";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "导出失败：" + err.message;
+  }
+});
+
+// 导入配置（从 JSON 文件恢复，部分更新）
+document.getElementById("btn-import-config").addEventListener("click", () => {
+  document.getElementById("config-file").click();
+});
+document.getElementById("config-file").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const el = document.getElementById("config-result");
+  el.textContent = "导入中…";
+  try {
+    const text = await file.text();
+    JSON.parse(text); // 先校验是否为合法 JSON
+    await postJson("/api/settings/import", JSON.parse(text));
+    await loadSettings();
+    el.style.color = "";
+    el.textContent = "已导入配置";
+  } catch (err) {
+    el.style.color = "var(--danger, #ef4444)";
+    el.textContent = "导入失败：" + err.message;
+  } finally {
+    e.target.value = "";
+  }
 });
 
 // ---- init ----

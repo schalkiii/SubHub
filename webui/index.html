@@ -338,6 +338,32 @@
             <span class="hint" style="margin:0">需 <b>repo</b> 或 <b>gist</b> 权限的 personal access token。保存后用于「合并 / 导出」页的「上传到 Gist」。出于安全，token 不通过接口明文回传，仅显示是否已配置。</span>
           </div>
         </div>
+        <div class="panel">
+          <h2>自动清理无可用订阅</h2>
+          <div class="row refresh-settings">
+            <label class="lbl">无可用天数</label>
+            <input id="remove-sub-days" type="number" min="0" step="1" value="0" style="width:80px" />
+            <span class="unit">天</span>
+            <span class="hint" style="margin:0">连续多少天「没有任何可用节点」则自动删除该订阅（0 = 关闭，建议 30）。定时刷新与节点重测运行时会自动清理，也可手动立即清理</span>
+            <button class="btn" id="btn-save-remove-sub" type="button">保存</button>
+            <span id="remove-sub-save-result" class="result"></span>
+          </div>
+          <div class="row refresh-settings">
+            <button class="btn" id="btn-prune-now" type="button">立即清理</button>
+            <span id="prune-result" class="result"></span>
+            <span class="hint" style="margin:0">立即删除当前所有「连续无可用节点已达阈值天数」的订阅</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>配置备份（导出 / 导入）</h2>
+          <div class="row refresh-settings">
+            <button class="btn" id="btn-export-config" type="button">导出配置</button>
+            <button class="btn" id="btn-import-config" type="button">导入配置</button>
+            <input id="config-file" type="file" accept="application/json,.json" style="display:none" />
+            <span id="config-result" class="result"></span>
+            <span class="hint" style="margin:0">导出当前全部设置（代理 / 刷新 / 引擎 / Top-N / 外部访问 / GitHub 账号等）为 JSON 文件，可在另一台机器导入恢复。出于安全，导出不含 GitHub token 明文。</span>
+          </div>
+        </div>
       </section>
     </main>
   </div>

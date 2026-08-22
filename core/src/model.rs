@@ -33,6 +33,10 @@ pub struct SubscriptionHealth {
     pub last_checked_at: Option<u64>,
     /// epoch millis of the last *successful* fetch
     pub last_updated_at: Option<u64>,
+    /// 最后一次「拥有至少一个可用节点」的时间（epoch millis）。
+    /// 供「连续 N 天无可用节点则自动删除订阅」功能衡量订阅已持续不可用多久：
+    /// 当前无可用节点且距该时间已超过阈值时，视为「长期不可用」予以清理。
+    pub last_healthy_at: Option<u64>,
     /// error message from the last failed fetch, if any
     pub last_error: Option<String>,
 

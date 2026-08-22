@@ -127,8 +127,11 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
 | GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`），用于整机备份或跨实例迁移 |
 | POST | `/api/subscriptions/import` | **从备份恢复订阅**：按源 URL 幂等合并（重导入同一实例或跨实例的远程订阅不重复），保留内嵌节点结果（不重新抓取 / 测速），本地 / 粘贴类无 URL 订阅互不冲突 |
-| GET  | `/api/settings`      | 读取当前全局设置（`use_proxy` / `auto_refresh_sec` / `default_fetch_proxy` / `top_n` / `engine_bin` / `remove_after_fails`） |
+| POST | `/api/subscriptions/prune` | **清理长期无可用订阅**：立即删除所有「连续 N 天没有任何可用节点」的订阅（N 取自设置项 `remove_sub_after_days`，0 = 关闭），返回 `{status,removed}`。定时刷新与节点重测运行时也会自动执行 |
+| GET  | `/api/settings`      | 读取当前全局设置（`use_proxy` / `auto_refresh_sec` / `node_health_check_sec` / `default_fetch_proxy` / `top_n` / `engine_bin` / `remove_after_fails` / `remove_sub_after_days`） |
 | POST | `/api/settings`      | 更新并**持久化**全局设置到 `meta` 表（重启不丢）；`default_fetch_proxy` 仅在代理 URL 校验通过后才写入 |
+| GET  | `/api/settings/export` | **导出配置备份**：返回完整全局设置 JSON 文件（带下载头），用于备份或迁移到另一台机器。出于安全，**不含** GitHub token 明文（仅回传「是否已配置」） |
+| POST | `/api/settings/import` | **导入配置备份**：接受导出的设置 JSON 做部分更新（只应用提供的字段，未提供字段保持不变）；可附带 `github_token` 写回凭据 |
 | POST | `/api/import`        | 粘贴订阅内容直接导入（body: `{"content":"..."}`，支持 clash yaml / sing-box json / base64 / 各类 URI 混合） |
 | POST | `/api/geo-detect`    | **出口地区探测**（BestSub 风格）：经 `SUBHUB_ENGINE_BIN` 起引擎，逐节点跑 geo-IP 通道，写回 `Proxy.outbound_country`（无引擎时安全返回空） |
 | POST | `/api/unlock-detect` | **流媒体解锁判定**（BestSub 风格）：经引擎逐节点探测 TikTok / Netflix / Disney+ / YouTube Premium / ChatGPT，写回 `Proxy.unlock`（无引擎时安全返回空矩阵） |

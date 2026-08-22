@@ -4,7 +4,7 @@ use axum::{
 
     http::{header, HeaderValue, StatusCode},
 
-    response::sse::{Event, Sse},
+    response::{sse::{Event, Sse}, IntoResponse},
 
     routing::{delete, get, patch, post},
 
@@ -172,6 +172,11 @@ pub struct AppState {
     /// the `meta` table so it survives restarts and applies to every test path
     /// (manual speedtest, post-add test, refresh, scheduler).
     pub remove_after_fails: Arc<Mutex<u64>>,
+
+    /// 连续多少天「没有任何可用节点」则自动删除该订阅（0 = 禁用）。
+    /// 通过 /api/settings 配置并持久化到 meta 表；手动 `POST /api/subscriptions/prune`
+    /// 与定时调度器均会据此阈值清理长期不可用的订阅。
+    pub remove_sub_after_days: Arc<Mutex<u64>>,
 
     /// 服务器监听地址（默认 0.0.0.0，允许局域网 / 公网其他设备访问 /sub 订阅）。
     /// 可用环境变量 `SUBHUB_BIND` 覆盖（如设为 127.0.0.1 仅本机）。
@@ -552,6 +557,9 @@ pub struct SettingsResp {
     /// 是否已配置 GitHub token（true = 已保存；出于安全不返回明文）
     pub has_github_token: bool,
 
+    /// 连续多少天「没有任何可用节点」则自动删除该订阅（0 = 禁用）
+    pub remove_sub_after_days: u64,
+
     /// 启动时探测到的本机局域网 IP（只读，供 WebUI 预填外部访问地址）
     pub lan_ip: Option<String>,
 
@@ -587,6 +595,10 @@ pub struct SettingsReq {
     /// optional: when present, updates the "auto-remove after N consecutive
     /// failed speed tests" threshold (0 = disabled)
     pub remove_after_fails: Option<u64>,
+
+    /// optional: when present, updates the "auto-remove a subscription after N
+    /// consecutive days with zero available nodes" threshold (0 = disabled)
+    pub remove_sub_after_days: Option<u64>,
 
     /// optional: when present, updates the server bind address (e.g. "0.0.0.0"
     /// for LAN / "127.0.0.1" for localhost only). Takes effect after restart.
@@ -1114,6 +1126,13 @@ fn persist_results(
                 !(p.available == Some(false) && u64::from(p.consecutive_failures) >= threshold)
             });
             removed += before - sub.proxies.len();
+        }
+
+        // 维护「最后有可用节点」时间戳：只要有任一节点当前可用，即刷新该时间。
+        // 供「连续 N 天无可用节点则删除订阅」判断订阅已持续不可用多久。保留旧值
+        // 直到重新测出可用节点，避免未测速 / 刷新拉到一群未测节点就被误判为「现在无可用」。
+        if sub.proxies.iter().any(|p| p.available == Some(true)) {
+            sub.health.last_healthy_at = Some(now);
         }
 
     }
@@ -2751,41 +2770,34 @@ async fn trends(State(state): State<AppState>) -> Json<Vec<TrendPoint>> {
 
 
 /// Read global runtime settings.
-async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
-
-    Json(SettingsResp {
-
+/// 构造当前全局设置的响应。供 GET /api/settings、配置导出等复用。
+fn build_settings_resp(state: &AppState) -> SettingsResp {
+    SettingsResp {
         use_proxy: *state.use_proxy.lock_ok(),
-
         auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
-
         node_health_check_sec: *state.node_health_check_sec.lock_ok(),
-
         default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
-
         top_n: *state.top_n.lock_ok(),
-
         engine_bin: state.engine_bin.lock_ok().clone(),
         remove_after_fails: *state.remove_after_fails.lock_ok(),
+        remove_sub_after_days: *state.remove_sub_after_days.lock_ok(),
         bind_addr: state.bind_addr.lock_ok().clone(),
         external_host: state.external_host.lock_ok().clone(),
         github_user: state.github_user.lock_ok().clone(),
         has_github_token: state.github_token.lock_ok().as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false),
         lan_ip: state.lan_ip.clone(),
-    })
+    }
+}
 
+async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
+
+    Json(build_settings_resp(&state))
 }
 
 
 
 /// Patch global runtime settings (persisted to the SQLite `meta` table).
-async fn set_settings(
-
-    State(state): State<AppState>,
-
-    Json(req): Json<SettingsReq>,
-
-) -> Json<SettingsResp> {
+fn apply_settings(state: &AppState, req: SettingsReq) -> SettingsResp {
 
     if let Some(v) = req.use_proxy {
         *state.use_proxy.lock_ok() = v;
@@ -2855,6 +2867,14 @@ async fn set_settings(
             }
         }
 
+        if let Some(n) = req.remove_sub_after_days {
+            let n = n.min(3650); // 十年上限，防止误填巨大值
+            *state.remove_sub_after_days.lock_ok() = n;
+            if let Some(db) = &state.db {
+                db.meta_set("remove_sub_after_days", &n.to_string());
+            }
+        }
+
         // 外部访问主机：空字符串清除（回退到本机 IP / localhost）。
         if let Some(h) = &req.external_host {
             let val = h.trim();
@@ -2896,27 +2916,7 @@ async fn set_settings(
             }
         }
 
-        Json(SettingsResp {
-
-            use_proxy: *state.use_proxy.lock_ok(),
-
-            auto_refresh_sec: *state.auto_refresh_sec.lock_ok(),
-
-            node_health_check_sec: *state.node_health_check_sec.lock_ok(),
-
-            default_fetch_proxy: state.default_fetch_proxy.lock_ok().clone(),
-
-        top_n: *state.top_n.lock_ok(),
-
-        engine_bin: state.engine_bin.lock_ok().clone(),
-        remove_after_fails: *state.remove_after_fails.lock_ok(),
-        bind_addr: state.bind_addr.lock_ok().clone(),
-        external_host: state.external_host.lock_ok().clone(),
-        github_user: state.github_user.lock_ok().clone(),
-        has_github_token: state.github_token.lock_ok().as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false),
-        lan_ip: state.lan_ip.clone(),
-    })
-
+    build_settings_resp(state)
 }
 
 
@@ -2924,6 +2924,41 @@ async fn set_settings(
 /// BestSub-style streaming-unlock detection: route each proxy through the
 /// external engine and probe the streaming services, persisting the per-service
 /// unlock matrix back onto each proxy. No-op (empty matrix) without an engine.
+/// Patch global runtime settings (persisted to the SQLite `meta` table).
+async fn set_settings(
+    State(state): State<AppState>,
+    Json(req): Json<SettingsReq>,
+) -> Json<SettingsResp> {
+    Json(apply_settings(&state, req))
+}
+
+/// GET /api/settings/export — 导出完整配置为 JSON 文件（供备份 / 迁移到另一台机器）。
+/// 出于安全，响应不包含 GitHub token 明文（与 get_settings 一致，只回传「是否已配置」）。
+async fn export_settings(State(state): State<AppState>) -> impl IntoResponse {
+    let resp = build_settings_resp(&state);
+    let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"subhub-settings.json\""),
+            ),
+        ],
+        body,
+    )
+}
+
+/// POST /api/settings/import — 从导出文件恢复配置（部分更新：只应用提供的字段，
+/// 未提供的字段保持原值）。接受与 set_settings 相同的请求体。安全提示：导入文件里
+/// 若含 github_token 会被写入；请仅供可信环境使用。
+async fn import_settings(
+    State(state): State<AppState>,
+    Json(req): Json<SettingsReq>,
+) -> Json<SettingsResp> {
+    Json(apply_settings(&state, req))
+}
+
 async fn unlock_detect(
 
     State(state): State<AppState>,
@@ -3053,6 +3088,54 @@ async fn cleanup_bad(State(state): State<AppState>) -> Json<serde_json::Value> {
 
     Json(serde_json::json!({ "status": "ok", "removed": removed }))
 
+}
+
+/// 删除「连续 N 天没有任何可用节点」的订阅。N 取自 `remove_sub_after_days`（0 = 禁用）。
+/// 判断规则：
+/// - 订阅当前仍有任一可用节点（`available == Some(true)`）→ 保留；
+/// - 否则以「最后有可用节点的时间」为基准（从未健康过则回退到最后检查时间），
+///   距现在已超过 N 天则从 store 移除。
+/// 返回被删除的订阅数量。
+fn prune_dead_subscriptions(state: &AppState, now: u64) -> usize {
+    let days = *state.remove_sub_after_days.lock_ok();
+    if days == 0 {
+        return 0;
+    }
+    // 把「天」换算成毫秒，注意 u64 溢出保护（与 auto-refresh 思路一致）。
+    let cutoff_ms = (days as u64).saturating_mul(24 * 60 * 60 * 1000);
+    let removed = {
+        let mut guard = state.store.lock_ok();
+        let before = guard.len();
+        guard.retain(|sub| {
+            // 当前仍有可用节点：保留。
+            if sub.proxies.iter().any(|p| p.available == Some(true)) {
+                return true;
+            }
+            // 否则以「最后健康时间」为基准；从未健康过用最后检查时间兜底。
+            let ref_time = sub
+                .health
+                .last_healthy_at
+                .or(sub.health.last_checked_at)
+                .or(sub.health.last_updated_at);
+            match ref_time {
+                // 距参考时间已达阈值 → 删除；否则保留（连续无可用未满 N 天）。
+                Some(t) => now.saturating_sub(t) < cutoff_ms,
+                // 没有任何时间信息，保守保留。
+                None => true,
+            }
+        });
+        before - guard.len()
+    };
+    if removed > 0 {
+        persist_all(state);
+    }
+    removed
+}
+
+/// POST /api/subscriptions/prune — 立即清理「连续 N 天无可用节点」的订阅。
+async fn prune_subscriptions(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let removed = prune_dead_subscriptions(&state, now_ms());
+    Json(serde_json::json!({ "status": "ok", "removed": removed }))
 }
 
 
@@ -3764,6 +3847,14 @@ pub async fn run_server() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(remove_after_fails_default);
 
+    // 连续 N 天无可用节点则删除订阅：持久化在 meta（来自 UI）。0 = 禁用。
+    let remove_sub_after_days_default: u64 = 0;
+    let remove_sub_after_days = db
+        .as_ref()
+        .and_then(|d| d.meta_get("remove_sub_after_days"))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(remove_sub_after_days_default);
+
     // 绑定地址：env `SUBHUB_BIND` 设默认值（默认 0.0.0.0 = 允许局域网 / 公网访问）；
     // 持久化在 meta 的值（来自 UI）优先于默认值。
     let bind_addr_default = std::env::var("SUBHUB_BIND")
@@ -3820,6 +3911,7 @@ pub async fn run_server() {
 
         engine_bin: Arc::new(Mutex::new(engine_bin_default)),
         remove_after_fails: Arc::new(Mutex::new(remove_after_fails)),
+        remove_sub_after_days: Arc::new(Mutex::new(remove_sub_after_days)),
         bind_addr: Arc::new(Mutex::new(bind_addr)),
         external_host: Arc::new(Mutex::new(external_host)),
         github_user: Arc::new(Mutex::new(github_user)),
@@ -3902,6 +3994,9 @@ pub async fn run_server() {
 
                 }
 
+                // 一轮刷新结束后，清理「连续 N 天无可用节点」的订阅（阈值 > 0 时生效）。
+                prune_dead_subscriptions(&st, now_ms());
+
             }
 
         });
@@ -3945,6 +4040,8 @@ pub async fn run_server() {
                 let timeout_ms = 4000u64;
                 run_health_check_core(&st, &all, timeout_ms, concurrency).await;
                 persist_all(&st);
+                // 定时清理「连续 N 天无可用节点」的订阅（阈值 > 0 时生效）。
+                prune_dead_subscriptions(&st, now_ms());
             }
         });
     }
@@ -3980,6 +4077,8 @@ pub async fn run_server() {
 
         .route("/api/subscriptions/import", post(import_subscriptions))
 
+        .route("/api/subscriptions/prune", post(prune_subscriptions))
+
         .route("/api/import", post(import_raw))
 
         .route("/api/proxies", get(list_proxies))
@@ -3992,6 +4091,10 @@ pub async fn run_server() {
         .route("/api/settings", get(get_settings))
 
         .route("/api/settings", post(set_settings))
+
+        .route("/api/settings/export", get(export_settings))
+
+        .route("/api/settings/import", post(import_settings))
 
         .route("/api/export", post(merge_export))
 
@@ -4147,6 +4250,7 @@ mod tests {
             github_token: Arc::new(Mutex::new(None)),
             gist_id: Arc::new(Mutex::new(None)),
             gist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            remove_sub_after_days: Arc::new(Mutex::new(0)),
             lan_ip: None,
             persist_lock: Arc::new(Mutex::new(())),
         };
