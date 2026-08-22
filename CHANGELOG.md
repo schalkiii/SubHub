@@ -2,6 +2,17 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P20] 自动清理无可用订阅 + 配置备份导出导入
+
+### Added
+- **连续 N 天无可用节点自动清理订阅**：新增设置项「无可用天数」（`remove_sub_after_days`，0 = 关闭，建议 30）。某订阅连续 N 天没有任何可用节点（即当前无任何 `available == Some(true)` 节点，且距最后一次有可用节点已超过 N 天）将被自动删除。判定基准为 `SubscriptionHealth.last_healthy_at`（在 `persist_results` 写出任一可用节点时刷新；从未健康过的订阅回退到 `last_checked_at`）。清理在「定时刷新」「节点健康重测」每轮结束时自动执行，也可 `POST /api/subscriptions/prune` 手动立即清理。
+- **配置备份导出 / 导入**：设置页新增「配置备份」面板。
+  - `GET /api/settings/export`：导出当前全局设置（代理 / 刷新 / 引擎 / Top-N / 外部访问 / GitHub 账号等）为带下载头的 JSON 文件，便于备份或迁移。出于安全，导出**不含** GitHub token 明文。
+  - `POST /api/settings/import`：接受同一份设置 JSON 做**部分更新**（仅应用提供的字段），可附带 `github_token` 写回。设置读写逻辑抽离为 `build_settings_resp` / `apply_settings` 复用，避免与 `GET/POST /api/settings` 行为分叉。
+
+### Changed
+- `SubscriptionHealth` 新增 `last_healthy_at: Option<u64>` 字段（随订阅 JSON 快照持久化）。
+
 ## [P19] 代码审计修复（R1 Round）
 
 ### Fixed
