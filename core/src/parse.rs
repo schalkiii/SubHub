@@ -156,7 +156,7 @@ fn extract_yaml_proxies(raw: &str) -> Vec<Proxy> {
     parse_clash_yaml(&yaml_lines.join("\n"))
 }
 
-fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     let s = s.trim().replace(['\n', '\r'], "");
     // Try every common base64 flavour. V2Board / Xboard / sspanel-style panels
     // frequently emit URL-safe base64 (`-`/`_` instead of `+`/`/`), and many

@@ -122,7 +122,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 |---|---|---|
 | GET  | `/api/health`        | 健康检查 |
 | GET  | `/api/subscriptions` | 订阅来源列表（**含逐个健康度**：`status` / `source_type` / `node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` / `last_checked_at` / `last_updated_at` / `last_error`） |
-| POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加协议级 HTTP 延迟与带宽） |
+| POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加协议级 HTTP 延迟与带宽）；**支持以 base64 形式粘贴的订阅链接集合（自动解码展开为多行 URL）** |
 | POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}` |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
 | GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`），用于整机备份或跨实例迁移 |
@@ -250,6 +250,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **逐个订阅健康度**（借 Resin `SubscriptionResponse` 模型）：`status`(healthy/degraded/down/error/empty/untested/disabled/pending)、`node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` 均随节点派生
 - 坏订阅（不可达源）→ `status:"error"` + `last_error` 填充；好订阅正确区分为 `untested` 而非 `down`
 - **添加后自动健康度检测 + 测速**：导入 / 添加订阅后立即对节点跑 TCP 测速，`available` / `latency_ms` 自动写回（本机可达节点 `available:true`、不可达 `available:false`），健康度卡片随之即时刷新
+- **订阅使用量展示**：自动解析订阅的 `Subscription-Userinfo` 响应头与 clash `info` 块（`download` / `upload` / `total` / `expire`），在「订阅管理」每张订阅卡片上显示流量用量进度条、已用 / 总量与到期日；无使用量信息的订阅自动隐藏。数据随订阅抓取 / 刷新自动刷新
 - **通过代理拉取订阅**：`POST /api/subscriptions` 的 `fetch_proxy` 字段（或 WebUI 批量添加面板的「拉取代理」）支持 `http` / `https` / `socks5` 代理，用于抓取被墙的订阅源；代理地址无效会令该订阅 `status:"error"` 并写入 `last_error`
 - **订阅刷新** `POST /api/subscriptions/:id/refresh` 生效（重拉源、更新 `last_checked_at`/`last_updated_at`；remote 订阅会沿用其存储的 `fetch_proxy`）
 - **出口地区探测** `POST /api/geo-detect` 无引擎时安全返回空列表、不报错；配置引擎后写回 `outbound_country`

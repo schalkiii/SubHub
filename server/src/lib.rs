@@ -827,7 +827,7 @@ async fn fetch_subscription_text(
     // builder error (or, worse, a future reqwest feature actually fetch it).
     let lower = url.trim().to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err(format!("不支持的订阅 URL 协议（仅支持 http/https）: {}", redact_url(url)));
+        return Err(format!("不支持的订阅 URL 协议（仅支持 http/https）: {}", redact_url(&url)));
     }
     let resp = client
         .get(url)
@@ -994,6 +994,25 @@ async fn run_engine_passes(
 /// Persist speed-test results back onto the matching proxies (by fingerprint)
 /// and stamp `last_tested_at`. Used by both the manual speedtest endpoint and
 /// the automatic post-add test so there is a single source of truth.
+/// 判断节点 server 是否为回环/本地/未指定地址字面量。
+///
+/// 命中（如 127.0.0.53 这类 DNS stub、127.0.0.1、::1、0.0.0.0、localhost、
+/// `[::1]`）的节点绕过了真实网络，测速会得到虚假带宽/延迟，写入结果时应跳过。
+/// 仅对可静态解析的 IP/主机字面量生效；域名（如 example.com）无法判断则返回 false。
+fn is_loopback_server(server: &str) -> bool {
+    let s = server.trim().trim_matches(|c| c == '[' || c == ']');
+    if s.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match s.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+/// Persist speed-test results back onto the matching proxies (by fingerprint)
+/// and stamp `last_tested_at`. Used by both the manual speedtest endpoint and
+/// the automatic post-add test so there is a single source of truth.
 fn persist_results(
 
     state: &AppState,
@@ -1074,6 +1093,16 @@ fn persist_results(
         for p in sub.proxies.iter_mut() {
 
             if let Some((lat, tcp_avail, h, dl, measured)) = by_fp.get(&p.fingerprint()) {
+
+                // 回环/本地节点（如 127.0.0.53）走本地回环会得到虚假带宽/延迟，
+                // 直接跳过所有测速结果，标记为「未测」以免污染健康度与速度列。
+                if is_loopback_server(&p.server) {
+                    p.available = None;
+                    p.latency_ms = None;
+                    p.download_speed_bps = None;
+                    p.bandwidth_measured = false;
+                    continue;
+                }
 
                 // engine_usable: 引擎本批确有成功探测 → 信任逐节点引擎结果；
                 // 否则回退 TCP（引擎未配置，或整体故障/全超时 → 不能 mass-red）。
@@ -1503,6 +1532,35 @@ async fn health() -> &'static str {
 
 
 
+/// 把一个「添加订阅」输入框中的条目展开为 0..N 个订阅 URL。
+///
+/// - 形如 `http(s)://...` 的普通链接：原样返回；
+/// - 否则当作 base64 编码的「链接列表」（常见于以 base64 形式分享的订阅合集，
+///   每行一个订阅 URL）尝试解码，逐行取出 http(s):// 链接。
+fn expand_input_entry(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // 已经是普通订阅链接（subconverter / v2rayN 大多直接给 URL）。
+    if raw.contains("://") {
+        return vec![raw.to_string()];
+    }
+    // 不是 URL：尝试按 base64 解码为「多行 URL 列表」。
+    match subhub_core::b64_decode(raw) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            text
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn add_subscriptions(
 
     State(state): State<AppState>,
@@ -1528,81 +1586,62 @@ async fn add_subscriptions(
 
     let mut new_subs: Vec<Subscription> = Vec::new();
 
-    for url in &req.urls {
+    // 每个输入框条目可能是一个普通订阅 URL，也可能是一段 base64（解码后为
+    // 多行订阅 URL 列表，常见于「以 base64 形式分享的订阅合集」）。自动展开后逐个添加。
+    for raw in &req.urls {
+        for url in expand_input_entry(raw) {
+            let now = now_ms();
 
-        let url = url.trim();
+            let mut sub = Subscription::new(sub_name_from_url(&url), url.clone(), Vec::new());
 
-        if url.is_empty() {
+            sub.fetch_proxy = effective_proxy.clone();
 
-            continue;
+            sub.health.last_checked_at = Some(now);
 
-        }
+            // fetch through the optional upstream proxy when the master switch is on
+            let client = match client_with_proxy(proxy_opt) {
+                Ok(c) => c,
+                Err(e) => {
+                    sub.health.last_error = Some(e);
+                    new_subs.push(sub);
+                    continue;
+                }
+            };
 
-        let now = now_ms();
-
-        let mut sub = Subscription::new(sub_name_from_url(url), url.to_string(), Vec::new());
-
-        sub.fetch_proxy = effective_proxy.clone();
-
-        sub.health.last_checked_at = Some(now);
-
-
-
-        // fetch through the optional upstream proxy when the master switch is on
-
-        let client = match client_with_proxy(proxy_opt) {
-
-            Ok(c) => c,
-
-            Err(e) => {
-
-                sub.health.last_error = Some(e);
-
-                new_subs.push(sub);
-
-                continue;
-
-            }
-
-        };
-
-        match fetch_subscription_text(&client, url).await {
-
-            Ok((text, userinfo)) => {
-                let proxies = parse_subscription(&text);
-                let (up, dl, tot, exp) = usage_from_sources(&userinfo, &text);
-                let n = proxies.len();
-                sub.proxies = proxies;
-                sub.health.upload = up;
-                sub.health.download = dl;
-                sub.health.total = tot;
-                sub.health.expire = exp;
-                sub.health.last_updated_at = Some(now);
-                sub.health.last_error = None;
-                eprintln!("fetched {}: {n} nodes", redact_url(url));
-                if n == 0 {
-                    // Diagnostics: a 200 response that parsed to zero nodes is
-                    // almost always an unrecognised body format (e.g. a base64
-                    // flavour or a clash key we don't unwrap). Dump the first
-                    // 400 bytes so the operator can identify the shape.
-                    let snippet: String = text.chars().take(400).collect();
-                    eprintln!(
-                        "  [subhub] warning: 0 nodes parsed from {}. body prefix ({}B): {:?}",
-                        redact_url(url),
-                        snippet.len(),
-                        snippet
-                    );
+            match fetch_subscription_text(&client, &url).await {
+                Ok((text, userinfo)) => {
+                    let proxies = parse_subscription(&text);
+                    let (up, dl, tot, exp) = usage_from_sources(&userinfo, &text);
+                    let n = proxies.len();
+                    sub.proxies = proxies;
+                    sub.health.upload = up;
+                    sub.health.download = dl;
+                    sub.health.total = tot;
+                    sub.health.expire = exp;
+                    sub.health.last_updated_at = Some(now);
+                    sub.health.last_error = None;
+                    eprintln!("fetched {}: {n} nodes", redact_url(&url));
+                    if n == 0 {
+                        // Diagnostics: a 200 response that parsed to zero nodes is
+                        // almost always an unrecognised body format (e.g. a base64
+                        // flavour or a clash key we don't unwrap). Dump the first
+                        // 400 bytes so the operator can identify the shape.
+                        let snippet: String = text.chars().take(400).collect();
+                        eprintln!(
+                            "  [subhub] warning: 0 nodes parsed from {}. body prefix ({}B): {:?}",
+                            redact_url(&url),
+                            snippet.len(),
+                            snippet
+                        );
+                    }
+                }
+                Err(e) => {
+                    sub.health.last_error = Some(e);
                 }
             }
 
-            Err(e) => {
-                sub.health.last_error = Some(e);
-            }
-
+            new_subs.push(sub);
         }
-
-        new_subs.push(sub);
-
     }
 
     // Remember the pull proxy as the default ONLY after at least one
@@ -4167,7 +4206,45 @@ pub async fn run_server() {
 #[cfg(test)]
 mod tests {
     use crate::LockExt;
+    use base64::Engine;
     use subhub_core::{Proxy, ProxyType};
+
+    #[test]
+    fn expand_input_entry_handles_urls_and_base64() {
+        // 普通 URL 原样返回
+        assert_eq!(
+            super::expand_input_entry("https://a.com/sub"),
+            vec!["https://a.com/sub".to_string()]
+        );
+        assert_eq!(
+            super::expand_input_entry("  http://b.com/x  "),
+            vec!["http://b.com/x".to_string()]
+        );
+        // base64 解码后是多行 URL 列表
+        let list = "https://c.com/1\nhttps://c.com/2\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(list.as_bytes());
+        assert_eq!(
+            super::expand_input_entry(&encoded),
+            vec!["https://c.com/1".to_string(), "https://c.com/2".to_string()]
+        );
+        // 非 URL、非 base64 → 空
+        assert!(super::expand_input_entry("just some random text").is_empty());
+        // 空输入
+        assert!(super::expand_input_entry("").is_empty());
+    }
+
+    #[test]
+    fn is_loopback_server_detects_local_addresses() {
+        assert!(super::is_loopback_server("127.0.0.53"));
+        assert!(super::is_loopback_server("127.0.0.1"));
+        assert!(super::is_loopback_server("::1"));
+        assert!(super::is_loopback_server("[::1]"));
+        assert!(super::is_loopback_server("0.0.0.0"));
+        assert!(super::is_loopback_server("localhost"));
+        // 真实公网/域名不应被判为回环
+        assert!(!super::is_loopback_server("1.2.3.4"));
+        assert!(!super::is_loopback_server("example.com"));
+    }
 
     #[test]
     fn score_untested_node_not_zeroed() {
@@ -4229,7 +4306,7 @@ mod tests {
         use subhub_core::speedtest::SpeedTestResult;
         use subhub_core::Subscription;
 
-        let mut state = super::AppState {
+        let state = super::AppState {
             store: Arc::new(Mutex::new(vec![Subscription::new(
                 "s".to_string(),
                 "pasted".to_string(),

@@ -12,8 +12,8 @@ pub use model::{
 };
 pub use ops::{apply as apply_transform, Transform};
 pub use parse::{
-    extract_subscription_usage, normalize_epoch, parse_clash_yaml, parse_subscription, parse_uri,
-    SubscriptionUsage,
+    b64_decode, extract_subscription_usage, normalize_epoch, parse_clash_yaml, parse_subscription,
+    parse_uri, SubscriptionUsage,
 };
 pub use export::{export_filter, export_str, to_clash_meta};
 pub use score::score_proxy;
