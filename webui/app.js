@@ -63,7 +63,7 @@ function showSpeedProgress(text) {
 }
 // 根据单个 Progress 事件刷新进度条与“当前节点”行
 function updateSpeedProgress(ev) {
-  const { done, total, name, available, latency_ms, bandwidth_bps, phase } = ev;
+  const { done, total, name, available, latency_ms, bandwidth_bps, phase, server } = ev;
   // 总数只在首次确定（后端 unit_total = N*3，阶段间保持不变），
   // 后续事件即使 total 偶发为 0 也以首个有效值为准，避免分母跳变。
   if (total > 0 && !_speedState.seenTotal) {
@@ -82,9 +82,14 @@ function updateSpeedProgress(ev) {
     // 测量中，不可用“超时 / —”误导用户以为节点已失败。
     const stage = phase === "http" ? "测 HTTP 延迟" : phase === "bw" ? "测带宽" : "";
     const lat = latency_ms != null ? latency_ms + " ms" : (phase === "tcp" ? "超时" : "测量中");
-    const bw = bandwidth_bps != null
-      ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s"
-      : (phase === "bw" ? "测速中" : "—");
+    // 回环节点（127.*/localhost/::1 等）的「带宽」只是本地内存拷贝，并非真实
+    // 代理速度，统一显示「不适用」而非误导性的大数值。
+    const loopback = isLoopback(server);
+    const bw = loopback
+      ? "不适用"
+      : (bandwidth_bps != null
+        ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s"
+        : (phase === "bw" ? "测速中" : "—"));
     const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
     cur.textContent = `(${_speedState.maxDone}/${effTotal}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
   }
@@ -1078,18 +1083,24 @@ function renderNodes(list) {
   const tbody = document.querySelector("#nodes-table tbody");
   const rowHtml = (p) => {
     const lat = p.latency_ms != null ? `${p.latency_ms} ms` : "—";
+    // 回环节点（127.*/localhost/::1 等）走本地回环，测出的「带宽」只是内存拷贝，
+    // 并非真实代理速度，统一显示「不适用」而非误导性的大数值。
+    const loopback = isLoopback(p.server);
     // 带宽只有配置 SUBHUB_ENGINE_BIN 后才是真实代理吞吐；否则 download_speed_bps
     // 只是 TCP 连接吞吐估算，并非真实可用带宽。未实测时用「≈」标注，避免把
     // 「TCP 能连」误当成「节点可用」（真实协议连通性需经引擎访问 gstatic）。
-    const speed =
-      p.download_speed_bps != null
+    const speed = loopback
+      ? "不适用"
+      : (p.download_speed_bps != null
         ? (p.bandwidth_measured
             ? `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`
             : `≈${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`)
-        : "—";
-    const speedTitle = p.bandwidth_measured
-      ? "真实代理下行带宽（经测速引擎实测）"
-      : "TCP 吞吐估算，非真实代理带宽（未配置测速引擎 SUBHUB_ENGINE_BIN）";
+        : "—");
+    const speedTitle = loopback
+      ? "回环/本地地址，测速无意义（带宽仅为本地内存拷贝）"
+      : (p.bandwidth_measured
+        ? "真实代理下行带宽（经测速引擎实测）"
+        : "TCP 吞吐估算，非真实代理带宽（未配置测速引擎 SUBHUB_ENGINE_BIN）");
     const unlock = p.unlock ? summaryUnlock(p.unlock) : "—";
     const avail =
       p.available === false ? "down" : p.available === true ? "up" : "unknown";
@@ -1343,6 +1354,20 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+// 与后端 is_loopback_server 对齐：判断节点 host 是否为回环/本地/未指定地址。
+// 命中（127.*、::1、0.0.0.0、localhost、[::1] 等）的节点走本地回环，
+// 测出的「带宽」只是内存拷贝而非真实代理速度，应在 UI 标注「不适用」。
+function isLoopback(server) {
+  if (!server) return false;
+  let s = String(server).trim().replace(/^\[|\]$/g, "");
+  if (s.toLowerCase() === "localhost") return true;
+  // IPv4 回环段 127.0.0.0/8，以及未指定的 0.0.0.0
+  if (/^127\./.test(s) || s === "0.0.0.0") return true;
+  // IPv6 回环 ::1 与未指定 ::
+  if (s === "::1" || s === "::") return true;
+  return false;
 }
 
 // 上次测速时间戳（epoch 毫秒）→ 本地日期时间；无记录显示「—」

@@ -479,6 +479,9 @@ struct ProgressView {
     available: bool,
     latency_ms: Option<u64>,
     bandwidth_bps: Option<f64>,
+    /// Node host, so the WebUI can flag loopback/localhost addresses (their
+    /// bandwidth is local memory copy, not a real proxy speed).
+    server: String,
     /// Which stage produced this tick: "tcp" (TCP latency) / "http"
     /// (engine HTTP latency) / "bw" (engine bandwidth). Lets the WebUI label
     /// the live row correctly — the whole speedtest spans all three stages.
@@ -3571,13 +3574,22 @@ async fn speedtest(
         let tx_tcp = tx.clone();
         let tcp_results = tokio::task::spawn_blocking(move || {
             let cb = move |p: subhub_core::speedtest::TestProgress| {
+                // 回环节点（127.*/localhost/::1 等）的「带宽」只是往本地 socket
+                // 灌数据的吞吐，是内存拷贝而非真实代理速度，实时进度里直接置空，
+                // 避免把 6000+ MB/s 的假值展示给用户。
+                let bandwidth_bps = if is_loopback_server(&p.server) {
+                    None
+                } else {
+                    p.bandwidth_bps
+                };
                 let _ = tx_tcp.send(SpeedEvent::Progress(ProgressView {
                     done: p.done,
                     total: unit_total,
                     name: p.name,
                     available: p.available,
                     latency_ms: p.latency_ms,
-                    bandwidth_bps: p.bandwidth_bps,
+                    bandwidth_bps,
+                    server: p.server,
                     phase: "tcp".to_string(),
                 }));
             };
@@ -3600,8 +3612,11 @@ async fn speedtest(
             let on_http: Option<Arc<dyn Fn(String) + Send + Sync>> = if has_engine {
                 let tx = tx_http.clone();
                 let c = http_counter.clone();
+                let servers = proxies.iter().map(|p| p.server.clone()).collect::<Vec<_>>();
                 Some(Arc::new(move |name: String| {
                     let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    // 计数器按输入顺序递增，可与 proxies 一一对应取到 server。
+                    let server = servers.get(d as usize - 1).cloned().unwrap_or_default();
                     let _ = tx.send(SpeedEvent::Progress(ProgressView {
                         done: http_off + d as usize,
                         total: ut,
@@ -3609,6 +3624,7 @@ async fn speedtest(
                         available: false,
                         latency_ms: None,
                         bandwidth_bps: None,
+                        server,
                         phase: "http".to_string(),
                     }));
                 }))
@@ -3618,8 +3634,10 @@ async fn speedtest(
             let on_bw: Option<Arc<dyn Fn(String) + Send + Sync>> = if has_engine {
                 let tx = tx_bw.clone();
                 let c = bw_counter.clone();
+                let servers = proxies.iter().map(|p| p.server.clone()).collect::<Vec<_>>();
                 Some(Arc::new(move |name: String| {
                     let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let server = servers.get(d as usize - 1).cloned().unwrap_or_default();
                     let _ = tx.send(SpeedEvent::Progress(ProgressView {
                         done: bw_off + d as usize,
                         total: ut,
@@ -3627,6 +3645,7 @@ async fn speedtest(
                         available: false,
                         latency_ms: None,
                         bandwidth_bps: None,
+                        server,
                         phase: "bw".to_string(),
                     }));
                 }))

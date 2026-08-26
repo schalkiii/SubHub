@@ -93,6 +93,10 @@ pub struct TestProgress {
     pub available: bool,
     pub latency_ms: Option<u64>,
     pub bandwidth_bps: Option<f64>,
+    /// Node `server` (host) so callers can tell loopback/localhost addresses
+    /// apart from real ones and avoid surfacing their meaningless local-only
+    /// throughput as if it were a proxy speed.
+    pub server: String,
 }
 
 /// Run TCP ping for every proxy with bounded concurrency. Returns one result
@@ -144,6 +148,7 @@ pub fn tcp_ping_all(
                             available: r.available,
                             latency_ms: r.tcp_latency_ms,
                             bandwidth_bps: r.download_speed_bps,
+                            server: p.server.clone(),
                         });
                     }
                     let _ = tx.send(r);
