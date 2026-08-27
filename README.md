@@ -84,7 +84,7 @@
 > ⚠️ **端口说明**：默认端口为 **3005**（本机 AdGuardHome 已占用 3000）。可用环境变量覆盖：
 > `SUBHUB_PORT=8080 cargo run -p subhub-server`
 
-> 🔧 **测速引擎（可选）**：设置 `SUBHUB_ENGINE_BIN` 指向 mihomo / sing-box 二进制后，测速会对每个节点临时拉起引擎、走 SOCKS5 测量**协议级 HTTP 延迟**（未设置时仅做 TCP 连通性延迟）。例如：
+> 🔧 **测速引擎（可选）**：设置 `SUBHUB_ENGINE_BIN` 指向 mihomo / sing-box 二进制后，测速会对每个节点临时拉起引擎、走 SOCKS5 测量**协议级 HTTP 延迟**（未设置时仅做 TCP 连通性延迟）。SubHub 会按二进制名自动选择启动参数：mihomo / clash 系用 `-f`、sing-box 用 `-c`。例如：
 > `SUBHUB_ENGINE_BIN=/path/to/mihomo cargo run -p subhub-server`
 
 > 💾 **持久化（默认开启）**：订阅与测速结果默认存入 `data/subhub.db`（SQLite，`rusqlite` bundled 编译，**零外部依赖**），重启不丢。可用 `SUBHUB_DB=/path/to/app.db` 覆盖路径；设为空字符串 `SUBHUB_DB=` 退回纯内存（重启即清空）。删除该文件即可重置全部数据。

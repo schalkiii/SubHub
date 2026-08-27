@@ -85,11 +85,18 @@ function updateSpeedProgress(ev) {
     // 回环节点（127.*/localhost/::1 等）的「带宽」只是本地内存拷贝，并非真实
     // 代理速度，统一显示「不适用」而非误导性的大数值。
     const loopback = isLoopback(server);
-    const bw = loopback
-      ? "不适用"
-      : (bandwidth_bps != null
-        ? (bandwidth_bps / 1048576).toFixed(2) + " MB/s"
-        : (phase === "bw" ? "测速中" : "—"));
+    let bw;
+    if (loopback) {
+      bw = `<span class="bw-tag loopback">回环</span>不适用`;
+    } else if (bandwidth_bps != null) {
+      // bw 阶段走测速引擎，为真实代理吞吐；tcp 阶段的带宽是本地 socket 估算。
+      const val = (bandwidth_bps / 1048576).toFixed(2) + " MB/s";
+      bw = phase === "bw"
+        ? `<span class="bw-tag real">实测</span>${val}`
+        : `<span class="bw-tag est">估算</span>≈${val}`;
+    } else {
+      bw = phase === "bw" ? "测速中" : "—";
+    }
     const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
     cur.textContent = `(${_speedState.maxDone}/${effTotal}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
   }
@@ -1120,7 +1127,7 @@ function renderNodes(list) {
       <td>${escapeHtml(p.outbound_country || p.region || "OTHER")}</td>
       <td>${escapeHtml(p.outbound_country || "—")}</td>
       <td class="${latencyClass(p.latency_ms)}">${lat}</td>
-      <td title="${speedTitle}">${speed}</td>
+      <td class="bw-cell" title="${speedTitle}">${bwBadge(p)}</td>
       <td class="unlock-cell">${escapeHtml(unlock)}</td>
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
@@ -1368,6 +1375,23 @@ function isLoopback(server) {
   // IPv6 回环 ::1 与未指定 ::
   if (s === "::1" || s === "::") return true;
   return false;
+}
+
+// 带宽质量徽标：一眼区分「真带宽」与「假绿带宽」。
+//   实测 = bandwidth_measured=true，经测速引擎真实代理下载测得（可信）；
+//   估算 = TCP 吞吐估算（未配/未启用引擎或未实测），不代表真实可用带宽；
+//   回环 = 本地地址，测速无意义。
+// 返回可直接塞进 <td> 的 HTML 片段。
+function bwBadge(p) {
+  if (isLoopback(p.server)) {
+    return `<span class="bw-tag loopback">回环</span>不适用`;
+  }
+  if (p.download_speed_bps == null) return "—";
+  const val = `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`;
+  if (p.bandwidth_measured) {
+    return `<span class="bw-tag real">实测</span>${val}`;
+  }
+  return `<span class="bw-tag est">估算</span>≈${val}`;
 }
 
 // 上次测速时间戳（epoch 毫秒）→ 本地日期时间；无记录显示「—」

@@ -100,7 +100,20 @@ where
 
 
     let mut cmd = Command::new(bin);
-    cmd.arg("-c")
+    // mihomo / clash-family engines take `-f` for the config file; sing-box takes
+    // `-c`. The clash-verge-rev `verge-mihomo.exe` build in particular rejects
+    // `-c` outright (flag not defined) and exits immediately, which previously
+    // made every engine probe fail silently and fall back to TCP-only (fake)
+    // measurements — nodes then showed a green "ping + bandwidth" that was never
+    // a real proxy check (e.g. SubHub green while clash reports the node dead).
+    let config_flag = if bin.to_ascii_lowercase().contains("mihomo")
+        || bin.to_ascii_lowercase().contains("clash")
+    {
+        "-f"
+    } else {
+        "-c"
+    };
+    cmd.arg(config_flag)
         .arg(&cfg_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
