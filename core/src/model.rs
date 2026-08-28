@@ -288,7 +288,6 @@ impl ProxyUnlock {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyType {
@@ -384,7 +383,11 @@ impl Proxy {
             i += 1;
         }
 
-        let hay = format!("{} {}", self.name.to_lowercase(), self.server.to_lowercase());
+        let hay = format!(
+            "{} {}",
+            self.name.to_lowercase(),
+            self.server.to_lowercase()
+        );
 
         // 1) full names / Chinese / English country names (substring, safe)
         const NAME_TABLE: &[(&str, &str)] = &[
@@ -832,7 +835,11 @@ impl Proxy {
                 s(&self.flow)
             ),
             ProxyType::Ss => format!("{}|{}", s(&self.method), s(&self.password)),
-            ProxyType::Trojan | ProxyType::Hysteria2 | ProxyType::Socks5 | ProxyType::Http | ProxyType::AnyTls => {
+            ProxyType::Trojan
+            | ProxyType::Hysteria2
+            | ProxyType::Socks5
+            | ProxyType::Http
+            | ProxyType::AnyTls => {
                 format!(
                     "{}|{}|{}|{}|{}",
                     s(&self.password),
@@ -869,7 +876,11 @@ impl Proxy {
     pub fn is_exportable(&self) -> bool {
         let has = |o: &Option<String>| o.as_ref().is_some_and(|s| !s.is_empty());
         match self.type_ {
-            ProxyType::Ss => has(&self.password) && has(&self.method),
+            // SS 的加密方法可能存于 `cipher`（clash-meta YAML 订阅）或 `method`
+            // （SIP002 URI 解析）任一字段，二者满足其一即视为完整。旧代码只读
+            // `method` 会把「从 YAML 订阅导入、cipher 有值而 method 为 null」的 SS
+            // 节点误判为不完整而丢弃，导致引擎跳过该节点、只能回退 TCP 估计（0.0MB/s）。
+            ProxyType::Ss => has(&self.password) && (has(&self.cipher) || has(&self.method)),
             ProxyType::Trojan | ProxyType::AnyTls => has(&self.password),
             ProxyType::Vmess => has(&self.uuid),
             ProxyType::Vless => has(&self.uuid),
@@ -914,13 +925,11 @@ mod tests {
         // bandwidth_measured marks whether download_speed_bps is a real engine
         // measurement (true) or just the engine-free TCP estimate (false). It
         // must start false so the scorer never credits an unmeasured estimate.
-        let p = Proxy::new(
-            "n".to_string(),
-            ProxyType::Ss,
-            "1.2.3.4".to_string(),
-            8388,
+        let p = Proxy::new("n".to_string(), ProxyType::Ss, "1.2.3.4".to_string(), 8388);
+        assert!(
+            !p.bandwidth_measured,
+            "bandwidth_measured must default to false"
         );
-        assert!(!p.bandwidth_measured, "bandwidth_measured must default to false");
     }
 
     #[test]
@@ -932,12 +941,20 @@ mod tests {
         a.uuid = Some("uuid-A".into());
         let mut b = Proxy::new("HK-01".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
         b.uuid = Some("uuid-B".into());
-        assert_ne!(a.fingerprint(), b.fingerprint(), "different uuid must differ");
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "different uuid must differ"
+        );
 
         // Identical credentials must still dedupe.
         let mut c = Proxy::new("HK-01".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
         c.uuid = Some("uuid-A".into());
-        assert_eq!(a.fingerprint(), c.fingerprint(), "same credential must dedupe");
+        assert_eq!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "same credential must dedupe"
+        );
 
         // SS: different password must differ.
         let mut s1 = Proxy::new("SS-01".into(), ProxyType::Ss, "5.6.7.8".into(), 8388);
@@ -946,7 +963,11 @@ mod tests {
         let mut s2 = Proxy::new("SS-01".into(), ProxyType::Ss, "5.6.7.8".into(), 8388);
         s2.password = Some("pw2".into());
         s2.method = Some("aes-256-gcm".into());
-        assert_ne!(s1.fingerprint(), s2.fingerprint(), "different ss password must differ");
+        assert_ne!(
+            s1.fingerprint(),
+            s2.fingerprint(),
+            "different ss password must differ"
+        );
     }
 
     #[test]
@@ -972,7 +993,11 @@ mod tests {
         c.password = Some("pw".into());
         c.sni = Some("a.example.com".into());
         c.path = Some("/v1".into());
-        assert_eq!(a.fingerprint(), c.fingerprint(), "identical Trojan must dedupe");
+        assert_eq!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "identical Trojan must dedupe"
+        );
     }
 
     #[test]
@@ -1015,11 +1040,23 @@ mod tests {
         // 整词误判需被排除：russia / ukraine 经 NAME_TABLE 正确识别为 RU / UA；
         // ruse 的 ru 前缀后跟字母，不得命中 2 字母码 → OTHER
         assert_eq!(
-            Proxy::new("russia-moscow".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "russia-moscow".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "RU"
         );
         assert_eq!(
-            Proxy::new("ukraine-kyiv".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "ukraine-kyiv".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "UA"
         );
         assert_eq!(
@@ -1032,7 +1069,13 @@ mod tests {
     fn region_flag_emoji_maps_to_code() {
         // 国旗 emoji 由两个 Regional_Indicator 直接映射为 2 字母代码
         assert_eq!(
-            Proxy::new("🇮🇸冰岛 按量不限时".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "🇮🇸冰岛 按量不限时".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "IS"
         );
         assert_eq!(
@@ -1040,7 +1083,13 @@ mod tests {
             "AE"
         );
         assert_eq!(
-            Proxy::new("🇲🇾 Malaysia".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "🇲🇾 Malaysia".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "MY"
         );
         // 中国国旗 → CN（上游常把国内节点标 🇨🇳）
@@ -1058,11 +1107,23 @@ mod tests {
             "IE"
         );
         assert_eq!(
-            Proxy::new("罗马尼亚 RO".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "罗马尼亚 RO".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "RO"
         );
         assert_eq!(
-            Proxy::new("土耳其 Istanbul".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
+            Proxy::new(
+                "土耳其 Istanbul".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
             "TR"
         );
         assert_eq!(

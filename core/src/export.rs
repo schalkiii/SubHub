@@ -69,9 +69,9 @@ fn ensure_unique_names(proxies: &mut [Proxy]) {
 /// Trojan without password) are silently **skipped** so that Clash's strict
 /// profile checker never rejects the output.
 pub fn to_clash_meta(proxies: &[Proxy]) -> String {
-    let (list, skipped) = proxies.iter().fold(
-        (Vec::new(), 0usize),
-        |(mut ok, mut skip), p| {
+    let (list, skipped) = proxies
+        .iter()
+        .fold((Vec::new(), 0usize), |(mut ok, mut skip), p| {
             if p.is_exportable() {
                 ok.push(to_clash_value(p));
                 (ok, skip)
@@ -79,12 +79,14 @@ pub fn to_clash_meta(proxies: &[Proxy]) -> String {
                 skip += 1;
                 eprintln!(
                     "导出时跳过不完整节点: {} [{}:{}], 类型={} 缺少必填字段",
-                    p.name, p.server, p.port, p.type_.as_str()
+                    p.name,
+                    p.server,
+                    p.port,
+                    p.type_.as_str()
                 );
                 (ok, skip)
             }
-        },
-    );
+        });
     if skipped > 0 {
         eprintln!("共跳过 {skipped} 个不完整节点（clash 校验会拒绝缺必填字段的条目）");
     }
@@ -102,7 +104,12 @@ fn to_clash_value(p: &Proxy) -> Value {
 
     match p.type_ {
         ProxyType::Ss => {
-            insert_opt(&mut m, "cipher", &p.method);
+            // SS 的加密方法可能存于 `cipher`（clash-meta YAML 订阅）或 `method`
+            // （SIP002 URI 解析）任一字段，二者取非空者作为 clash-meta 的 `cipher`。
+            // 旧代码只读 `method`，导致从 YAML 订阅导入的 SS 节点缺失 cipher →
+            // mihomo 解析失败 → 引擎测速拿不到真实带宽（显示 0.0MB/s 的 TCP 估计值）。
+            let ss_cipher = p.cipher.clone().or_else(|| p.method.clone());
+            insert_opt(&mut m, "cipher", &ss_cipher);
             insert_opt(&mut m, "password", &p.password);
         }
         ProxyType::Trojan => {
@@ -179,7 +186,11 @@ fn insert_transport_opts(m: &mut Mapping, p: &Proxy) {
     let net = p.network.as_deref().unwrap_or("");
     let has_path = p.path.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
     let has_host = p.host.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
-    let has_svc = p.service_name.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let has_svc = p
+        .service_name
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
 
     if net == "ws" {
         if has_path || has_host {
@@ -460,8 +471,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             // AnyTLS is unsupported by sing-box as well as v2ray-core.
             eprintln!(
                 "[export] sing-box 不支持的节点类型 {:?}「{}」，已跳过",
-                p.type_,
-                p.name
+                p.type_, p.name
             );
             None
         }
@@ -575,14 +585,20 @@ mod tests {
         let wg = mk(ProxyType::Wireguard, "5.5.5.5", 51820);
 
         let out = super::to_singbox_json(&[h2, tuic, socks, http, wg]);
-        assert!(!out.contains("\"direct\""), "sing-box must not emit direct nodes");
+        assert!(
+            !out.contains("\"direct\""),
+            "sing-box must not emit direct nodes"
+        );
         assert!(out.contains("\"hysteria2\""), "hysteria2 outbound missing");
         assert!(out.contains("\"tuic\""), "tuic outbound missing");
         assert!(out.contains("\"socks\""), "socks outbound missing");
         assert!(out.contains("\"http\""), "http outbound missing");
         // wireguard is unsupported and must be skipped (4 of 5 nodes exported).
         let count = out.matches("\"tag\": \"node\"").count();
-        assert_eq!(count, 4, "wireguard should be skipped (4 of 5 nodes exported)");
+        assert_eq!(
+            count, 4,
+            "wireguard should be skipped (4 of 5 nodes exported)"
+        );
     }
 
     #[test]
@@ -602,7 +618,10 @@ mod tests {
         assert!(yaml.contains("skip-cert-verify: true"));
         assert!(yaml.contains("client-fingerprint: chrome"));
         // mihomo's anytls outbound has no tls: switch — must be absent.
-        assert!(!yaml.contains("tls:"), "anytls must not emit a top-level tls key");
+        assert!(
+            !yaml.contains("tls:"),
+            "anytls must not emit a top-level tls key"
+        );
     }
 
     #[test]
@@ -616,7 +635,10 @@ mod tests {
         let sb = super::to_singbox_json(&[p]);
         assert_eq!(v2, "[]", "v2ray must skip anytls (empty array)");
         assert!(!sb.contains("\"anytls\""), "sing-box must skip anytls");
-        assert!(!sb.contains("\"aws.host.xyz\""), "sing-box must skip anytls node");
+        assert!(
+            !sb.contains("\"aws.host.xyz\""),
+            "sing-box must skip anytls node"
+        );
     }
 
     #[test]

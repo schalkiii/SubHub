@@ -37,6 +37,21 @@
 - **速度（带宽）列一眼区分真假带宽**：节点列表与实时测速进度中，「速度」单元格新增语义徽标——`实测`（绿色，= `bandwidth_measured: true`，经测速引擎真实代理下载测得、可信）、`估算`（琥珀色，= TCP 吞吐估算 / 未配置或未启用引擎 / 未实测，不代表真实可用带宽）、`回环`（灰色，= 本地地址测速无意义）。此前仅靠 `≈` 前缀区分，不够直观；现用颜色 + 文字标签，避免把「TCP 能连」误当成「节点可用」。列头 `title` 补充图例说明三种状态含义。
 - 新增前端辅助函数 `bwBadge(p)`，节点列表与实时进度共用同一套渲染逻辑。
 
+## [P21.3] 修复测速引擎 `mode: global` 导致全部节点测速失败
+
+### Fixed
+- **测速引擎统一「测不到速度」的根因**：`engine.rs` 为 mihomo 生成的单节点配置用 `mode: global`，但 clash-meta 的 GLOBAL 模式会忽略 `rules`、使用一个默认选为 `DIRECT` 的全局选择器，于是 mihomo 收到代理请求后**直接直连目标**、从不经被测节点转发。表现为「所有节点测速统一失败 / 带宽列全空」，与 clash 能正常测速形成反差。改为 `mode: rule` 并保留 `rules: - MATCH,PROXY`，强制所有流量经 PROXY 组（即被测节点）转发，与 clash-verge 行为对齐。实测日志由 `dial GLOBAL ... --> 目标直连` 变为 `match Match using PROXY[节点]`，确认节点真正生效。
+- **移除调试期临时落盘**：删除 `last_engine_config.yaml` 与 `mihomo_engine.log` 的临时诊断写入，引擎进程 stdout/stderr 恢复为 `Stdio::null`，避免每次测速（每个节点一个进程）在 cwd 产生海量日志文件。
+
+## [P21.4] 修复 SS 节点被误判为「不完整」导致全部 0.0MB/s
+
+### Fixed
+- **0.0MB/s 的真正根因之一：SS 节点被整体丢弃**：`model.rs` 的 `is_exportable()` 对 SS 类型要求 `method` 字段非空，但**从 clash-meta YAML 订阅导入的 SS 节点其加密方法存在 `cipher` 字段、`method` 为 null**（只有 SIP002 URI 解析的节点才存到 `method`）。于是海量 SS 节点被 `is_exportable()` 误判为不完整 → 在 `to_clash_meta`（导出 / 引擎配置生成）和 `engine.rs::with_engine` 两处被整体跳过 → 引擎根本不测这些节点、直接回退 TCP 吞吐估计（≈0.0MB/s），`bandwidth_measured` 全为 `false`。修复：`is_exportable()` 对 SS 改为「`password` 且（`cipher` 或 `method` 任一非空）」；`to_clash_meta` 的 SS 分支同步从 `cipher.or(method)` 取值写 `cipher`，与解析侧两种存储位置对齐。
+- **测速目标不可达 / 大分片超时**：`resources.rs` 的存活 / 带宽探测目标原为 Hetzner，本环境被封锁（`http=000`），且带宽分片以 10MB 优先，慢节点 30s 下不完 → 全失败回退 TCP 假测量。改为 **OVH 分片优先（1MB 档在前、10MB 档留给快节点、Hetzner 放最后兜底）**，存活目标改用 `https://proof.ovh.net/files/1Mb.dat`，让探测在多数网络下真正可达并能产出真实带宽。
+
+### Verification
+- 端到端验证：用 `to_clash_meta` 生成的引擎配置对 Oracle SS 节点（129.146.200.6）实测 `measured=True`、真实带宽 110–130 KB/s；手写与 `to_clash_meta` 两种路径均能在节点出口健康时下载到 1MB 分片。廉价 / 受限出口节点（Cloudflare 前置、worker 前端、抖动 AWS SS 等）仍会测不到，属节点质量问题，正确回退为 TCP 估计值，不再被误标「可用」。
+
 ## [P19] 代码审计修复（R1 Round）
 
 ### Fixed
