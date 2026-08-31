@@ -636,6 +636,41 @@ mod tests {
     }
 
     #[test]
+    fn https_proxy_exports_tls_true() {
+        // Regression guard for the https-proxy export fix: an Http proxy that
+        // carries tls=true must emit `tls: true` in clash-meta, otherwise mihomo
+        // would attempt a plaintext HTTP CONNECT to port 443 and fail.
+        let mut p = mk(ProxyType::Http, "1.2.3.4", 443);
+        p.tls = Some(true);
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(yaml.contains("type: http"), "type must be http");
+        assert!(yaml.contains("tls: true"), "https proxy must emit tls: true");
+    }
+
+    #[test]
+    fn http_on_443_emits_tls_true_via_port_fallback() {
+        // 443-port fallback: a clash subscription may ship `type: http` on port
+        // 443 without an explicit tls field. Export must still emit `tls: true`.
+        let p = mk(ProxyType::Http, "1.2.3.4", 443); // tls = None
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(
+            yaml.contains("tls: true"),
+            "port-443 http must fall back to tls: true"
+        );
+    }
+
+    #[test]
+    fn http_on_non_443_stays_plaintext() {
+        // A plaintext http proxy on a non-443 port must NOT get tls: true.
+        let p = mk(ProxyType::Http, "1.2.3.4", 8080); // tls = None
+        let yaml = super::to_clash_meta(&[p]);
+        assert!(
+            !yaml.contains("tls: true"),
+            "non-443 http must stay plaintext"
+        );
+    }
+
+    #[test]
     fn anytls_skipped_in_v2ray_and_singbox() {
         // v2ray-core / sing-box have no anytls support — exporting must skip
         // (return None), not emit a broken `direct` outbound.

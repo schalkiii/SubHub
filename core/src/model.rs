@@ -977,6 +977,38 @@ mod tests {
     }
 
     #[test]
+    fn is_exportable_ss_accepts_cipher_or_method() {
+        // Regression guard for the SS exportability fix: an SS node imported from
+        // a clash-meta YAML subscription stores its cipher in `cipher` with
+        // `method` null. Either field must satisfy "complete"; previously only
+        // `method` was checked, so these nodes were dropped (engine skipped →
+        // 0.0MB/s). SIP002 URI imports use `method`, so both must work.
+        let mut a = Proxy::new("SS-cipher".into(), ProxyType::Ss, "1.2.3.4".into(), 8388);
+        a.password = Some("pw".into());
+        a.cipher = Some("aes-128-gcm".into()); // method is None
+        assert!(
+            a.is_exportable(),
+            "SS with cipher (YAML-import style) must be exportable"
+        );
+
+        let mut b = Proxy::new("SS-method".into(), ProxyType::Ss, "1.2.3.4".into(), 8388);
+        b.password = Some("pw".into());
+        b.method = Some("aes-256-gcm".into()); // cipher is None
+        assert!(
+            b.is_exportable(),
+            "SS with method (SIP002 style) must be exportable"
+        );
+
+        // Missing both cipher and method → incomplete, must NOT be exportable.
+        let mut c = Proxy::new("SS-nothing".into(), ProxyType::Ss, "1.2.3.4".into(), 8388);
+        c.password = Some("pw".into());
+        assert!(
+            !c.is_exportable(),
+            "SS with neither cipher nor method is incomplete"
+        );
+    }
+
+    #[test]
     fn fingerprint_distinguishes_trojan_same_addr_diff_sni_path() {
         // Q3: two Trojan nodes on the same host/port that differ only in SNI or
         // path are genuinely different nodes — they must NOT share a fingerprint.

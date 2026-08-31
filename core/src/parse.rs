@@ -893,6 +893,24 @@ mod tests {
     }
 
     #[test]
+    fn https_uri_sets_tls_true_but_plain_http_does_not() {
+        // Regression guard for the https-proxy fix: `https://` must parse to
+        // ProxyType::Http WITH tls=Some(true) so mihomo connects over TLS to
+        // port 443; `http://` stays plaintext (tls None). Before the fix both
+        // were flattened to a plaintext `type: http` and every 443 http node
+        // failed the handshake (0/24 → 4/24 after the fix).
+        let https = parse_subscription("https://user:pass@1.2.3.4:443#Secure");
+        assert_eq!(https.len(), 1, "https proxy must parse");
+        assert_eq!(https[0].type_.as_str(), "http", "https must be Http type");
+        assert_eq!(https[0].tls, Some(true), "https:// must set tls=true");
+
+        let http = parse_subscription("http://user:pass@1.2.3.4:8080#Plain");
+        assert_eq!(http.len(), 1, "http proxy must parse");
+        assert_eq!(http[0].type_.as_str(), "http");
+        assert_eq!(http[0].tls, None, "plain http:// must not set tls");
+    }
+
+    #[test]
     fn base64_of_uri_list_is_decoded() {
         // A very common shape (v2rayN / NekoBox / laodavip-style short links):
         // the subscription body is base64 of a plain URI list, NOT a clash
