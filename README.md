@@ -91,6 +91,12 @@
 
 > ⏱️ **定时自动刷新（可选）**：设置 `SUBHUB_AUTO_REFRESH_SEC=1800`（秒）后，后台会按间隔自动重拉所有**远程**订阅并重新测速（Resin 式自动检测），remote 订阅会沿用各自的 `fetch_proxy`。默认关闭。
 
+> 🔌 **其它可选环境变量**：
+> - `SUBHUB_USE_PROXY=0`（或 `false`）—— 关闭所有订阅抓取 / 刷新的上游代理（即使订阅存了 `fetch_proxy`）。
+> - `SUBHUB_HEALTH_CHECK_SEC=3600` —— 节点健康定时重测间隔（秒），后台周期性重探每个节点的连通性 / 延迟；0 = 关闭。
+> - `SUBHUB_DEFAULT_PROXY=http://127.0.0.1:7890` —— 默认拉取代理（「设置」页也可配，二者取其一），用于预填「拉取代理」并作为添加订阅时的兜底。
+> - `SUBHUB_BIND=127.0.0.1` —— 仅监听本机（默认 `0.0.0.0`，允许局域网 / 公网其他设备访问 `/sub`）。
+
 ### 仅用 WebUI（推荐先验证）
 ```bash
 cargo run -p subhub-server
@@ -126,6 +132,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}`。**注意：刷新只重测新增节点，已有节点沿用旧测速数据，不会重测** |
 | GET  | `/api/subscriptions/:id/speedtest` | **对单个订阅单独重测**（不碰其他订阅）：返回 SSE 流，事件与全局 `/api/speedtest` 同构（`progress`/`done`），只测该订阅的节点；订阅不存在或无节点返回 404。订阅页卡片的「测速」按钮即调用此端点（区别于「刷新」——刷新不重测已有节点，此端点强制重测该订阅全部节点） |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
+| PATCH | `/api/subscriptions/:id` | **重命名订阅来源**（body: `{"name":"新名字"}`），仅更新展示名，不影响其节点与测速数据 |
 | GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`），用于整机备份或跨实例迁移 |
 | POST | `/api/subscriptions/import` | **从备份恢复订阅**：按源 URL 幂等合并（重导入同一实例或跨实例的远程订阅不重复），保留内嵌节点结果（不重新抓取 / 测速），本地 / 粘贴类无 URL 订阅互不冲突 |
 | POST | `/api/subscriptions/prune` | **清理长期无可用订阅**：立即删除所有「连续 N 天没有任何可用节点」的订阅（N 取自设置项 `remove_sub_after_days`，0 = 关闭），返回 `{status,removed}`。定时刷新与节点重测运行时也会自动执行 |
@@ -139,9 +146,11 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | POST | `/api/nodes/cleanup` | **坏节点熔断清理**（Resin 风格）：删除所有 `available==false` 的节点（保留未测节点），返回 `{status,removed}` |
 | GET  | `/api/nodes/top`     | **跨订阅 Top-N 节点**：按综合评分返回全局最高的前 N 个节点（受全局 `top_n` 设置控制；`?n=N` 可临时覆盖，0=全部），每项含 `sub_id`/`sub_name`/`region`/`score` |
 | GET  | `/api/proxies`       | 节点列表（可 `?type=ss&region=HK&q=foo` 过滤；**分页** `?page=1&page_size=50`，返回 `{total,page,page_size,items}`，`page_size` 上限 500；**全局排序** `?sort=name\|latency\|speed\|score&desc=1` 在**分页前对全部节点**生效，可用性主导——`available==false` 的节点无论按哪列都沉底；每项含 `outbound_country` / `unlock` / `download_speed_bps` / `region` / `sub_id` / `sub_name` —— `region` 为节点地区（HK/JP/US…，此前曾因未注入而恒为 `OTHER`，已修复）；`sub_id`/`sub_name` 标明节点归属的订阅来源，供「按订阅分组」视图使用） |
+| POST | `/api/proxies/delete` | **删除单个节点**（body: `{"sub_id":"...","fingerprint":"..."}`）：从指定订阅中剔除某一个节点，不影响其余节点与订阅本身 |
 | GET  | `/api/dashboard`     | 仪表盘统计（总数 / 订阅数 / 可用·不可用·未测 / 平均·最佳延迟 / 按类型 / 按地区 / 每订阅） |
 | GET  | `/api/trends`        | **趋势数据**（Resin 风格）：滚动窗口内的 `TrendPoint` 快照序列（总/可用/未测节点 + 平均延迟），供趋势图使用 |
 | POST | `/api/export`        | 合并并导出（body: `{"format":"clash-meta","transform":{...},"sub_ids":[...],"top_n":N}`），返回 `{format,count,content}`，`top_n` 可临时覆盖全局设置 |
+| POST | `/api/gist/upload`    | **上传全部订阅到 GitHub Gist**（需先在「设置」页填 GitHub user / token）：将当前所有订阅打包为可公开拉取的 Gist，返回稳定地址，便于远程设备一键同步；串行化上传避免孤儿 Gist |
 | GET  | `/sub`               | **本地订阅直接拉取地址**：合并所有（或 `?sub=id1,id2` 指定）订阅，可选 `?format=clash-meta` / `clash` / `v2ray` / `sing-box` / `surge` / `base64` 与算子参数 `?sort=latency&desc=1&rename_pat=.*HK-(.*)&rename_rep=HK-$1&q=关键词&region=HK&type=ss`，返回**纯文本订阅内容**（clash 类为 `text/plain`、v2ray/sing-box 为 `application/json`），无 JSON 包装、无需鉴权。把这个网址直接填进 mihomo / clash / v2rayN / sing-box 的「订阅」即可常驻拉取（详见下文「本地订阅地址」一节） |
 | GET  | `/api/speedtest`     | 手动测速，返回 **SSE 流**（`text/event-stream`），WebUI 据此实时显示进度条与「正在测的节点 / Ping / 带宽」。查询参数：`timeout_ms`（默认 4000）、`concurrency`（默认 20）、`mode`（`all` 全部 / `untested` 只测 `last_tested_at==None` / `failed` 只测 `available==Some(false)`，复用自动刷新增量思路）、`ids`（可选，URL 编码的 JSON 数组字符串，形如 `ids=["<fp1>","<fp2>"]`，**只测这些选中节点**，供节点页「测速选中」多选使用；用 JSON 数组而非分隔符拼接，避免 fingerprint 内逗号（常见于 vless+ws 的 path）被误切导致匹配不到）。事件：`progress`（每个节点完成 **任一阶段** 发一条，含 `done/total/name/available/latency_ms/bandwidth_bps/server/phase`，`phase` 为 `tcp`/`http`/`bw`；`server` 为该节点 host，前端据其判定回环节点并对「速度」显示「不适用」而非本地内存拷贝的虚假大数值）与 `done`（汇总 `tested/reachable/avg_latency_ms`）。**进度总量覆盖全程**：无引擎时 `total = 节点数`（仅 TCP）；配置引擎时 `total = 节点数 × 3`（TCP + HTTP 延迟 + 带宽各占一段），所以进度条**真正到 100% 才结束**，不会在 TCP 完成后卡住。每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟、下行带宽）测完即写回节点记录。**可用性判定对齐 clash-verge**：配置了 `SUBHUB_ENGINE_BIN` 且本批确有节点经引擎 gstatic generate_204 实测成功时，节点的「可用」就以**引擎的真实代理级 HTTP 探测**为准（逐节点 `h.is_some()`）——TCP 能连但协议层不通的节点会被正确判为不可用，不再出现「SubHub 绿、clash-verge 红」的假绿（例如 `35.187.156.27:443` 这类 Google 443 端口，TCP 必可连但代理隧道不通的节点）；当引擎未配置、或本批 0 个节点探测成功（引擎整体故障/超时过严）时，回退到裸 TCP 可用性作为兜底，避免 mass-red 让用户完全无法使用 |
 | POST | `/api/proxy-test`    | **代理可达性测试**（body: `{"proxy":"http://127.0.0.1:7890","url?":"https://..."}`）：经该代理发 HTTP GET（默认 gstatic `generate_204`），15s 超时，返回 `{ok,status|error}`，用于校验「拉取代理」是否可用 |
