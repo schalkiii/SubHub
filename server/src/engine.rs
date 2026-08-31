@@ -266,12 +266,16 @@ fn is_http_only(plan: ProbePlan) -> bool {
 /// 单实例的 select 组无法指定出口，仍走 `probe_all` 的每节点一进程路径。
 pub async fn probe_all_shared(task: ProbeTask<'_>) -> Vec<EngineProbe> {
     let ProbeTask {
-        proxies, bin, timeout_ms, bandwidth_timeout_ms, concurrency, plan, ..
+        proxies,
+        bin,
+        timeout_ms,
+        bandwidth_timeout_ms,
+        concurrency,
+        plan,
+        ..
     } = task;
 
-    let mut out: Vec<EngineProbe> = (0..proxies.len())
-        .map(|_| EngineProbe::default())
-        .collect();
+    let mut out: Vec<EngineProbe> = (0..proxies.len()).map(|_| EngineProbe::default()).collect();
 
     if !std::path::Path::new(bin).exists() || proxies.is_empty() {
         return out;
@@ -323,9 +327,7 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
         on_bw: _,
     } = task;
 
-    let mut out: Vec<EngineProbe> = (0..proxies.len())
-        .map(|_| EngineProbe::default())
-        .collect();
+    let mut out: Vec<EngineProbe> = (0..proxies.len()).map(|_| EngineProbe::default()).collect();
 
     if !std::path::Path::new(bin).exists() || proxies.is_empty() {
         return out;
@@ -525,9 +527,7 @@ async fn delay_via_api(
                             return if d > 0 { Some(d) } else { None };
                         }
                         if attempt == 2 {
-                            eprintln!(
-                                "[engine] delay 探测失败 ({node_name}): HTTP {status} {j}"
-                            );
+                            eprintln!("[engine] delay 探测失败 ({node_name}): HTTP {status} {j}");
                         }
                     }
                     Err(e) => eprintln!("[engine] delay 响应解析失败 ({node_name}): {e}"),
@@ -620,7 +620,10 @@ fn replace_node_name(body: &str, new_name: &str) -> String {
     let escaped = escape_yaml_scalar(new_name);
     match body.find("name:") {
         Some(pos) => {
-            let line_end = body[pos..].find('\n').map(|i| pos + i).unwrap_or(body.len());
+            let line_end = body[pos..]
+                .find('\n')
+                .map(|i| pos + i)
+                .unwrap_or(body.len());
             format!("{}name: {}{}", &body[..pos], escaped, &body[line_end..])
         }
         None => body.to_string(),

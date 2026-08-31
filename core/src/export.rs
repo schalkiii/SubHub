@@ -174,7 +174,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             // 个、强制 tls 后通过 3 个，故 443 一律按 TLS 处理。
             let tls = p
                 .tls
-                .or_else(|| if p.port == 443 { Some(true) } else { None });
+                .or(if p.port == 443 { Some(true) } else { None });
             insert_opt_bool(&mut m, "tls", tls);
         }
         _ => {}

@@ -989,7 +989,15 @@ fn persist_results(
     // (latency_ms, tcp_available, engine_http_ms, download_speed_bps, bandwidth_measured, ran_engine)
     // ran_engine = 本轮引擎是否确实尝试过该节点（http/bw 外层为 Some）。仅当尝试过才以
     // 引擎结论为准；尝试过但探测失败（内层 None）即判不可用，避免回退不稳的裸 TCP 翻转。
-    type PersistRow = (Option<u64>, bool, Option<u64>, Option<f64>, bool, bool, Option<u64>);
+    type PersistRow = (
+        Option<u64>,
+        bool,
+        Option<u64>,
+        Option<f64>,
+        bool,
+        bool,
+        Option<u64>,
+    );
 
     let mut by_fp: std::collections::HashMap<String, PersistRow> = std::collections::HashMap::new();
 
@@ -1026,16 +1034,21 @@ fn persist_results(
                 .and_then(|x| *x)
                 .flatten()
                 .is_some();
-        let dl = idx
-            .and_then(|i| bw.get(i))
-            .and_then(|x| *x)
-            .flatten();
+        let dl = idx.and_then(|i| bw.get(i)).and_then(|x| *x).flatten();
 
         // Store raw TCP availability + engine HTTP result + 是否跑过引擎，供下方
         // 逐节点判定；最终 `available` 在第二个循环里决定（需要 ran_engine）。
         by_fp.insert(
             r.fingerprint.clone(),
-            (lat, r.available, h, dl, measured, ran_engine, r.tcp_latency_ms),
+            (
+                lat,
+                r.available,
+                h,
+                dl,
+                measured,
+                ran_engine,
+                r.tcp_latency_ms,
+            ),
         );
     }
 
@@ -1050,7 +1063,8 @@ fn persist_results(
 
     for sub in guard.iter_mut() {
         for p in sub.proxies.iter_mut() {
-            if let Some((lat, tcp_avail, h, dl, measured, ran_engine, tcp_ms)) = by_fp.get(&p.fingerprint())
+            if let Some((lat, tcp_avail, h, dl, measured, ran_engine, tcp_ms)) =
+                by_fp.get(&p.fingerprint())
             {
                 // 回环/本地节点（如 127.0.0.53）走本地回环会得到虚假带宽/延迟，
                 // 直接跳过所有测速结果，标记为「未测」以免污染健康度与速度列。
@@ -1829,7 +1843,10 @@ pub async fn run_server() {
         .route("/api/subscriptions/:id", delete(delete_subscription))
         .route("/api/subscriptions/:id", patch(rename_subscription))
         .route("/api/subscriptions/:id/refresh", post(refresh_subscription))
-        .route("/api/subscriptions/:id/speedtest", get(speedtest_subscription))
+        .route(
+            "/api/subscriptions/:id/speedtest",
+            get(speedtest_subscription),
+        )
         .route("/api/subscriptions/export", get(export_subscriptions))
         .route("/api/subscriptions/import", post(import_subscriptions))
         .route("/api/subscriptions/prune", post(prune_subscriptions))
