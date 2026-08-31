@@ -84,9 +84,10 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
         .iter()
         .map(|rule| {
             let re = if rule.match_ == "regex" {
-                Some(Regex::new(&rule.value).map_err(|e| {
-                    format!("正则过滤器「{}」无效: {}", rule.value, e)
-                })?)
+                Some(
+                    Regex::new(&rule.value)
+                        .map_err(|e| format!("正则过滤器「{}」无效: {}", rule.value, e))?,
+                )
             } else {
                 None
             };
@@ -148,33 +149,51 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
         };
         match s.key.as_str() {
             "latency" => out.sort_by(|a, b| {
-                avail_rank(a)
-                    .cmp(&avail_rank(b))
-                    .then_with(|| {
-                        let av = a.latency_ms.unwrap_or(u64::MAX);
-                        let bv = b.latency_ms.unwrap_or(u64::MAX);
-                        if s.desc {
-                            bv.cmp(&av)
-                        } else {
-                            av.cmp(&bv)
-                        }
-                    })
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    let av = a.latency_ms.unwrap_or(u64::MAX);
+                    let bv = b.latency_ms.unwrap_or(u64::MAX);
+                    if s.desc {
+                        bv.cmp(&av)
+                    } else {
+                        av.cmp(&bv)
+                    }
+                })
+            }),
+            "tcplat" => out.sort_by(|a, b| {
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    let av = a.tcp_latency_ms.unwrap_or(u64::MAX);
+                    let bv = b.tcp_latency_ms.unwrap_or(u64::MAX);
+                    if s.desc {
+                        bv.cmp(&av)
+                    } else {
+                        av.cmp(&bv)
+                    }
+                })
+            }),
+            "httplat" => out.sort_by(|a, b| {
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    let av = a.http_latency_ms.unwrap_or(u64::MAX);
+                    let bv = b.http_latency_ms.unwrap_or(u64::MAX);
+                    if s.desc {
+                        bv.cmp(&av)
+                    } else {
+                        av.cmp(&bv)
+                    }
+                })
             }),
             "speed" => out.sort_by(|a, b| {
                 // higher bandwidth is better -> `desc` (default) = fastest first
-                avail_rank(a)
-                    .cmp(&avail_rank(b))
-                    .then_with(|| {
-                        let av = a.download_speed_bps.unwrap_or(0.0);
-                        let bv = b.download_speed_bps.unwrap_or(0.0);
-                        if s.desc {
-                            // fastest first: b with the larger value ranks before a
-                            bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
-                        } else {
-                            // slowest first
-                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                    })
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    let av = a.download_speed_bps.unwrap_or(0.0);
+                    let bv = b.download_speed_bps.unwrap_or(0.0);
+                    if s.desc {
+                        // fastest first: b with the larger value ranks before a
+                        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        // slowest first
+                        av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                })
             }),
             "type" => out.sort_by(|a, b| {
                 avail_rank(a)
@@ -188,17 +207,15 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
                 // key's convention. Availability still dominates (score_proxy
                 // already returns 0 for dead nodes, but avail_rank keeps the
                 // tie-break behaviour identical to every other key).
-                avail_rank(a)
-                    .cmp(&avail_rank(b))
-                    .then_with(|| {
-                        let av = crate::score::score_proxy(a);
-                        let bv = crate::score::score_proxy(b);
-                        if s.desc {
-                            bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
-                        } else {
-                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                    })
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    let av = crate::score::score_proxy(a);
+                    let bv = crate::score::score_proxy(b);
+                    if s.desc {
+                        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                })
             }),
             _ => out.sort_by(|a, b| {
                 avail_rank(a)
@@ -244,10 +261,8 @@ fn keep(p: &Proxy, rule: &FilterRule, re: &Option<Regex>) -> bool {
 /// de-duplicated (first occurrence wins) so a subscription never accumulates
 /// intra-subscription duplicates.
 pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Proxy>) {
-    let old_map: HashMap<String, Proxy> = old
-        .iter()
-        .map(|p| (p.fingerprint(), p.clone()))
-        .collect();
+    let old_map: HashMap<String, Proxy> =
+        old.iter().map(|p| (p.fingerprint(), p.clone())).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut merged: Vec<Proxy> = Vec::with_capacity(new.len());
     let mut new_nodes: Vec<Proxy> = Vec::new();
@@ -378,7 +393,7 @@ mod tests {
         let old: Vec<Proxy> = vec![];
         let x1 = node("X", "10.0.0.9", 9);
         let x2 = node("X", "10.0.0.9", 9); // duplicate fingerprint
-        let (merged, new_nodes) = incremental_update(&old, &vec![x1, x2]);
+        let (merged, new_nodes) = incremental_update(&old, &[x1, x2]);
         assert_eq!(merged.len(), 1, "intra-list duplicates collapsed");
         assert_eq!(new_nodes.len(), 1);
     }
@@ -397,10 +412,13 @@ mod tests {
 
         // freshly parsed node has no health yet
         let new_a = node("A", "10.0.0.1", 1);
-        let (merged, _new_nodes) = incremental_update(&old, &vec![new_a]);
+        let (merged, _new_nodes) = incremental_update(&old, &[new_a]);
 
         let merged_a = merged.iter().find(|p| p.name == "A").unwrap();
-        assert_eq!(merged_a.bandwidth_measured, true, "bandwidth_measured must survive refresh");
+        assert!(
+            merged_a.bandwidth_measured,
+            "bandwidth_measured must survive refresh"
+        );
         assert_eq!(merged_a.download_speed_bps, Some(25_000_000.0));
     }
 
@@ -420,8 +438,11 @@ mod tests {
             min_bandwidth_bps: None,
             max_latency_ms: None,
         };
-        let out = apply(&[p.clone()], &t).unwrap();
-        assert_eq!(out[0].name, "$1-OK", "escaped \\$ must yield a literal dollar");
+        let out = apply(std::slice::from_ref(&p), &t).unwrap();
+        assert_eq!(
+            out[0].name, "$1-OK",
+            "escaped \\$ must yield a literal dollar"
+        );
 
         // an unescaped `$1` still behaves as a capture-group reference
         let t2 = Transform {
@@ -458,7 +479,10 @@ mod tests {
         };
         let res = apply(&[p], &t);
         assert!(res.is_err(), "invalid regex must return Err, got Ok");
-        assert!(res.unwrap_err().contains("无效"), "error message must name the bad regex");
+        assert!(
+            res.unwrap_err().contains("无效"),
+            "error message must name the bad regex"
+        );
     }
 
     #[test]
@@ -476,7 +500,10 @@ mod tests {
         };
         let res = apply(&[p], &t);
         assert!(res.is_err(), "invalid rename regex must return Err");
-        assert!(res.unwrap_err().contains("重命名正则"), "error must name the rename rule");
+        assert!(
+            res.unwrap_err().contains("重命名正则"),
+            "error must name the rename rule"
+        );
     }
 
     #[test]
@@ -495,25 +522,37 @@ mod tests {
 
         let t_asc = Transform {
             filters: vec![],
-            sort: Some(SortBy { key: "latency".to_string(), desc: false }),
+            sort: Some(SortBy {
+                key: "latency".to_string(),
+                desc: false,
+            }),
             rename: None,
             min_bandwidth_bps: None,
             max_latency_ms: None,
         };
         let out = apply(&[dead.clone(), alive.clone()], &t_asc).unwrap();
-        assert_eq!(out[0].name, "Alive", "available must outrank unavailable even with higher latency");
+        assert_eq!(
+            out[0].name, "Alive",
+            "available must outrank unavailable even with higher latency"
+        );
         assert_eq!(out[1].name, "Dead");
 
         // descending must also keep the unavailable node last
         let t_desc = Transform {
             filters: vec![],
-            sort: Some(SortBy { key: "latency".to_string(), desc: true }),
+            sort: Some(SortBy {
+                key: "latency".to_string(),
+                desc: true,
+            }),
             rename: None,
             min_bandwidth_bps: None,
             max_latency_ms: None,
         };
         let out2 = apply(&[dead, alive], &t_desc).unwrap();
-        assert_eq!(out2[0].name, "Alive", "descending: available still before unavailable");
+        assert_eq!(
+            out2[0].name, "Alive",
+            "descending: available still before unavailable"
+        );
         assert_eq!(out2[1].name, "Dead");
     }
 
@@ -534,7 +573,10 @@ mod tests {
 
         let t = Transform {
             filters: vec![],
-            sort: Some(SortBy { key: "score".to_string(), desc: true }),
+            sort: Some(SortBy {
+                key: "score".to_string(),
+                desc: true,
+            }),
             rename: None,
             min_bandwidth_bps: None,
             max_latency_ms: None,
@@ -547,7 +589,10 @@ mod tests {
         // ascending flips the usable nodes but the dead one still sinks
         let t_asc = Transform {
             filters: vec![],
-            sort: Some(SortBy { key: "score".to_string(), desc: false }),
+            sort: Some(SortBy {
+                key: "score".to_string(),
+                desc: false,
+            }),
             rename: None,
             min_bandwidth_bps: None,
             max_latency_ms: None,
@@ -555,7 +600,10 @@ mod tests {
         let out2 = apply(&[fast, dead, slow], &t_asc).unwrap();
         assert_eq!(out2[0].name, "Slow", "ascending: worst usable score first");
         assert_eq!(out2[1].name, "Fast");
-        assert_eq!(out2[2].name, "Dead", "avail_rank keeps dead last even ascending");
+        assert_eq!(
+            out2[2].name, "Dead",
+            "avail_rank keeps dead last even ascending"
+        );
     }
 
     #[test]
@@ -572,13 +620,19 @@ mod tests {
 
         let t = Transform {
             filters: vec![],
-            sort: Some(SortBy { key: "speed".to_string(), desc: true }),
+            sort: Some(SortBy {
+                key: "speed".to_string(),
+                desc: true,
+            }),
             rename: None,
             min_bandwidth_bps: None,
             max_latency_ms: None,
         };
         let out = apply(&[dead, alive], &t).unwrap();
-        assert_eq!(out[0].name, "Alive", "available must outrank dead even with lower speed");
+        assert_eq!(
+            out[0].name, "Alive",
+            "available must outrank dead even with lower speed"
+        );
         assert_eq!(out[1].name, "Dead");
     }
 
@@ -597,7 +651,7 @@ mod tests {
         weak.available = Some(true);
         weak.latency_ms = Some(80);
         weak.download_speed_bps = Some(1_000_000.0); // 1 MB/s
-        // 未测速：无延迟 / 带宽数据
+                                                     // 未测速：无延迟 / 带宽数据
         let untested = node("Untested", "10.0.0.4", 4);
 
         let t = Transform {
@@ -607,12 +661,19 @@ mod tests {
             min_bandwidth_bps: Some(5_000_000), // 5 MB/s 下限
             max_latency_ms: Some(500),
         };
-        let out = apply(&[fast.clone(), slow.clone(), weak.clone(), untested.clone()], &t).unwrap();
+        let out = apply(
+            &[fast.clone(), slow.clone(), weak.clone(), untested.clone()],
+            &t,
+        )
+        .unwrap();
         let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"Fast"), "快且低延迟应保留");
         assert!(!names.contains(&"Slow"), "高延迟应排除");
         assert!(!names.contains(&"Weak"), "低带宽应排除");
-        assert!(names.contains(&"Untested"), "未测速（无数据）应保留，不误删");
+        assert!(
+            names.contains(&"Untested"),
+            "未测速（无数据）应保留，不误删"
+        );
     }
 
     #[test]
@@ -620,8 +681,16 @@ mod tests {
         // Two brand-new subscriptions are both created; `added` reflects the
         // node count of the genuinely new subs (not any merged ones).
         let mut store: Vec<Subscription> = vec![];
-        let a = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1)]);
-        let b = Subscription::new("B".into(), "https://b.example/sub".into(), vec![node("n2", "2.2.2.2", 2), node("n3", "3.3.3.3", 3)]);
+        let a = Subscription::new(
+            "A".into(),
+            "https://a.example/sub".into(),
+            vec![node("n1", "1.1.1.1", 1)],
+        );
+        let b = Subscription::new(
+            "B".into(),
+            "https://b.example/sub".into(),
+            vec![node("n2", "2.2.2.2", 2), node("n3", "3.3.3.3", 3)],
+        );
 
         let (created, added) = merge_subscriptions_by_source(&mut store, vec![a, b]);
         assert_eq!(created, 2, "both subscriptions are new");
@@ -634,18 +703,33 @@ mod tests {
         // Re-adding an existing source URL must update in place, not create a
         // second entry (the bug Round Q's e2e test caught: duplicate URLs).
         let mut store: Vec<Subscription> = vec![];
-        let first = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1)]);
+        let first = Subscription::new(
+            "A".into(),
+            "https://a.example/sub".into(),
+            vec![node("n1", "1.1.1.1", 1)],
+        );
         merge_subscriptions_by_source(&mut store, vec![first]);
         assert_eq!(store.len(), 1);
 
         // re-add the same source with a different node set
-        let again = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n2", "2.2.2.2", 2)]);
+        let again = Subscription::new(
+            "A".into(),
+            "https://a.example/sub".into(),
+            vec![node("n2", "2.2.2.2", 2)],
+        );
         let (created, added) = merge_subscriptions_by_source(&mut store, vec![again]);
         assert_eq!(created, 0, "no new subscription created on re-add");
         assert_eq!(added, 0, "re-add is a refresh, not an addition");
-        assert_eq!(store.len(), 1, "still a single subscription, not a duplicate");
+        assert_eq!(
+            store.len(),
+            1,
+            "still a single subscription, not a duplicate"
+        );
         assert_eq!(store[0].proxies.len(), 1);
-        assert_eq!(store[0].proxies[0].name, "n2", "node list replaced by refresh");
+        assert_eq!(
+            store[0].proxies[0].name, "n2",
+            "node list replaced by refresh"
+        );
     }
 
     #[test]
@@ -653,7 +737,11 @@ mod tests {
         // A failed re-fetch (last_error set) must preserve the existing node
         // list and only record the error — never wipe working nodes.
         let mut store: Vec<Subscription> = vec![];
-        let mut good = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("n1", "1.1.1.1", 1), node("n2", "2.2.2.2", 2)]);
+        let mut good = Subscription::new(
+            "A".into(),
+            "https://a.example/sub".into(),
+            vec![node("n1", "1.1.1.1", 1), node("n2", "2.2.2.2", 2)],
+        );
         good.health.last_error = None;
         merge_subscriptions_by_source(&mut store, vec![good]);
 
@@ -665,8 +753,15 @@ mod tests {
         assert_eq!(created, 0);
         assert_eq!(added, 0);
         assert_eq!(store.len(), 1);
-        assert_eq!(store[0].proxies.len(), 2, "old nodes preserved on failed refetch");
-        assert_eq!(store[0].health.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(
+            store[0].proxies.len(),
+            2,
+            "old nodes preserved on failed refetch"
+        );
+        assert_eq!(
+            store[0].health.last_error.as_deref(),
+            Some("connection refused")
+        );
         assert_eq!(store[0].health.last_checked_at, Some(999));
     }
 
@@ -686,15 +781,26 @@ mod tests {
         merge_subscriptions_by_source(&mut store, vec![existing]);
 
         // refresh returns the same node plus one genuinely new node
-        let refresher = Subscription::new("A".into(), "https://a.example/sub".into(), vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)]);
+        let refresher = Subscription::new(
+            "A".into(),
+            "https://a.example/sub".into(),
+            vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)],
+        );
         let (created, added) = merge_subscriptions_by_source(&mut store, vec![refresher]);
 
         assert_eq!(created, 0);
-        assert_eq!(added, 0, "re-add is a refresh; the new node is not 'added' by count");
+        assert_eq!(
+            added, 0,
+            "re-add is a refresh; the new node is not 'added' by count"
+        );
         assert_eq!(store.len(), 1);
         assert_eq!(store[0].proxies.len(), 2, "surviving + new node present");
         let kept = store[0].proxies.iter().find(|p| p.name == "keep").unwrap();
-        assert_eq!(kept.latency_ms, Some(42), "measured latency preserved across refresh");
+        assert_eq!(
+            kept.latency_ms,
+            Some(42),
+            "measured latency preserved across refresh"
+        );
         assert!(store[0].proxies.iter().any(|p| p.name == "brandnew"));
     }
 }

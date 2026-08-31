@@ -125,7 +125,7 @@
           <button class="btn" id="btn-refresh">刷新</button>
           <button class="btn" id="btn-sort-latency">按延迟排序</button>
           <button class="btn" id="btn-sort-score">按评分排序</button>
-          <button class="btn" id="btn-sort-speed">按速度排序</button>
+          <button class="btn" id="btn-sort-speed">按 HTTP 延迟排序</button>
           <button class="btn" id="btn-group">按订阅分组</button>
           <label class="lbl" style="margin-left:8px">测速范围</label>
           <select id="test-mode">
@@ -144,7 +144,7 @@
         <div class="panel table-wrap">
           <table id="nodes-table">
             <thead>
-              <tr><th class="col-check"><input type="checkbox" id="check-all" title="全选本页节点" /></th><th>名称</th><th>归属订阅</th><th>类型</th><th>服务器</th><th>端口</th><th>地区</th><th>出口</th><th data-sort="latency">延迟</th><th data-sort="speed" title="速度（带宽）：实测 = 经测速引擎真实代理下载测得，可信；估算 = TCP 吞吐估算（未配/未启用引擎或未实测），不代表真实可用带宽；回环 = 本地地址无意义">速度</th><th>解锁</th><th>状态</th><th data-sort="score">评分</th><th>上次测速</th><th>操作</th></tr>
+              <tr><th class="col-check"><input type="checkbox" id="check-all" title="全选本页节点" /></th><th>名称</th><th>归属订阅</th><th>类型</th><th>服务器</th><th>端口</th><th>地区</th><th>出口</th><th data-sort="tcplat">TCP延迟</th><th data-sort="httplat" title="经代理隧道访问 Google 204 的 HTTP 往返延迟（实测连通性依据）；未测出表示 204 不通 / 未实测">HTTP延迟</th><th>解锁</th><th>状态</th><th data-sort="score">评分</th><th>上次测速</th><th>操作</th></tr>
             </thead>
             <tbody></tbody>
           </table>

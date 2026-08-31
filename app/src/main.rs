@@ -4,10 +4,9 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use tauri::{
-    Manager,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    WindowEvent,
+    Manager, WindowEvent,
 };
 
 fn main() {
@@ -33,7 +32,9 @@ fn main() {
     // not-yet-bound socket. Previously the window loaded immediately and the
     // initial health check always failed on launch.
     let addr = format!("127.0.0.1:{port}");
-    let socket_addr = addr.parse::<std::net::SocketAddr>().expect("invalid listen addr");
+    let socket_addr = addr
+        .parse::<std::net::SocketAddr>()
+        .expect("invalid listen addr");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ready = false;
     while Instant::now() < deadline {

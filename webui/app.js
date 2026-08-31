@@ -46,6 +46,11 @@ function hideProgress() {
 // 直接按 done/total 算百分比会导致进度条来回跳。
 const _speedState = { maxDone: 0, total: 0, seenTotal: false };
 
+// 测速实时结果缓存：fingerprint -> { tcpAvail, tcpLat, httpAvail, httpLat }
+// 每收到一个 SSE Progress 就更新对应条目，用于就地 patch 表格行 + 实时刷新仪表盘。
+// 测速开始时清空，测速结束后由 loadNodes()/loadDashboard() 的全量重拉覆盖。
+const _liveResults = new Map();
+
 // 测速专用：显示实时进度条 + 当前被测节点区，并重置进度
 function showSpeedProgress(text) {
   showProgress(text);
@@ -60,6 +65,7 @@ function showSpeedProgress(text) {
   _speedState.maxDone = 0;
   _speedState.total = 0;
   _speedState.seenTotal = false;
+  _liveResults.clear();
 }
 // 根据单个 Progress 事件刷新进度条与“当前节点”行
 function updateSpeedProgress(ev) {
@@ -80,25 +86,109 @@ function updateSpeedProgress(ev) {
   if (cur) {
     // phase 标明当前进度来自哪一阶段：tcp / http / bw。非 tcp 阶段节点尚在
     // 测量中，不可用“超时 / —”误导用户以为节点已失败。
-    const stage = phase === "http" ? "测 HTTP 延迟" : phase === "bw" ? "测带宽" : "";
+    const stage = phase === "http" ? "测 HTTP 延迟" : phase === "bw" ? "测 HTTP 延迟" : "";
     const lat = latency_ms != null ? latency_ms + " ms" : (phase === "tcp" ? "超时" : "测量中");
-    // 回环节点（127.*/localhost/::1 等）的「带宽」只是本地内存拷贝，并非真实
-    // 代理速度，统一显示「不适用」而非误导性的大数值。
+    // 带宽已不再展示：带宽探测已关闭（仅做 HTTP 连通校验），TCP 阶段的
+    // bandwidth_bps 只是往本地 socket 灌数据的吞吐估算、并非真实代理速度，
+    // 显示成「估算≈3.11 MB/s」会严重误导，故进度条只保留节点名+阶段+延迟。
     const loopback = isLoopback(server);
-    let bw;
-    if (loopback) {
-      bw = `<span class="bw-tag loopback">回环</span>不适用`;
-    } else if (bandwidth_bps != null) {
-      // bw 阶段走测速引擎，为真实代理吞吐；tcp 阶段的带宽是本地 socket 估算。
-      const val = (bandwidth_bps / 1048576).toFixed(2) + " MB/s";
-      bw = phase === "bw"
-        ? `<span class="bw-tag real">实测</span>${val}`
-        : `<span class="bw-tag est">估算</span>≈${val}`;
-    } else {
-      bw = phase === "bw" ? "测速中" : "—";
-    }
     const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
-    cur.textContent = `(${_speedState.maxDone}/${effTotal}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat} · ${bw}`;
+    const tail = loopback ? " · 回环不适用" : "";
+    cur.textContent = `(${_speedState.maxDone}/${effTotal}) ${status} ${name}${stage ? " · " + stage : ""} · ${lat}${tail}`;
+  }
+
+  // ---- 实时就地 patch：测完一个节点就更新表格行 + 仪表盘 ----
+  const fp = ev.fingerprint;
+  if (fp) {
+    const entry = _liveResults.get(fp) || { tcpAvail: null, tcpLat: null, httpAvail: null, httpLat: null };
+    if (phase === "tcp") {
+      entry.tcpAvail = available;
+      entry.tcpLat = ev.tcp_latency_ms != null ? ev.tcp_latency_ms : latency_ms;
+    } else if (phase === "http") {
+      entry.httpAvail = available;
+      entry.httpLat = ev.http_latency_ms != null ? ev.http_latency_ms : latency_ms;
+    }
+    _liveResults.set(fp, entry);
+    patchNodeRow(fp, entry);
+    refreshLiveDashboard();
+  }
+}
+
+// 就地 patch 单个表格行：根据 fingerprint 定位 <tr>，更新 TCP/HTTP 延迟列 + 状态点。
+// 避免测速期间整表重渲染（会丢失滚动位置、checkbox 状态、闪烁）。
+function patchNodeRow(fp, entry) {
+  const row = document.querySelector(`#nodes-table tbody tr[data-fp="${CSS.escape(fp)}"]`);
+  if (!row) return; // 节点不在当前页，跳过（DB 最终一致会在测速后 loadNodes 覆盖）
+  const cells = row.children;
+  // cells[8] = TCP 延迟列, cells[9] = HTTP 延迟列, cells[11] = 状态点列
+  if (cells[8]) {
+    const tcpLat = entry.tcpLat != null ? `${entry.tcpLat} ms` : "—";
+    cells[8].textContent = tcpLat;
+    cells[8].className = latencyClass(entry.tcpLat);
+  }
+  if (cells[9]) {
+    const httpLat = entry.httpLat != null ? `${entry.httpLat} ms` : "—";
+    cells[9].textContent = httpLat;
+    cells[9].className = `bw-cell ${latencyClass(entry.httpLat)}`;
+  }
+  if (cells[11]) {
+    // 状态点：HTTP 阶段结果优先（引擎实测），否则用 TCP 阶段（未实测）。
+    const engineConfigured = !!G_SETTINGS.engine_bin;
+    let dotHtml;
+    if (entry.httpAvail === true) {
+      dotHtml = '<span class="dot up" title="经测速引擎实测可用"></span>可用';
+    } else if (entry.httpAvail === false) {
+      dotHtml = '<span class="dot down" title="不可用（引擎实测 HTTP 不通）"></span>不可用';
+    } else if (entry.tcpAvail === true) {
+      // TCP 通了但还没跑引擎（或引擎未配置）
+      dotHtml = engineConfigured
+        ? '<span class="dot warn" title="仅 TCP 连通，等待引擎实测"></span>可用·待测'
+        : '<span class="dot up" title="TCP 可达"></span>可用';
+    } else if (entry.tcpAvail === false) {
+      dotHtml = '<span class="dot down" title="TCP 不可达"></span>不可用';
+    } else {
+      dotHtml = '<span class="dot"></span>未测';
+    }
+    cells[11].innerHTML = dotHtml;
+  }
+}
+
+// 从 _liveResults 聚合实时仪表盘数字（可用/不可用/平均延迟/最佳延迟）。
+// 只更新测速期间会变的卡片，节点总数/订阅数不变（测速后 loadDashboard 全量覆盖）。
+function refreshLiveDashboard() {
+  const cards = document.getElementById("dash-cards");
+  if (!cards) return; // 不在仪表盘页，无需更新
+  let avail = 0, unavail = 0;
+  const tcpLats = [], httpLats = [];
+  for (const [, e] of _liveResults) {
+    // 可用性优先取引擎 HTTP 实测结果；HTTP 阶段尚未跑到（httpAvail === null）
+    // 时回退 TCP 结果，保证 TCP 阶段就有计数增长，而不是卡在 0/0。
+    const state = e.httpAvail !== null && e.httpAvail !== undefined
+      ? e.httpAvail
+      : e.tcpAvail;
+    if (state === true) avail++;
+    else if (state === false) unavail++;
+    if (e.tcpLat != null) tcpLats.push(e.tcpLat);
+    if (e.httpLat != null) httpLats.push(e.httpLat);
+  }
+  const avg = (a) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : null);
+  const best = (a) => (a.length ? Math.min(...a) : null);
+  const latTxt = (v) => (v == null ? "—" : `${v} ms`);
+  const num = (sel) => cards.querySelector(sel);
+  // 卡片顺序：总数 / 订阅数 / 可用 / 不可用 / 平均延迟 / 最佳延迟 / 平均HTTP延迟 / 最佳HTTP延迟
+  const nums = cards.querySelectorAll(".num");
+  if (nums.length >= 7) {
+    // 实时统计只覆盖「本轮参与测速的节点」，与全量 4266 个节点的口径不同。
+    // 把「节点总数」卡片改标为「本轮已测」，避免用户把下面的实时数字误读成全量。
+    const labels = cards.querySelectorAll(".label");
+    if (labels[0]) labels[0].textContent = "本轮已测";
+    if (nums[0]) nums[0].textContent = _liveResults.size;
+    if (nums[2]) nums[2].textContent = avail;
+    if (nums[3]) nums[3].textContent = unavail;
+    if (nums[4]) nums[4].textContent = latTxt(avg(tcpLats));
+    if (nums[5]) nums[5].textContent = latTxt(best(tcpLats));
+    if (nums[6]) nums[6].textContent = latTxt(avg(httpLats));
+    if (nums[7]) nums[7].textContent = latTxt(best(httpLats));
   }
 }
 
@@ -274,13 +364,6 @@ async function loadDashboard() {
   }
   const cards = document.getElementById("dash-cards");
   const latTxt = (v) => (v == null ? "—" : `${v} ms`);
-  // 带宽（bps）→ 友好单位；嵌套三元避免 KB/s 区间，直接 Mbps 起跳更直观。
-  const bpsTxt = (v) => {
-    if (v == null || !isFinite(v) || v <= 0) return "—";
-    if (v >= 1e9) return `${(v / 1e9).toFixed(2)} Gbps`;
-    if (v >= 1e6) return `${(v / 1e6).toFixed(1)} Mbps`;
-    return `${(v / 1e3).toFixed(0)} Kbps`;
-  };
   cards.innerHTML = `
     <div class="card"><div class="num">${d.total}</div><div class="label">节点总数</div></div>
     <div class="card"><div class="num">${d.subscriptions}</div><div class="label">订阅数</div></div>
@@ -288,8 +371,8 @@ async function loadDashboard() {
     <div class="card"><div class="num down">${d.unavailable}</div><div class="label">不可用</div></div>
     <div class="card"><div class="num">${latTxt(d.avg_latency_ms)}</div><div class="label">平均延迟</div></div>
     <div class="card"><div class="num">${latTxt(d.best_latency_ms)}</div><div class="label">最佳延迟</div></div>
-    <div class="card"><div class="num">${bpsTxt(d.avg_bandwidth_bps)}</div><div class="label">平均带宽</div></div>
-    <div class="card"><div class="num">${bpsTxt(d.best_bandwidth_bps)}</div><div class="label">最佳带宽</div></div>`;
+    <div class="card"><div class="num">${latTxt(d.avg_http_latency_ms)}</div><div class="label">平均HTTP延迟</div></div>
+    <div class="card"><div class="num">${latTxt(d.best_http_latency_ms)}</div><div class="label">最佳HTTP延迟</div></div>`;
 
   // type donut + region donut (both pie charts with legends)
   renderDonut("type-donut", "type-legend", d.by_type, TYPE_COLORS);
@@ -566,6 +649,7 @@ async function loadSubs(targetId, withManage, compact) {
           withManage
             ? `<div class="sub-card-actions">
                  <button class="btn sub-refresh" data-id="${s.id}">刷新</button>
+                 <button class="btn sub-test" data-id="${s.id}">测速</button>
                  <button class="btn sub-rename" data-id="${s.id}" data-name="${escapeHtml(
                 s.name
               )}">重命名</button>
@@ -597,6 +681,32 @@ async function loadSubs(targetId, withManage, compact) {
         }
         loadSubs(targetId, true);
         loadDashboard();
+      })
+    );
+    el.querySelectorAll(".sub-test").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        const old = b.textContent;
+        b.textContent = "测速中…";
+        const resultEl = document.getElementById("speedtest-result");
+        showSpeedProgress(`正在测速该订阅的节点（TCP 延迟 → 引擎 HTTP 延迟）…`);
+        const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20 });
+        try {
+          const summary = await runSpeedtest(
+            params,
+            "/api/subscriptions/" + b.dataset.id + "/speedtest"
+          );
+          await loadSubs(targetId, true);
+          loadDashboard();
+          if (resultEl && summary) resultEl.textContent = speedSummaryText(summary);
+        } catch (e) {
+          console.error(e);
+          alert("测速失败: " + e.message);
+        } finally {
+          hideProgress();
+          b.disabled = false;
+          b.textContent = old;
+        }
       })
     );
     el.querySelectorAll(".sub-rename").forEach((b) =>
@@ -837,6 +947,7 @@ async function loadSettings() {
     // 外部访问地址（生成订阅网址用）：回显已保存值，并记录本机局域网 IP 供预填。
     G_SETTINGS.external_host = s.external_host || "";
     G_SETTINGS.lan_ip = s.lan_ip || "";
+    G_SETTINGS.engine_bin = s.engine_bin || "";
     const extInput = document.getElementById("external-host");
     if (extInput) extInput.value = G_SETTINGS.external_host;
     const lanHint = document.getElementById("lan-ip-hint");
@@ -1089,35 +1200,32 @@ function scoreText(s) {
 function renderNodes(list) {
   const tbody = document.querySelector("#nodes-table tbody");
   const rowHtml = (p) => {
-    const lat = p.latency_ms != null ? `${p.latency_ms} ms` : "—";
-    // 回环节点（127.*/localhost/::1 等）走本地回环，测出的「带宽」只是内存拷贝，
-    // 并非真实代理速度，统一显示「不适用」而非误导性的大数值。
+    const tcpLat = p.tcp_latency_ms != null ? `${p.tcp_latency_ms} ms` : "—";
+    // 回环节点（127.*/localhost/::1 等）走本地回环，延迟/带宽无意义。
     const loopback = isLoopback(p.server);
-    // 带宽只有配置 SUBHUB_ENGINE_BIN 后才是真实代理吞吐；否则 download_speed_bps
-    // 只是 TCP 连接吞吐估算，并非真实可用带宽。未实测时用「≈」标注，避免把
-    // 「TCP 能连」误当成「节点可用」（真实协议连通性需经引擎访问 gstatic）。
-    const speed = loopback
-      ? "不适用"
-      : (p.download_speed_bps != null
-        ? (p.bandwidth_measured
-            ? `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`
-            : `≈${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`)
-        : "—");
-    const speedTitle = loopback
-      ? "回环/本地地址，测速无意义（带宽仅为本地内存拷贝）"
-      : (p.bandwidth_measured
-        ? "真实代理下行带宽（经测速引擎实测）"
-        : "TCP 吞吐估算，非真实代理带宽（未配置测速引擎 SUBHUB_ENGINE_BIN）");
+    const httpTitle = loopback
+      ? "回环/本地地址，测速无意义"
+      : "经代理到 Google 204 的 HTTP 往返延迟（实测连通性依据；未测出表示 204 不通）";
     const unlock = p.unlock ? summaryUnlock(p.unlock) : "—";
+    // 可用状态区分「引擎实测」与「仅 TCP 连通（未实测）」：已配置测速引擎、但节点
+    // 从未被引擎实测（bandwidth_measured=false）的，虽能 TCP 连端口，代理隧道未必通
+    // （与 clash 实测常矛盾），不应显示成已验证的绿色，改为琥珀色「可用·未实测」。
+    // 未配置引擎时 TCP 即唯一信号，保持绿色「可用」不动。
+    const engineConfigured = !!G_SETTINGS.engine_bin;
+    const engineVerified = p.bandwidth_measured === true;
     const avail =
-      p.available === false ? "down" : p.available === true ? "up" : "unknown";
+      p.available === false ? "down"
+        : p.available === true ? (engineConfigured && !engineVerified ? "up-unverified" : "up")
+        : "unknown";
     const dot =
       avail === "up"
-        ? '<span class="dot up"></span>可用'
+        ? '<span class="dot up" title="经测速引擎实测可用"></span>可用'
+        : avail === "up-unverified"
+        ? '<span class="dot warn" title="仅 TCP 连通，未经测速引擎实测，不代表真实可用"></span>可用·未实测'
         : avail === "down"
-        ? `<span class="dot down"></span>不可用${p.consecutive_failures > 0 ? " ×" + p.consecutive_failures : ""}`
+        ? `<span class="dot down" title="不可用（引擎实测或 TCP 均不通）"></span>不可用${p.consecutive_failures > 0 ? " ×" + p.consecutive_failures : ""}`
         : '<span class="dot"></span>未测';
-    return `<tr>
+    return `<tr data-fp="${escapeHtml(p.fingerprint)}">
       <td class="col-check"><input type="checkbox" class="node-check" data-fp="${escapeHtml(p.fingerprint)}" data-name="${escapeHtml(p.name)}" /></td>
       <td>${escapeHtml(p.name)}</td>
       <td class="sub-cell" title="${escapeHtml(p.sub_name || "")}">${escapeHtml(p.sub_name || "—")}</td>
@@ -1126,8 +1234,8 @@ function renderNodes(list) {
       <td>${p.port}</td>
       <td>${escapeHtml(p.outbound_country || p.region || "OTHER")}</td>
       <td>${escapeHtml(p.outbound_country || "—")}</td>
-      <td class="${latencyClass(p.latency_ms)}">${lat}</td>
-      <td class="bw-cell" title="${speedTitle}">${bwBadge(p)}</td>
+      <td class="${latencyClass(p.tcp_latency_ms)}">${tcpLat}</td>
+      <td class="bw-cell ${latencyClass(p.http_latency_ms)}" title="${httpTitle}">${httpLatCell(p)}</td>
       <td class="unlock-cell">${escapeHtml(unlock)}</td>
       <td>${dot}</td>
       <td class="${scoreClass(p.score)}">${scoreText(p.score)}</td>
@@ -1190,7 +1298,7 @@ function updateSortIndicators() {
     .classList.toggle("active", _sortField === "score");
   document
     .getElementById("btn-sort-speed")
-    .classList.toggle("active", _sortField === "speed");
+    .classList.toggle("active", _sortField === "httplat");
 }
 
 function sortNodes(field) {
@@ -1199,7 +1307,7 @@ function sortNodes(field) {
   } else {
     _sortField = field;
     // 默认方向：评分/速度降序（高在前），延迟/名称升序（低在前）
-    _sortDesc = field === "score" || field === "speed";
+    _sortDesc = field === "score";
   }
   updateSortIndicators();
   // 全局排序由后端完成：重新拉取第一页即可得到全局最优的前 N 个，
@@ -1209,7 +1317,7 @@ function sortNodes(field) {
 
 document.getElementById("btn-sort-latency").addEventListener("click", () => sortNodes("latency"));
 document.getElementById("btn-sort-score").addEventListener("click", () => sortNodes("score"));
-document.getElementById("btn-sort-speed").addEventListener("click", () => sortNodes("speed"));
+document.getElementById("btn-sort-speed").addEventListener("click", () => sortNodes("httplat"));
 
 // clickable column headers (延迟 / 速度 / 评分) for sorting
 document.querySelector("#nodes-table thead").addEventListener("click", (e) => {
@@ -1259,8 +1367,8 @@ document.getElementById("nodes-table").addEventListener("click", async (e) => {
 });
 
 // 读取 SSE 测速流并推进进度条，返回汇总 summary。「测速」「测速选中」共用。
-async function runSpeedtest(params) {
-  const resp = await fetch(`/api/speedtest?${params.toString()}`);
+async function runSpeedtest(params, url = "/api/speedtest") {
+  const resp = await fetch(`${url}?${params.toString()}`);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
@@ -1290,10 +1398,10 @@ async function runSpeedtest(params) {
 
 function speedSummaryText(summary) {
   if (!summary) return "";
-  const { tested, reachable, avg_latency_ms, with_http, with_bw, removed, threshold } = summary;
+  const { tested, reachable, avg_latency_ms, with_http, removed, threshold } = summary;
   let msg =
     `测速完成：共 ${tested} 个，可达 ${reachable} 个，` +
-    `平均延迟 ${avg_latency_ms != null ? avg_latency_ms + " ms" : "—"}（含 HTTP 延迟 ${with_http} 个，带宽 ${with_bw} 个）`;
+    `平均延迟 ${avg_latency_ms != null ? avg_latency_ms + " ms" : "—"}（实测连通 ${with_http} 个）`;
   if (removed > 0) msg += `；已自动移除连续不可用节点 ${removed} 个（阈值 ${threshold} 次）`;
   return msg;
 }
@@ -1305,7 +1413,7 @@ document.getElementById("btn-speedtest").addEventListener("click", async (e) => 
   if (resultEl) resultEl.textContent = "";
   const mode = document.getElementById("test-mode").value;
   const modeText = mode === "untested" ? "未测过的节点" : mode === "failed" ? "测速失败的节点" : "全部节点";
-  showSpeedProgress(`正在测速${modeText}（TCP 延迟 → 引擎 HTTP 延迟 → 带宽，进度条覆盖全程）…`);
+  showSpeedProgress(`正在测速${modeText}（TCP 延迟 → 引擎 HTTP 延迟，进度条覆盖全程）…`);
   const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20, mode });
   try {
     const summary = await runSpeedtest(params);
@@ -1332,7 +1440,7 @@ document.getElementById("btn-speedtest-selected").addEventListener("click", asyn
   }
   btn.disabled = true;
   if (resultEl) resultEl.textContent = "";
-  showSpeedProgress(`正在测速选中的 ${ids.length} 个节点（TCP 延迟 → 引擎 HTTP 延迟 → 带宽）…`);
+  showSpeedProgress(`正在测速选中的 ${ids.length} 个节点（TCP 延迟 → 引擎 HTTP 延迟）…`);
   const params = new URLSearchParams({ timeout_ms: 4000, concurrency: 20 });
   // fingerprint 本身含逗号（常见于 vless+ws 的 path），不能用逗号拼接，
   // 否则服务端按逗号切割会把 fingerprint 切碎、静默匹配不到。改为把选中
@@ -1377,21 +1485,16 @@ function isLoopback(server) {
   return false;
 }
 
-// 带宽质量徽标：一眼区分「真带宽」与「假绿带宽」。
-//   实测 = bandwidth_measured=true，经测速引擎真实代理下载测得（可信）；
-//   估算 = TCP 吞吐估算（未配/未启用引擎或未实测），不代表真实可用带宽；
-//   回环 = 本地地址，测速无意义。
+// HTTP 延迟单元格：展示经代理到 Google 204 的 HTTP 往返耗时（实测连通性的真实延迟）。
+//   回环 = 本地地址，测速无意义；
+//   null = 未测出（204 不通 / 未实测）。
 // 返回可直接塞进 <td> 的 HTML 片段。
-function bwBadge(p) {
+function httpLatCell(p) {
   if (isLoopback(p.server)) {
     return `<span class="bw-tag loopback">回环</span>不适用`;
   }
-  if (p.download_speed_bps == null) return "—";
-  const val = `${(p.download_speed_bps / 1_000_000).toFixed(1)} MB/s`;
-  if (p.bandwidth_measured) {
-    return `<span class="bw-tag real">实测</span>${val}`;
-  }
-  return `<span class="bw-tag est">估算</span>≈${val}`;
+  if (p.http_latency_ms == null) return "—";
+  return `${p.http_latency_ms} ms`;
 }
 
 // 上次测速时间戳（epoch 毫秒）→ 本地日期时间；无记录显示「—」

@@ -202,6 +202,10 @@ pub struct Proxy {
 
     // speed-test results (populated by the speedtest engine)
     pub latency_ms: Option<u64>,
+    /// 裸 TCP 建连到节点服务器的耗时（未走代理隧道，仅反映到节点的网络距离）。
+    pub tcp_latency_ms: Option<u64>,
+    /// 经代理隧道访问 Google 204 的 HTTP 往返耗时（实测连通性的真实端到端延迟）。
+    pub http_latency_ms: Option<u64>,
     pub available: Option<bool>,
     pub download_speed_bps: Option<f64>,
     /// Whether `download_speed_bps` is a *real* engine-measured bandwidth
@@ -344,6 +348,8 @@ impl Proxy {
             service_name: None,
             fingerprint: None,
             latency_ms: None,
+            tcp_latency_ms: None,
+            http_latency_ms: None,
             available: None,
             download_speed_bps: None,
             bandwidth_measured: false,

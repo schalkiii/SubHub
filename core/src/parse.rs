@@ -37,10 +37,7 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
         if let Ok(decoded) = b64_decode(raw) {
             if decoded.len() <= MAX_B64_DECODED_BYTES {
                 let text = String::from_utf8_lossy(&decoded);
-                if !text.trim().is_empty()
-                    && text.trim() != raw
-                    && looks_like_subscription(&text)
-                {
+                if !text.trim().is_empty() && text.trim() != raw && looks_like_subscription(&text) {
                     return parse_subscription_depth(&text, depth + 1);
                 }
             }
@@ -100,8 +97,20 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
 fn is_known_scheme(scheme: &str) -> bool {
     matches!(
         scheme.to_ascii_lowercase().as_str(),
-        "vmess" | "vless" | "trojan" | "ss" | "ssr" | "hysteria2" | "hy2" | "hysteria" | "tuic"
-            | "anytls" | "socks5" | "socks" | "http" | "https"
+        "vmess"
+            | "vless"
+            | "trojan"
+            | "ss"
+            | "ssr"
+            | "hysteria2"
+            | "hy2"
+            | "hysteria"
+            | "tuic"
+            | "anytls"
+            | "socks5"
+            | "socks"
+            | "http"
+            | "https"
     )
 }
 
@@ -139,10 +148,7 @@ fn extract_yaml_proxies(raw: &str) -> Vec<Proxy> {
             }
         } else if line.trim().is_empty() {
             yaml_lines.push(line);
-        } else if line.starts_with(' ')
-            || line.starts_with('\t')
-            || line.starts_with('-')
-        {
+        } else if line.starts_with(' ') || line.starts_with('\t') || line.starts_with('-') {
             // accept indented entries AND column-0 list items
             // (`- name:` / `- {name:...}`), which many Clash subs use
             yaml_lines.push(line);
@@ -283,10 +289,16 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
     p.method = as_str(v, "method").map(str::to_string);
     p.network = as_str(v, "network").map(str::to_string);
     p.tls = v.get("tls").and_then(|x| x.as_bool());
-    p.sni = as_str(v, "sni").or_else(|| as_str(v, "servername")).map(str::to_string);
+    p.sni = as_str(v, "sni")
+        .or_else(|| as_str(v, "servername"))
+        .map(str::to_string);
     p.skip_cert_verify = v.get("skip-cert-verify").and_then(|x| x.as_bool());
     p.path = as_str(v, "path")
-        .or_else(|| v.get("ws-opts").and_then(|w| w.get("path")).and_then(|x| x.as_str()))
+        .or_else(|| {
+            v.get("ws-opts")
+                .and_then(|w| w.get("path"))
+                .and_then(|x| x.as_str())
+        })
         .map(str::to_string);
     p.host = as_str(v, "host")
         .or_else(|| {
@@ -318,7 +330,11 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 Some(p) if (1..=65535).contains(&p) => p as u16,
                 _ => continue, // skip outbounds without a valid port
             };
-            let name = ob.get("tag").and_then(|x| x.as_str()).unwrap_or(&server).to_string();
+            let name = ob
+                .get("tag")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&server)
+                .to_string();
             let type_ = match type_str {
                 "shadowsocks" => ProxyType::Ss,
                 "trojan" => ProxyType::Trojan,
@@ -331,8 +347,14 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 _ => continue,
             };
             let mut p = Proxy::new(name, type_, server, port);
-            p.password = ob.get("password").and_then(|x| x.as_str()).map(str::to_string);
-            p.method = ob.get("method").and_then(|x| x.as_str()).map(str::to_string);
+            p.password = ob
+                .get("password")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            p.method = ob
+                .get("method")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
             p.uuid = ob.get("uuid").and_then(|x| x.as_str()).map(str::to_string);
             // sing-box uses `tls: {}` to enable and `tls: false` to disable; a
             // bare `tls: true`/object means enabled. Don't treat a present key
@@ -343,7 +365,10 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 None => false,
             });
             if let Some(tls) = ob.get("tls") {
-                p.sni = tls.get("server_name").and_then(|x| x.as_str()).map(str::to_string);
+                p.sni = tls
+                    .get("server_name")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
                 p.skip_cert_verify = tls.get("insecure").and_then(|x| x.as_bool());
             }
             // Transport (ws / grpc / h2) — sing-box nests this under
@@ -353,7 +378,10 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 match ttype {
                     "ws" => {
                         p.network = Some("ws".to_string());
-                        p.path = transport.get("path").and_then(|x| x.as_str()).map(str::to_string);
+                        p.path = transport
+                            .get("path")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string);
                         p.host = transport
                             .get("headers")
                             .and_then(|h| h.get("Host"))
@@ -362,12 +390,21 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                     }
                     "grpc" => {
                         p.network = Some("grpc".to_string());
-                        p.service_name = transport.get("service_name").and_then(|x| x.as_str()).map(str::to_string);
+                        p.service_name = transport
+                            .get("service_name")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string);
                     }
                     "h2" => {
                         p.network = Some("h2".to_string());
-                        p.path = transport.get("path").and_then(|x| x.as_str()).map(str::to_string);
-                        p.host = transport.get("host").and_then(|x| x.as_str()).map(str::to_string);
+                        p.path = transport
+                            .get("path")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string);
+                        p.host = transport
+                            .get("host")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string);
                     }
                     _ => {}
                 }
@@ -397,8 +434,10 @@ pub fn parse_uri(line: &str) -> Option<Proxy> {
         "anytls" => parse_anytls(&body, name),
         "hysteria2" | "hy2" | "hysteria" => parse_hy2(&body, name),
         "tuic" => parse_tuic(&body, name),
-        "socks5" | "socks" => parse_socks(&body, name, ProxyType::Socks5),
-        "http" | "https" => parse_socks(&body, name, ProxyType::Http),
+        "socks5" | "socks" => parse_socks(&body, name, ProxyType::Socks5, false),
+        // `https://` 必须带 TLS；`http://` 才是明文。
+        "http" => parse_socks(&body, name, ProxyType::Http, false),
+        "https" => parse_socks(&body, name, ProxyType::Http, true),
         _ => None,
     }
 }
@@ -457,7 +496,12 @@ fn split_authority(body: &str) -> Option<Auth> {
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (k.to_string(), decode_percent(v)))
         .collect();
-    Some(Auth { userinfo, host, port, query })
+    Some(Auth {
+        userinfo,
+        host,
+        port,
+        query,
+    })
 }
 
 fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
@@ -466,23 +510,33 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     let server = v.get("add")?.as_str()?.to_string();
     let port: u16 = v.get("port").and_then(|x| {
-        x.as_str()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                x.as_u64().and_then(|n| {
-                    if (1..=65535).contains(&n) {
-                        Some(n as u16)
-                    } else {
-                        None
-                    }
-                })
+        x.as_str().and_then(|s| s.parse().ok()).or_else(|| {
+            x.as_u64().and_then(|n| {
+                if (1..=65535).contains(&n) {
+                    Some(n as u16)
+                } else {
+                    None
+                }
             })
+        })
     })?;
-    let pname = name.unwrap_or_else(|| v.get("ps").and_then(|x| x.as_str()).unwrap_or(&server).to_string());
+    let pname = name.unwrap_or_else(|| {
+        v.get("ps")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&server)
+            .to_string()
+    });
     let mut p = Proxy::new(pname, ProxyType::Vmess, server, port);
     p.uuid = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
-    p.alter_id = v.get("aid").and_then(|x| x.as_str()).and_then(|s| s.parse().ok());
-    p.cipher = v.get("scy").or_else(|| v.get("cipher")).and_then(|x| x.as_str()).map(str::to_string);
+    p.alter_id = v
+        .get("aid")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse().ok());
+    p.cipher = v
+        .get("scy")
+        .or_else(|| v.get("cipher"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     if p.cipher.is_none() {
         p.cipher = Some("aes-128-gcm".to_string());
     }
@@ -506,11 +560,25 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
 
 fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
     let a = split_authority(body)?;
-    let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Vless, a.host, a.port);
+    let mut p = Proxy::new(
+        name.unwrap_or_else(|| a.host.clone()),
+        ProxyType::Vless,
+        a.host,
+        a.port,
+    );
     p.uuid = Some(a.userinfo);
     p.flow = a.query.get("flow").cloned();
-    p.network = a.query.get("type").or_else(|| a.query.get("network")).cloned();
-    p.tls = Some(a.query.get("security").map(|s| s != "none").unwrap_or(false));
+    p.network = a
+        .query
+        .get("type")
+        .or_else(|| a.query.get("network"))
+        .cloned();
+    p.tls = Some(
+        a.query
+            .get("security")
+            .map(|s| s != "none")
+            .unwrap_or(false),
+    );
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
     p.path = a.query.get("path").cloned();
@@ -521,7 +589,12 @@ fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
 
 fn parse_trojan(body: &str, name: Option<String>) -> Option<Proxy> {
     let a = split_authority(body)?;
-    let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Trojan, a.host, a.port);
+    let mut p = Proxy::new(
+        name.unwrap_or_else(|| a.host.clone()),
+        ProxyType::Trojan,
+        a.host,
+        a.port,
+    );
     p.password = Some(a.userinfo);
     p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
@@ -529,7 +602,10 @@ fn parse_trojan(body: &str, name: Option<String>) -> Option<Proxy> {
     p.network = a.query.get("type").cloned();
     p.path = a.query.get("path").cloned();
     p.host = a.query.get("host").cloned();
-    p.skip_cert_verify = a.query.get("allowInsecure").map(|v| v == "1" || v == "true");
+    p.skip_cert_verify = a
+        .query
+        .get("allowInsecure")
+        .map(|v| v == "1" || v == "true");
     Some(p)
 }
 
@@ -545,7 +621,12 @@ fn parse_ss(body: &str, name: Option<String>) -> Option<Proxy> {
             // through to the legacy whole-base64 decoder instead of emitting a
             // node with a missing cipher — Clash would reject it.
             if !method.is_empty() {
-                let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Ss, a.host, a.port);
+                let mut p = Proxy::new(
+                    name.unwrap_or_else(|| a.host.clone()),
+                    ProxyType::Ss,
+                    a.host,
+                    a.port,
+                );
                 p.method = Some(method);
                 p.password = Some(password);
                 return Some(p);
@@ -557,7 +638,12 @@ fn parse_ss(body: &str, name: Option<String>) -> Option<Proxy> {
         let s = String::from_utf8_lossy(&decoded);
         if let Some(a) = split_authority(&s) {
             let (method, password) = decode_ss_userinfo(&a.userinfo);
-            let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Ss, a.host, a.port);
+            let mut p = Proxy::new(
+                name.unwrap_or_else(|| a.host.clone()),
+                ProxyType::Ss,
+                a.host,
+                a.port,
+            );
             p.method = Some(method);
             p.password = Some(password);
             return Some(p);
@@ -590,7 +676,12 @@ fn parse_ssr(_body: &str, _name: Option<String>) -> Option<Proxy> {
 
 fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
     let a = split_authority(body)?;
-    let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Hysteria2, a.host, a.port);
+    let mut p = Proxy::new(
+        name.unwrap_or_else(|| a.host.clone()),
+        ProxyType::Hysteria2,
+        a.host,
+        a.port,
+    );
     // userinfo may be "user:pass" or just "pass"
     if let Some((_, pass)) = a.userinfo.rsplit_once(':') {
         p.password = Some(pass.to_string());
@@ -604,7 +695,12 @@ fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
 
 fn parse_tuic(body: &str, name: Option<String>) -> Option<Proxy> {
     let a = split_authority(body)?;
-    let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), ProxyType::Tuic, a.host, a.port);
+    let mut p = Proxy::new(
+        name.unwrap_or_else(|| a.host.clone()),
+        ProxyType::Tuic,
+        a.host,
+        a.port,
+    );
     if let Some((u, pass)) = a.userinfo.rsplit_once(':') {
         p.uuid = Some(u.to_string());
         p.password = Some(pass.to_string());
@@ -632,7 +728,11 @@ fn parse_anytls(body: &str, name: Option<String>) -> Option<Proxy> {
         a.port,
     );
     p.password = Some(a.userinfo);
-    p.network = a.query.get("type").or_else(|| a.query.get("network")).cloned();
+    p.network = a
+        .query
+        .get("type")
+        .or_else(|| a.query.get("network"))
+        .cloned();
     p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
@@ -640,7 +740,7 @@ fn parse_anytls(body: &str, name: Option<String>) -> Option<Proxy> {
     Some(p)
 }
 
-fn parse_socks(body: &str, name: Option<String>, t: ProxyType) -> Option<Proxy> {
+fn parse_socks(body: &str, name: Option<String>, t: ProxyType, tls: bool) -> Option<Proxy> {
     let a = split_authority(body)?;
     let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), t, a.host, a.port);
     if !a.userinfo.is_empty() {
@@ -649,9 +749,16 @@ fn parse_socks(body: &str, name: Option<String>, t: ProxyType) -> Option<Proxy> 
             p.password = Some(pass.to_string());
         }
     }
+    // `https://` 链接是 HTTPS 代理（HTTP over TLS）。此前 scheme 的 http/https
+    // 都被塞进 `ProxyType::Http` 且不记录 TLS，导出成 clash 配置后退化成明文
+    // `type: http`，mihomo 于是用明文 HTTP CONNECT 去连 443 端口 —— 握手必然
+    // 失败，整批节点被误判为不可用（实测 24 个 443 端口 http 节点：明文通过
+    // 0 个，强制 tls 后通过 3 个）。
+    if tls {
+        p.tls = Some(true);
+    }
     Some(p)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -659,7 +766,8 @@ mod tests {
 
     #[test]
     fn usage_from_plain_yaml() {
-        let raw = "download: 100\nupload: 50\ntotal: 1000\nexpire: 1700000000\nproxies:\n  - name: a\n";
+        let raw =
+            "download: 100\nupload: 50\ntotal: 1000\nexpire: 1700000000\nproxies:\n  - name: a\n";
         let u = extract_subscription_usage(raw);
         assert_eq!(u.download, Some(100));
         assert_eq!(u.upload, Some(50));
@@ -717,7 +825,10 @@ mod tests {
     #[test]
     fn clash_port_zero_is_rejected() {
         let yaml = "proxies:\n  - name: z\n    type: ss\n    server: 1.2.3.4\n    port: 0\n    cipher: aes-128-gcm\n    password: x\n";
-        assert!(parse_subscription(yaml).is_empty(), "port 0 must drop the node");
+        assert!(
+            parse_subscription(yaml).is_empty(),
+            "port 0 must drop the node"
+        );
     }
 
     #[test]
@@ -816,7 +927,11 @@ mod tests {
         let b64 = std.replace('+', "-").replace('/', "_");
         assert_ne!(b64, std, "test setup: body must be genuinely URL-safe");
         let out = parse_subscription(&b64);
-        assert_eq!(out.len(), 2, "URL-safe base64 URI list must yield its nodes");
+        assert_eq!(
+            out.len(),
+            2,
+            "URL-safe base64 URI list must yield its nodes"
+        );
         let types: Vec<&str> = out.iter().map(|p| p.type_.as_str()).collect();
         assert!(types.contains(&"vless"));
         assert!(types.contains(&"trojan"));
@@ -834,7 +949,10 @@ mod tests {
         assert_eq!(p.type_, ProxyType::AnyTls);
         assert_eq!(p.server, "anytls.example.com");
         assert_eq!(p.port, 56147);
-        assert_eq!(p.password.as_deref(), Some("00000000-0000-4000-8000-000000000001"));
+        assert_eq!(
+            p.password.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
         // always TLS
         assert_eq!(p.tls, Some(true));
         // insecure=1 -> skip-cert-verify
@@ -852,7 +970,11 @@ mod tests {
         let uri_list = "anytls://00000000-0000-4000-8000-000000000001@anytls.example.com:56147/?type=tcp&insecure=1&fp=chrome&sni=updates.cdn-apple.com#JP-AWS\r\nanytls://abc123@hk.example.com:443/?insecure=0&sni=hk.example.com#HK\r\n";
         let b64 = base64::engine::general_purpose::STANDARD.encode(uri_list);
         let out = parse_subscription(&b64);
-        assert_eq!(out.len(), 2, "base64-wrapped anytls URI list must yield its nodes");
+        assert_eq!(
+            out.len(),
+            2,
+            "base64-wrapped anytls URI list must yield its nodes"
+        );
         assert!(out.iter().all(|p| p.type_ == ProxyType::AnyTls));
     }
 
@@ -877,4 +999,3 @@ mod tests {
         assert_eq!(out1.len(), 1, "single base64 layer must still parse");
     }
 }
-

@@ -10,18 +10,16 @@
 //! - Streaming-unlock services are modelled on BestSub's `checker/tiktok.go`
 //!   (parse the `"region":` JSON field) plus the well-established community
 //!   media-unlock heuristics (Netflix / Disney+ / YouTube Premium / ChatGPT).
-// 原 BestSub 用 gstatic generate_204，但「节点出口 → 测速目标」链路中该域常被
-// 干扰/不可达（国内代理环境尤甚），实测 HTTP 存活探测全失败。改用数据中心普遍
-// 可达的主机（Hetzner 主页，返回 200），让延迟探测真正生效。
-/// HTTP "is the proxy alive / what is its latency" probe.
-// HTTP "is the proxy alive / what is its latency" probe.
-
-/// 原用 Hetzner 主页作存活目标，但本环境（及部分国内网络）Hetzner 被封锁/污染，
-/// 实测 `http=000` 完全不可达，导致存活探测全失败、节点被误判不可用（TCP 握手
-/// 能过就标「可用」的假绿，正是此前「SubHub 绿但 clash 报死」的同类问题）。
-/// 改用数据中心普遍可达的 OVH 分片作存活目标。
-pub const ALIVE_TARGET: &str = "https://proof.ovh.net/files/1Mb.dat";
-pub const ALIVE_EXPECT_CODE: u16 = 200;
+/// 真实代理「连通性」探测目标：Google 的 `generate_204`（期望 `204`）。
+///
+/// 多数代理节点正是为访问 Google 而生，经该节点出口能拿到 204 即代表隧道真实可用，
+/// 而非仅 TCP 端口可达。此前为求带宽测速改用 OVH/Hetzner 分片作存活目标，但这些数据中心
+/// 在部分网络被封/受限，导致存活探测全失败 → 节点被统一误判「未实测」（即用户看到的
+/// 「可用·未实测」）。改回 Google 204 后，「实测」(绿) 直接由「Google 204 能否经该节点访问」
+/// 决定，更贴近用户对「节点能用」的真实预期。端点经引擎 SOCKS5/HTTP 出口探测，与 BestSub
+/// `checker/alive.go` 思路一致。
+pub const ALIVE_TARGET: &str = "http://www.gstatic.com/generate_204";
+pub const ALIVE_EXPECT_CODE: u16 = 204;
 
 /// Bandwidth test endpoints. Each entry is tried in order; the first that yields
 /// bytes wins. On failure we fall through to the next, smaller / different-host

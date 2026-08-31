@@ -49,7 +49,11 @@ pub fn score_proxy(p: &Proxy) -> f64 {
             if total == 0.0 {
                 0.0
             } else {
-                let ok = u.services.values().filter(|s| s.status == "unlocked").count() as f64;
+                let ok = u
+                    .services
+                    .values()
+                    .filter(|s| s.status == "unlocked")
+                    .count() as f64;
                 ok / total
             }
         }

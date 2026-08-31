@@ -1,8 +1,8 @@
 use crate::model::Proxy;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,11 @@ pub struct SpeedTestResult {
 
 /// Measure raw TCP connect latency to `host:port`. This is a cheap
 /// reachability + latency signal that works without any external engine.
-pub fn tcp_ping(host: &str, port: u16, timeout: Duration) -> Result<(Duration, Option<f64>), String> {
+pub fn tcp_ping(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(Duration, Option<f64>), String> {
     // DNS resolution is NOT bounded by `connect_timeout`, so a stalled resolver
     // (dead host, captive portal, no network) would hang the whole speed test
     // and the UI would never receive a result. Resolve in a detached thread
@@ -46,7 +50,8 @@ pub fn tcp_ping(host: &str, port: u16, timeout: Duration) -> Result<(Duration, O
         Err(_) => return Err("dns timeout".to_string()),
     };
     let start = Instant::now();
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("conn: {e}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("conn: {e}"))?;
     let latency = start.elapsed();
     // Engine-free throughput estimate: measure how fast we can push data to the
     // node's socket. This is a raw TCP throughput proxy (NOT true proxy download
@@ -90,6 +95,7 @@ pub struct TestProgress {
     pub done: usize,
     pub total: usize,
     pub name: String,
+    pub fingerprint: String,
     pub available: bool,
     pub latency_ms: Option<u64>,
     pub bandwidth_bps: Option<f64>,
@@ -145,6 +151,7 @@ pub fn tcp_ping_all(
                             done: done_n,
                             total: proxies.len(),
                             name: r.name.clone(),
+                            fingerprint: r.fingerprint.clone(),
                             available: r.available,
                             latency_ms: r.tcp_latency_ms,
                             bandwidth_bps: r.download_speed_bps,
@@ -180,5 +187,87 @@ fn test_one(p: &Proxy, timeout: Duration) -> SpeedTestResult {
             download_speed_bps: None,
             error: Some(e),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Proxy, ProxyType};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PROGRESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn tcp_ping_reaches_local_listener() {
+        // 绑定本地监听，accept 后保持连接即可；tcp_ping 应能连上并返回延迟。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.read(&mut [0u8; 8]);
+            }
+        });
+        let res = tcp_ping("127.0.0.1", port, Duration::from_millis(2000));
+        let _ = handle.join();
+        let (lat, _bw) = res.expect("本地监听应可达");
+        assert!(lat.as_millis() < 2000, "loopback 延迟应极小");
+    }
+
+    #[test]
+    fn tcp_ping_to_closed_port_errors() {
+        // 端口 1 无监听，连接必失败；校验错误路径不 panic、返回 Err。
+        let res = tcp_ping("127.0.0.1", 1, Duration::from_millis(1000));
+        assert!(res.is_err(), "连向关闭端口必须返回 Err");
+    }
+
+    #[test]
+    fn tcp_ping_all_empty_returns_empty() {
+        let out = tcp_ping_all(&[], 1000, 4, None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tcp_ping_all_progress_and_availability() {
+        PROGRESS_CALLS.store(0, Ordering::SeqCst);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let _ = s.read(&mut [0u8; 8]);
+                }
+            }
+        });
+        let proxies: Vec<Proxy> = (0..3)
+            .map(|i| Proxy::new(format!("n{i}"), ProxyType::Ss, "127.0.0.1".into(), port))
+            .collect();
+        let cb: &(dyn Fn(TestProgress) + Sync) = &|_p: TestProgress| {
+            PROGRESS_CALLS.fetch_add(1, Ordering::SeqCst);
+        };
+        let out = tcp_ping_all(&proxies, 2000, 4, Some(cb));
+        let _ = handle.join();
+        assert_eq!(out.len(), 3, "结果数 == 节点数");
+        assert!(out.iter().all(|r| r.available), "loopback 节点应全部可达");
+        assert_eq!(PROGRESS_CALLS.load(Ordering::SeqCst), 3, "每节点回调一次");
+    }
+
+    #[test]
+    fn measure_send_throughput_returns_some_for_open_socket() {
+        // 对保持打开的对端写数据，应在预算内返回 Some(>0) 吞吐估计。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(300)); // 保持连接
+                drop(s);
+            }
+        });
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let bw = measure_send_throughput(&mut client, Duration::from_millis(200));
+        let _ = handle.join();
+        assert!(bw.is_some_and(|b| b > 0.0), "开放 socket 应测得正吞吐");
     }
 }

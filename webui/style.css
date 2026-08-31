@@ -122,6 +122,7 @@ td .tag { background: var(--panel-2); border: 1px solid var(--border); border-ra
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
 .dot.up { background: var(--accent-2); box-shadow: 0 0 6px var(--accent-2); }
 .dot.down { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
 
 /* dashboard donut + legend */
 .donut-wrap { display: flex; gap: 18px; align-items: center; }

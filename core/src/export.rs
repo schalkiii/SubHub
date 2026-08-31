@@ -165,6 +165,17 @@ fn to_clash_value(p: &Proxy) -> Value {
                 }
             }
             insert_opt(&mut m, "password", &p.password);
+            // HTTPS 代理必须输出 `tls: true`，否则 mihomo 用明文 HTTP CONNECT
+            // 去连 443 端口，握手必失败、节点被误判为不可用。
+            //
+            // 兜底：`https://` 链接在部分订阅里被下发成 `type: http` 且不带
+            // tls 字段（解析侧也无从得知），此时按端口推断 —— 明文 HTTP 代理
+            // 跑在 443 上极为罕见，而实测 24 个 443 端口 http 节点明文通过 0
+            // 个、强制 tls 后通过 3 个，故 443 一律按 TLS 处理。
+            let tls = p
+                .tls
+                .or_else(|| if p.port == 443 { Some(true) } else { None });
+            insert_opt_bool(&mut m, "tls", tls);
         }
         _ => {}
     }

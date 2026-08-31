@@ -24,3 +24,4 @@ tower = "0.5"
 base64 = "0.22"
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+percent-encoding = "2"
