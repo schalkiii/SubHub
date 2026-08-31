@@ -52,6 +52,11 @@
 ### Verification
 - 端到端验证：用 `to_clash_meta` 生成的引擎配置对 Oracle SS 节点（129.146.200.6）实测 `measured=True`、真实带宽 110–130 KB/s；手写与 `to_clash_meta` 两种路径均能在节点出口健康时下载到 1MB 分片。廉价 / 受限出口节点（Cloudflare 前置、worker 前端、抖动 AWS SS 等）仍会测不到，属节点质量问题，正确回退为 TCP 估计值，不再被误标「可用」。
 
+## [P21.5] 修复「仅未测过」漏测无延迟数据的节点
+
+### Fixed
+- **「仅未测过」误漏节点**：选「仅未测过」测速时，部分 tcp / http 延迟均为 "— —"（从未拿到延迟数据）的节点未被纳入测试。根因：`apply_mode("untested")` 原以 `last_tested_at.is_none()` 判定未测过，但这些节点可能已被测速流程跑过（如 TCP-only 节点健康重测、添加时 TCP 超时）并被写入时间戳，只是那一轮没产出延迟值——`persist_results` 对每个经过的节点都会写 `last_tested_at`，导致「有时间戳但无数据」与「已测得数据」被混为一谈。现改为以「确实没有延迟数据」为准（`tcp_latency_ms == None && http_latency_ms == None`），使 UI 上显示 "— —" 的节点必定被「仅未测过」纳入。手动勾选测试不受影响（手动路径不走该过滤）。新增回归测试 `apply_mode_untested_catches_data_less_nodes`。
+
 ## [P19] 代码审计修复（R1 Round）
 
 ### Fixed

@@ -397,8 +397,9 @@ pub struct SpeedTestReq {
 
     /// Test-scope filter for the "仅测未测 / 仅失败" WebUI selector:
     /// - `None` / `""` / `"all"` -> test every node (default)
-    /// - `"untested"` -> only nodes that were never speed-tested
-    ///   (`last_tested_at == None`)
+    /// - `"untested"` -> only nodes that have no latency data yet
+    ///   (`tcp_latency_ms == None && http_latency_ms == None`), i.e. nodes
+    ///   still showing "—" in both columns regardless of `last_tested_at`.
     /// - `"failed"`   -> only nodes currently marked unavailable
     ///   (`available == Some(false)`)
     ///
@@ -1344,7 +1345,11 @@ fn flatten_dedup(subs: &[Subscription], only: Option<&[String]>) -> Vec<Proxy> {
 fn apply_mode(proxies: Vec<Proxy>, mode: &str) -> Vec<Proxy> {
     let mut out = proxies;
     match mode {
-        "untested" => out.retain(|p| p.last_tested_at.is_none()),
+        // 以「确实没有延迟数据」判定未测过，而非「没打过时间戳」：
+        // 节点可能已被测速流程跑过（last_tested_at 有值）却因 TCP 超时 /
+        // 未跑引擎而 tcp/http 全是空（UI 上即 "— —"）。这类节点对用户而言
+        // 仍是未测，必须被「仅未测过」纳入，否则会出现「看着没数据却测不到」的困惑。
+        "untested" => out.retain(|p| p.tcp_latency_ms.is_none() && p.http_latency_ms.is_none()),
         "failed" => out.retain(|p| p.available == Some(false)),
         _ => {}
     }
@@ -1987,6 +1992,24 @@ mod tests {
             s.is_finite(),
             "score must stay finite with NaN bandwidth, got {s}"
         );
+    }
+
+    #[test]
+    fn apply_mode_untested_catches_data_less_nodes() {
+        // 回归：节点被测速流程跑过（last_tested_at 有值）却因 TCP 超时 /
+        // 未跑引擎而 tcp/http 均为空（UI 显示 "— —"）时，「仅未测过」必须将其
+        // 纳入，不能因 last_tested_at 有值就误判为已测过而跳过。
+        let mut no_data = Proxy::new("a".into(), ProxyType::Ss, "1.1.1.1".into(), 8388);
+        no_data.last_tested_at = Some(123); // 跑过流程但无任何延迟数据
+        assert!(no_data.tcp_latency_ms.is_none() && no_data.http_latency_ms.is_none());
+
+        let mut has_data = Proxy::new("b".into(), ProxyType::Ss, "2.2.2.2".into(), 8389);
+        has_data.tcp_latency_ms = Some(50);
+        has_data.http_latency_ms = Some(80);
+
+        let filtered = super::apply_mode(vec![no_data, has_data], "untested");
+        assert_eq!(filtered.len(), 1, "仅未测过应只保留无延迟数据的节点");
+        assert_eq!(filtered[0].server, "1.1.1.1");
     }
 
     #[test]
