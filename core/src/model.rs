@@ -922,6 +922,20 @@ pub fn merge(proxies: &[Proxy]) -> Vec<Proxy> {
     out
 }
 
+impl Proxy {
+    /// 与节点列表「地区」列一致的「有效地区」：优先用实测出口地区
+    /// `outbound_country`（经测速引擎真连测出的真实出口国家），仅在未做出口
+    /// 检测（或检测为空）时回退到从名字猜测的 `region()`。让地区筛选 / 地区分布
+    /// 与列表显示保持一致——列表列本身就是 `outbound_country || region`。
+    pub fn effective_region(&self) -> String {
+        self.outbound_country
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.region())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,10 +1182,27 @@ mod tests {
             Proxy::new("阿根廷 AR".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
             "AR"
         );
-        // 上游明确的“其他地区”分组应保留为 OTHER（无地区信号）
+        // 上游明确的"其他地区"分组应保留为 OTHER（无地区信号）
         assert_eq!(
             Proxy::new("其他地区_1".into(), ProxyType::Vmess, "1.2.3.4".into(), 443).region(),
             "OTHER"
         );
+    }
+
+    #[test]
+    fn effective_region_prefers_outbound_country() {
+        // 名字无地区信号（region == OTHER）但实测出口地区已知时，
+        // effective_region 应返回实测出口地区，而非 OTHER。
+        let mut p = Proxy::new("其他".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
+        assert_eq!(p.region(), "OTHER");
+        p.outbound_country = Some("HK".into());
+        assert_eq!(p.effective_region(), "HK");
+
+        // 未做出口检测时回退到名字猜测
+        let mut q = Proxy::new("香港节点".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
+        assert_eq!(q.effective_region(), "HK");
+        // 即使名字有地区、出口地区不同，也以实测出口为准
+        q.outbound_country = Some("JP".into());
+        assert_eq!(q.effective_region(), "JP");
     }
 }

@@ -63,7 +63,8 @@ fn field_val(p: &Proxy, field: &str) -> String {
     match field {
         "name" => p.name.clone(),
         "type" => p.type_.as_str().to_string(),
-        "region" => p.region(),
+        // 与节点列表「地区」列一致：优先实测出口地区，回退名字猜测
+        "region" => p.effective_region(),
         "server" => p.server.clone(),
         _ => p.name.clone(),
     }
@@ -74,6 +75,44 @@ fn field_val(p: &Proxy, field: &str) -> String {
 /// Returns `Err` (with a human-readable message) when a regex used in a filter
 /// or the rename rule fails to compile, so the caller can surface the mistake
 /// to the user instead of silently producing an empty (include-mode) or
+/// 导出前地区名修正（**仅作用于传入的节点副本，绝不改动落库数据**）。
+///
+/// 对「名字未识别地区（`region()` 返回 `"OTHER"`）但实测出口地区
+/// （`outbound_country`）已知」的节点，把出口国家码前置到名字前，使 Clash Verge
+/// 等按名字匹配地区的客户端不再把它们归为「其他」。例如名字叫「其他」、出口实测为
+/// HK 的节点会被重命名为「HK 其他」。
+///
+/// 同一导出集合内若重名（含与原名撞名），追加 ` #2` / ` #3` 后缀去重，与
+/// `export::ensure_unique_names` 行为对齐（双重保险，最终输出必唯一）。
+/// `export_str` 内部的 `ensure_unique_names` 仍会兜底，这里提前去重只是让重命名
+/// 后的名字更干净、可读。
+pub fn region_fixup_for_export(proxies: &mut [Proxy]) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for p in proxies.iter_mut() {
+        // 需要重命名的节点：region 判定为 OTHER 且已有实测出口地区
+        let candidate = if p.region() == "OTHER" {
+            p.outbound_country
+                .as_ref()
+                .filter(|c| !c.is_empty())
+                .map(|code| format!("{} {}", code, p.name))
+        } else {
+            None
+        };
+        let base = candidate.unwrap_or_else(|| p.name.clone());
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            let renamed = format!("{} #{}", base, *count);
+            // 后缀名本身也登记，避免后续再次撞名
+            seen.entry(renamed.clone()).or_insert(1);
+            p.name = renamed;
+        } else {
+            p.name = base;
+        }
+    }
+}
+
 /// all-kept (exclude-mode) export.
 pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
     // Precompile every regex filter once (not per-node) so a large list with
@@ -802,5 +841,30 @@ mod tests {
             "measured latency preserved across refresh"
         );
         assert!(store[0].proxies.iter().any(|p| p.name == "brandnew"));
+    }
+
+    #[test]
+    fn region_fixup_renames_other_with_outbound_and_dedups() {
+        // 名字无地区（region==OTHER）但实测出口地区已知 → 前置国家码重命名，
+        // 让 Clash Verge 按名字匹配不再归为「其他」。
+        let mut a = node("其他", "1.1.1.1", 1);
+        a.region(); // 确保 region 判定为 OTHER（名字不含地区信号）
+        a.outbound_country = Some("HK".into());
+        let mut b = node("其他", "2.2.2.2", 2); // 同名、同出口，需去重
+        b.outbound_country = Some("HK".into());
+        let mut c = node("香港节点", "3.3.3.3", 3); // 名字已有地区 → 不改
+        c.outbound_country = Some("JP".into());
+        let d = node("未实测节点", "4.4.4.4", 4); // 无出口地区 → 不改
+        // region() 应为 OTHER（名字无地区信号）以验证「不改」分支
+        assert_eq!(d.region(), "OTHER");
+
+        let mut all = vec![a, b, c, d];
+        region_fixup_for_export(&mut all);
+
+        let by_name = |n: &str| all.iter().find(|p| p.server == n).unwrap();
+        assert_eq!(by_name("1.1.1.1").name, "HK 其他");
+        assert_eq!(by_name("2.2.2.2").name, "HK 其他 #2", "同名同出口需去重");
+        assert_eq!(by_name("3.3.3.3").name, "香港节点", "名字已含地区不改");
+        assert_eq!(by_name("4.4.4.4").name, "未实测节点", "无出口地区不改");
     }
 }

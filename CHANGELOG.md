@@ -52,6 +52,14 @@
 ### Verification
 - 端到端验证：用 `to_clash_meta` 生成的引擎配置对 Oracle SS 节点（129.146.200.6）实测 `measured=True`、真实带宽 110–130 KB/s；手写与 `to_clash_meta` 两种路径均能在节点出口健康时下载到 1MB 分片。廉价 / 受限出口节点（Cloudflare 前置、worker 前端、抖动 AWS SS 等）仍会测不到，属节点质量问题，正确回退为 TCP 估计值，不再被误标「可用」。
 
+## [P21.6] 地区列/筛选一致 + 导出按实测出口重命名
+
+### Fixed
+- **地区筛选与列表显示不一致**：节点列表「地区」列优先显示实测出口地区 `outbound_country`，但「地区筛选」与仪表盘「地区分布」仍用从名字猜测的 `region()`，导致显示 HK 的节点按「地区=HK」筛选却被排除。新增 `Proxy::effective_region()`（优先 `outbound_country`，回退 `region()`），列表筛选、关键字搜索的 region 维度、仪表盘地区分布，以及 `apply` transform 的 `region` 过滤器（影响 `/sub` URL 与手动导出的 region 过滤）统一改用它，四处与列表列一致。
+
+### Added
+- **导出按实测出口地区重命名**：`/sub` 在线订阅与「导出」两种渠道在导出前，对「名字未识别地区（`region()`==OTHER）但实测出口地区已知」的节点，把出口国家码前置到名字（如「其他」→「HK 其他」），使 Clash Verge 按名字匹配地区时不再把它们归为「其他」。重名时追加 ` #2`/` #3` 后缀去重；仅在导出副本上修改，绝不改动落库数据（`export_str` 的 `ensure_unique_names` 仍兜底去重）。新增回归测试 `region_fixup_renames_other_with_outbound_and_dedups` 与 `effective_region_prefers_outbound_country`。
+
 ## [P21.5] 修复「仅未测过」漏测无延迟数据的节点
 
 ### Fixed

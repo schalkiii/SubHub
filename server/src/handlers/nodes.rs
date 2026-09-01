@@ -123,7 +123,8 @@ pub(crate) async fn list_proxies(
             }
 
             if let Some(r) = &q.region {
-                if !p.region().eq_ignore_ascii_case(r) {
+                // 与节点列表「地区」列一致：优先实测出口地区，回退名字猜测
+                if !p.effective_region().eq_ignore_ascii_case(r) {
                     continue;
                 }
             }
@@ -134,7 +135,7 @@ pub(crate) async fn list_proxies(
                 // name, server/host, region, and type. Case-insensitive.
                 let matched = p.name.to_lowercase().contains(&s)
                     || p.server.to_lowercase().contains(&s)
-                    || p.region().to_lowercase().contains(&s)
+                    || p.effective_region().to_lowercase().contains(&s)
                     || p.type_.as_str().to_lowercase().contains(&s);
 
                 if !matched {
@@ -322,7 +323,8 @@ pub(crate) async fn dashboard(State(state): State<AppState>) -> Json<DashboardRe
     for p in &all {
         *by_type.entry(p.type_.as_str().to_string()).or_insert(0) += 1;
 
-        *by_region.entry(p.region()).or_insert(0) += 1;
+        // 与节点列表「地区」列保持一致：优先实测出口地区，回退名字猜测
+        *by_region.entry(p.effective_region()).or_insert(0) += 1;
 
         match p.available {
             Some(true) => available += 1,

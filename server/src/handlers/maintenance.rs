@@ -7,7 +7,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     Json,
 };
-use subhub_core::{apply_transform, export_str, Proxy};
+use subhub_core::{apply_transform, export_str, region_fixup_for_export, Proxy};
 /// Resin circuit-breaker style cleanup: drop nodes that have been tested and
 /// found unavailable (`available == Some(false)`) across all subscriptions.
 /// Returns how many were removed. Keeps `untested` (None) nodes untouched.
@@ -146,7 +146,7 @@ pub(crate) async fn merge_export(
     } else {
         None
     });
-    let transformed = if let Some(n) = top_n {
+    let mut transformed = if let Some(n) = top_n {
         let mut scored: Vec<(f64, Proxy)> = transformed
             .into_iter()
             .map(|p| (score_proxy(&p), p))
@@ -160,6 +160,10 @@ pub(crate) async fn merge_export(
     } else {
         transformed
     };
+
+    // 导出前地区名修正（与 /sub 一致）：名字 OTHER 但实测出口地区已知的节点前置国家码，
+    // 避免 Clash Verge 把它们归为「其他」。仅改导出副本，不影响落库数据。
+    region_fixup_for_export(&mut transformed);
 
     let content = export_str(&transformed, &fmt);
 
@@ -234,7 +238,7 @@ pub(crate) fn build_sub_content(
     } else {
         None
     });
-    let transformed = if let Some(n) = top_n {
+    let mut transformed = if let Some(n) = top_n {
         let mut scored: Vec<(f64, Proxy)> = transformed
             .into_iter()
             .map(|p| (score_proxy(&p), p))
@@ -250,6 +254,11 @@ pub(crate) fn build_sub_content(
     };
 
     let fmt = q.format.clone().unwrap_or_else(|| "clash-meta".to_string());
+
+    // 导出前地区名修正：名字未识别地区（region==OTHER）但实测出口地区已知的节点，
+    // 把出口国家码前置到名字，避免 Clash Verge 按名字匹配时把它们归为「其他」。
+    // 仅改导出副本，不影响落库数据。
+    region_fixup_for_export(&mut transformed);
 
     let content = export_str(&transformed, &fmt);
 
