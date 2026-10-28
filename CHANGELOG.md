@@ -2,6 +2,38 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P22] 全量复核修复（数据保护 / 协议保真 / 进度与文档一致性）
+
+### Fixed
+
+- **刷新返回 0 节点不再清空订阅**：`do_refresh_one` 遇到 200 但解析出 0 个节点时，按失败处理（写入 `last_error` 并保留原有节点），避免上游一次空响应/格式变更就把整个订阅的节点与测速结果清空。
+- **增量刷新保留全部测速字段**：`incremental_update` 现在同步保留 `tcp_latency_ms` / `http_latency_ms` / `consecutive_failures`。此前每次刷新都会把 TCP/HTTP 两列清空，并把自动移除的连续失败计数归零。
+- **重复添加只测新增节点**：`merge_subscriptions_by_source` 额外返回 `fresh_nodes`，`POST /api/subscriptions` 只对真正新增的节点跑自动测速。此前重复添加同一 URL 会对该订阅全部节点重测，数千节点场景耗时与网络压力巨大。
+- **TCP-only 健康检查不再误判未测节点**：配置引擎时，`run_health_check_core` 只跑裸 TCP；TCP 成功时保持上一轮判定（`available == None` 仍为未测），不再把未测/可用节点改成不可用，也不累加连续失败计数。只有 TCP 失败才降级。
+- **SSE 测速进度可达 100%**：带宽探测已关闭，进度总量由 `节点数 × 3` 改为按实际阶段计（无引擎 `×1`、有引擎 `×2`）；前端在收到 `done` 时强制收尾到 100%，引擎整体起不来时也不会卡在中间百分比。
+- **SS 加密方法跨格式一致**：v2ray / sing-box / surge 导出统一通过 `ss_method()` 读取 `method` 或 `cipher`。此前 YAML 导入的 SS 节点在以上格式中会回退成默认 `aes-256-gcm`，导出后无法连接。
+- **Hysteria2 / TUIC 强制 TLS**：解析时标记 `tls=true`；sing-box 导出强制输出 TLS 块，避免整份配置校验失败。
+- **补全 VLESS REALITY**：模型新增 `reality` / `reality_public_key` / `reality_short_id`；支持 URI（`security=reality&pbk=&sid=`）与 clash YAML（`reality-opts`）解析；导出到 clash-meta（`reality-opts` + 缺省 `client-fingerprint: chrome`）、sing-box（`tls.reality` + `utls`）、v2ray/xray（`security: reality` + `realitySettings`）。缺公钥的 REALITY 节点按不完整处理，不再导出成必然失败的普通 TLS。
+- **WebUI 出口/解锁按钮结果判定**：出口检测改读 `outbound_country`、解锁检测改读摘要字段 `unlock`。此前字段名错配导致两个功能成功后仍提示“未检测到”。
+- **`/api/proxies` 排序参数**：`desc` 同时接受 `1` 与 `true`（此前文档示例 `desc=1` 会触发 400）。
+- **`top_n=0` 语义**：显式传 `0` 现在表示“全部节点”并覆盖全局 Top-N；只有参数缺省才回落全局设置（与 README 一致）。
+- **`/api/proxies` / `/api/nodes/top` 的 `region` 口径**：统一为 `effective_region()`（实测出口优先），与列表列/筛选/地区分布一致。
+- **指纹补全**：VMess/VLESS/TUIC 在存在 ws `host`、gRPC `service_name`、REALITY 参数时纳入指纹（空值不追加，避免给无这些字段的节点制造新指纹）。同服务器同 UUID 不同 Host/service 的节点不再被合并去重。
+- **sing-box 导出细节**：uTLS 改为 `utls: { enabled, fingerprint }` 对象；SOCKS5/HTTP 导出用户名；HTTP 443/`tls` 节点导出 TLS。
+- **WebUI 内嵌兜底**：静态资源改为「磁盘优先（`SUBHUB_WEBUI_DIR` → 源码 `webui/` → exe 同级）→ 内嵌副本兜底」；exe 分发到无源码的机器后 WebUI 不再 404。开发时仍保持“改前端重启即生效”。
+- **文档/脚本同步**：`docs/test_subhub.py` 改为消费 `/api/speedtest` 的 SSE 流；README 修正进度总量、带宽状态、排序参数、设置字段，并新增协议支持矩阵与 WebUI 分发说明。
+
+### Changed
+
+- WebUI 合并/导出页移除“最小带宽”输入（当前不采集新带宽，阈值只能作用于历史数据）；后端 `min_bandwidth_bps` 字段保留用于兼容旧分享链接。
+- 移除 `region()` 中过短的 `hong` 子串匹配（避免 `chongqing` 等被误判为 HK）。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**102 个测试全通过**（core 84 + server 18）。
+- `cargo clippy --release -p subhub-core -p subhub-server --all-targets -- -D warnings`：0 警告。
+- 隔离 DB 启动 server 后运行 `docs/test_subhub.py` 端到端：ALL CHECKS PASSED。
+
 ## [P20] 自动清理无可用订阅 + 配置备份导出导入
 
 ### Added

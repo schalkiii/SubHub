@@ -12,7 +12,7 @@
 - **用户实际跑的是 `subhub-app.exe`（Tauri 内嵌 server），不是 `subhub-server.exe`。** 任何改动要生效，必须 `cargo build --release -p subhub-app` + 重启 `subhub-app.exe`；只构建/重启 server 对用户**完全无效**。
 - **构建前先 `Stop-Process subhub-app`**，否则 exe 被占用、`failed to remove file ... subhub-app.exe`。
 - **DB 路径相对进程 CWD**：从 `target\release` 目录启动才读 `target/release/data/subhub.db`（真数据）；从项目根启动会读项目根的空库、误建空文件、节点全丢。重启前务必 `cd target/release` 或用 `-WorkingDirectory target/release` 启动。
-- WebUI 由 axum `ServeDir` 直接从 `webui/` 提供、**不嵌入 exe**；改前端重启即生效（无需重打 app）。
+- WebUI 静态资源：磁盘优先（源码 `webui/`，可用 `SUBHUB_WEBUI_DIR` 覆盖）→ exe 内嵌副本兜底。改前端重启即生效；发行版更新内嵌副本需重新构建 app。
 - 新增全局设置字段需在 7 处同步（见 `.codebuddy/memory/MEMORY.md` 的「新增全局设置字段同步清单」），漏改会 E0063。
 
 ## 技术栈与目录
