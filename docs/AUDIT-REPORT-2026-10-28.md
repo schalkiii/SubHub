@@ -301,3 +301,38 @@
 - 本轮**未**执行 `cargo fmt` 全量格式化：项目现有排版包含大量历史空行，全量格式化会产生上千行无关 diff；建议单独一次“纯格式化提交”并加入 CI 门禁。
 - 带宽能力的产品决策保持“关闭新采集”：评分中的带宽分量仅对历史实测数据生效。若后续要恢复，建议以独立设置项（默认关闭）接入，而不是重新打开全局带宽探测。
 - 静态资源内嵌使用 `include_bytes!`（零新依赖），构建 `subhub-server` / `subhub-app` 时自动更新；开发时磁盘优先，保持“改前端重启即生效”的现有工作流。
+
+---
+
+## 七、第二轮复核增强（2026-10-28 续）
+
+在第一轮修复后对导出命名、Top-N、备份保真、Gist 分发、引擎进度映射、传输协议与前端错误态做二次复查。
+
+### 7.1 新发现问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| C1 | `core/src/export.rs::ensure_unique_names` | 生成 ` #2` 后未把该名称登记到已用集合；`["A","A","A #2"]` 会导出两个 `A #2`，客户端报 duplicate name 拒绝整份配置 | 高 | 改为 `HashSet` 循环分配唯一名并登记生成名；新增单测 `unique_names_avoid_collision_with_existing_suffix` |
+| C2 | `server/src/handlers/maintenance.rs` | Top-N 在 `export_filter` 之前按全部节点评分，死节点 / Other 类型占用名额后又被过滤，最终可能不足 N 个 | 中 | 新增 `core::ops::top_n_by_score`（先 `is_usable` 再评分排序）；`merge_export`、`/sub`、`/api/nodes/top` 统一使用；新增单测 |
+| C3 | `SubExportItem` / `import_subscriptions` | 备份不含健康时间戳、错误与流量用量；恢复后用量卡片消失、`last_healthy_at` 丢失影响自动清理计时 | 中 | `version: 2`，新增 8 个可选字段并原样恢复；旧备份缺字段时回退原行为；新增 round-trip 单测 |
+| C4 | `handlers/speedtest.rs::gist_upload` | Gist 文件名固定 `subscription.yaml`，v2ray/sing-box/surge 内容扩展名错误；raw URL 使用设置里的用户名，与 token 实际 owner 不一致时 404 | 中 | 按格式选择 `.yaml/.json/.conf/.txt`；优先使用响应中的 `owner.login`；新增扩展名单测 |
+| C5 | `server/src/engine.rs::EngineProgress` | SSE 用回调计数反查输入列表取 server；批次中不可导出节点不回调时，后续节点 host 错位 | 低 | `EngineProgress` 直接携带 `server`，SSE 改用该字段 |
+| C6 | `core/src/parse.rs` / `export.rs` | h2 / HTTP 传输只解析 sing-box，clash `h2-opts` 与 v2ray `httpSettings` 未支持，导出即丢传输层 | 中 | 解析 clash `h2-opts`、sing-box `transport.type=http`（host 数组）；导出 clash / v2ray / sing-box；新增三格式单测 |
+| C7 | `core/src/parse.rs::parse_vmess` | 字符串端口 `"0"` 被接受；数字形式 `aid` 丢失、超大值可能截断 | 低 | 统一 `u64` 解析 + `1..=65535` 过滤；`aid` 支持数字并做 u32 校验；新增单测 |
+| C8 | `webui/app.js::loadSubs` | 请求失败被当作空列表，显示「还没有订阅」，掩盖服务端错误 | 低 | 区分 error 与空列表，显示「订阅列表加载失败：…」 |
+| C9 | `webui/app.js::buildSubParams` | 多条同字段 include 筛选生成重复 `q`/`region`/`type` 键，服务端反序列化 400 | 中 | 每键只保留第一条并提示「同一字段多条筛选无法完整编码」；浏览器验证 |
+| C10 | `server/src/db.rs`、`Cargo.toml` | `load_all` 无 ORDER BY，重启后订阅顺序可能变化；`tower`/`tower-http`/`anyhow` 已无引用 | 低 | 增加 `ORDER BY rowid`；移除未使用依赖 |
+
+### 7.2 验证
+
+- `cargo test -p subhub-core -p subhub-server`：**110 个测试全通过**（core 90 + server 20）。
+- clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端 ALL CHECKS PASSED；额外脚本验证 Top-N 不选死节点、备份健康字段往返。
+- 浏览器验证：分享 URL 重复筛选提示、订阅列表错误态、合并/设置页无控制台错误。
+
+### 7.3 仍为 pending（与第一轮一致或新增）
+
+- 刷新不存在订阅仍返回 200 + `status:error`（B11）。
+- SS `plugin` / `plugin-opts`、Hysteria2 `obfs`/`alpn`、TUIC 拥塞控制等高级参数未解析（B19/B20，已在 README 声明）。
+- 无 CI、无全量 `cargo fmt`、无 LICENSE；根目录 `nul` 与 `docs/review-round-*.html` 为待确认删除候选。
+- 本地 / 粘贴类订阅的备份恢复仍靠「新增一条」而非幂等更新；如需完全幂等需引入内容指纹或受控 id 匹配（设计取舍，未在本轮改动）。

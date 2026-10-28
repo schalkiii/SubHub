@@ -9,7 +9,7 @@
 
 ## 状态
 
-**P0 ~ P22 全部完成并端到端验证。** 更晚的 P16–P22（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY 支持与复核修复等）见 [`CHANGELOG.md`](CHANGELOG.md)。
+**P0 ~ P23 全部完成并端到端验证。** 更晚的 P16–P23（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY 支持与两轮复核修复/增强等）见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -30,6 +30,7 @@
 | **P15** | **修复已配置引擎时的假绿误报**：移除「本批全部探测失败则退回 TCP」的全局回退，改为只要配置引擎即逐节点以 gstatic 实测为权威，根除 `35.187.156.27:443` 类「端口可连、代理不通」误报 | ✅ |
 | **P16–P21.6** | **无可用订阅自动清理 + 配置备份导入导出 · 订阅使用量展示 · base64 链接导入 · 测速引擎参数/模式修复 · 地区筛选与导出一致性 · 导出按实测出口重命名** | ✅ |
 | **P22** | **复核修复：刷新空结果保护 · 增量刷新保留延迟/失败计数 · 重复添加只测新增 · TCP-only 健康检查不误判 · SSE 进度修正 · SS cipher 跨格式回退 · Hysteria2/TUIC 强制 TLS · VLESS REALITY 解析/导出 · WebUI 内嵌兜底** | ✅ |
+| **P23** | **第二轮增强：导出名去重与既有后缀冲突 · Top-N 只选可用节点 · 备份保留健康/用量元数据 · Gist 按格式命名与 owner · h2/HTTP 传输 · VMess 端口/aid 校验 · 订阅列表错误态与分享 URL 重复筛选** | ✅ |
 
 ## 架构
 
@@ -141,7 +142,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | GET  | `/api/subscriptions/:id/speedtest` | **对单个订阅单独重测**（不碰其他订阅）：返回 SSE 流，事件与全局 `/api/speedtest` 同构（`progress`/`done`），只测该订阅的节点；订阅不存在或无节点返回 404。订阅页卡片的「测速」按钮即调用此端点（区别于「刷新」——刷新不重测已有节点，此端点强制重测该订阅全部节点） |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
 | PATCH | `/api/subscriptions/:id` | **重命名订阅来源**（body: `{"name":"新名字"}`），仅更新展示名，不影响其节点与测速数据 |
-| GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`），用于整机备份或跨实例迁移 |
+| GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`=2/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`，以及 `last_checked_at`/`last_updated_at`/`last_healthy_at`/`last_error`/`upload`/`download`/`total`/`expire` 健康与用量元数据），用于整机备份或跨实例迁移 |
 | POST | `/api/subscriptions/import` | **从备份恢复订阅**：按源 URL 幂等合并（重导入同一实例或跨实例的远程订阅不重复），保留内嵌节点结果（不重新抓取 / 测速），本地 / 粘贴类无 URL 订阅互不冲突 |
 | POST | `/api/subscriptions/prune` | **清理长期无可用订阅**：立即删除所有「连续 N 天没有任何可用节点」的订阅（N 取自设置项 `remove_sub_after_days`，0 = 关闭），返回 `{status,removed}`。定时刷新与节点重测运行时也会自动执行 |
 | GET  | `/api/settings`      | 读取当前全局设置（`use_proxy` / `auto_refresh_sec` / `node_health_check_sec` / `default_fetch_proxy` / `top_n` / `engine_bin` / `remove_after_fails` / `remove_sub_after_days` / `bind_addr` / `external_host` / `github_user` / `has_github_token` / `lan_ip`） |
@@ -152,13 +153,13 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | POST | `/api/geo-detect`    | **出口地区探测**（BestSub 风格）：经 `SUBHUB_ENGINE_BIN` 起引擎，逐节点跑 geo-IP 通道，写回 `Proxy.outbound_country`（无引擎时安全返回空） |
 | POST | `/api/unlock-detect` | **流媒体解锁判定**（BestSub 风格）：经引擎逐节点探测 TikTok / Netflix / Disney+ / YouTube Premium / ChatGPT，写回 `Proxy.unlock`（无引擎时安全返回空矩阵） |
 | POST | `/api/nodes/cleanup` | **坏节点熔断清理**（Resin 风格）：删除所有 `available==false` 的节点（保留未测节点），返回 `{status,removed}` |
-| GET  | `/api/nodes/top`     | **跨订阅 Top-N 节点**：按综合评分返回全局最高的前 N 个节点（受全局 `top_n` 设置控制；`?n=N` 可临时覆盖，0=全部），每项含 `sub_id`/`sub_name`/`region`/`score` |
+| GET  | `/api/nodes/top`     | **跨订阅 Top-N 节点**：按综合评分返回全局最高的前 N 个节点（受全局 `top_n` 设置控制；`?n=N` 可临时覆盖，0=全部）。只列可导出且未判死的节点，每项含 `sub_id`/`sub_name`/`region`/`score` |
 | GET  | `/api/proxies`       | 节点列表（可 `?type=ss&region=HK&q=foo` 过滤；**分页** `?page=1&page_size=50`，返回 `{total,page,page_size,items}`，`page_size` 上限 500；**全局排序** `?sort=name\|latency\|tcplat\|httplat\|speed\|score&desc=1` 在**分页前对全部节点**生效（`desc` 同时接受 `1` 与 `true`），可用性主导——`available==false` 的节点无论按哪列都沉底；每项含 `outbound_country` / `unlock` / `download_speed_bps` / `region` / `sub_id` / `sub_name` —— `region` 为**有效地区**（优先实测出口 `outbound_country`，回退名称推断，与列表列/筛选/地区分布同口径）；`sub_id`/`sub_name` 标明节点归属的订阅来源，供「按订阅分组」视图使用） |
 | POST | `/api/proxies/delete` | **删除单个节点**（body: `{"sub_id":"...","fingerprint":"..."}`）：从指定订阅中剔除某一个节点，不影响其余节点与订阅本身 |
 | GET  | `/api/dashboard`     | 仪表盘统计（总数 / 订阅数 / 可用·不可用·未测 / 平均·最佳延迟 / 按类型 / 按地区 / 每订阅） |
 | GET  | `/api/trends`        | **趋势数据**（Resin 风格）：滚动窗口内的 `TrendPoint` 快照序列（总/可用/未测节点 + 平均延迟），供趋势图使用 |
 | POST | `/api/export`        | 合并并导出（body: `{"format":"clash-meta","transform":{...},"sub_ids":[...],"top_n":N}`），返回 `{format,count,content}`，`top_n` 可临时覆盖全局设置（`0` = 全部）。`count` 为通过 `export_filter` 的节点数，未扣除目标格式自身不支持而跳过的类型（v2ray/sing-box/surge 的跳过数量见服务端日志） |
-| POST | `/api/gist/upload`    | **上传全部订阅到 GitHub Gist**（需先在「设置」页填 GitHub user / token）：将当前所有订阅打包为可公开拉取的 Gist，返回稳定地址，便于远程设备一键同步；串行化上传避免孤儿 Gist |
+| POST | `/api/gist/upload`    | **上传全部订阅到 GitHub Gist**（需先在「设置」页填 GitHub user / token）：将当前所有订阅打包为可公开拉取的 Gist，返回稳定地址，便于远程设备一键同步；串行化上传避免孤儿 Gist。Gist 文件名与返回的 raw 地址按格式选择扩展名（`subscription.yaml` / `.json` / `.conf` / `.txt`），并优先使用 Gist 实际所有者生成 raw URL |
 | GET  | `/sub`               | **本地订阅直接拉取地址**：合并所有（或 `?sub=id1,id2` 指定）订阅，可选 `?format=clash-meta` / `clash` / `v2ray` / `sing-box` / `surge` / `base64` 与算子参数 `?sort=latency&desc=1&rename_pat=.*HK-(.*)&rename_rep=HK-$1&q=关键词&region=HK&type=ss`，返回**纯文本订阅内容**（clash 类为 `text/plain`、v2ray/sing-box 为 `application/json`），无 JSON 包装、无需鉴权。把这个网址直接填进 mihomo / clash / v2rayN / sing-box 的「订阅」即可常驻拉取（详见下文「本地订阅地址」一节） |
 | GET  | `/api/speedtest`     | 手动测速，返回 **SSE 流**（`text/event-stream`），WebUI 据此实时显示进度条与「正在测的节点 / 延迟」。查询参数：`timeout_ms`（默认 4000）、`concurrency`（默认 20）、`mode`（`all` 全部 / `untested` 只测「无延迟数据」的节点——`tcp_latency_ms` 与 `http_latency_ms` 均为 `None`，即 UI 上显示 "— —" 的节点；注意只要经过测速流程就会被打 `last_tested_at` 时间戳，但没拿到延迟值的节点也会被纳入 / `failed` 只测 `available==Some(false)`，复用自动刷新增量思路）、`ids`（可选，URL 编码的 JSON 数组字符串，形如 `ids=["<fp1>","<fp2>"]`，**只测这些选中节点**，供节点页「测速选中」多选使用；用 JSON 数组而非分隔符拼接，避免 fingerprint 内逗号（常见于 vless+ws 的 path）被误切导致匹配不到）。事件：`progress`（每个节点完成 **任一阶段** 发一条，含 `done/total/name/available/latency_ms/tcp_latency_ms/http_latency_ms/server/phase`；`bandwidth_bps` 字段仍保留，但仅为 TCP 吞吐估算或 `null`，前端不展示），`phase` 为 `tcp`/`http`；`server` 为该节点 host，前端据其判定回环节点）与 `done`（汇总 `tested/reachable/avg_latency_ms/with_http/removed/threshold`）。**进度总量覆盖全程**：无引擎时 `total = 节点数`（仅 TCP）；配置引擎时 `total = 节点数 × 2`（TCP + HTTP 延迟各占一段；带宽探测已关闭，不再计入），所以进度条**真正到 100% 才结束**，不会在 TCP 完成后卡住。每个节点的 TCP 延迟 / 可用性（及可选 HTTP 延迟）测完即写回节点记录。**可用性判定对齐 clash-verge**：配置了 `SUBHUB_ENGINE_BIN` 且本批确有节点经引擎 gstatic generate_204 实测成功时，节点的「可用」就以**引擎的真实代理级 HTTP 探测**为准（逐节点 `h.is_some()`）——TCP 能连但协议层不通的节点会被正确判为不可用，不再出现「SubHub 绿、clash-verge 红」的假绿（例如 `35.187.156.27:443` 这类 Google 443 端口，TCP 必可连但代理隧道不通的节点）；当引擎未配置、或本批 0 个节点探测成功（引擎整体故障/超时过严）时，回退到裸 TCP 可用性作为兜底，避免 mass-red 让用户完全无法使用 |
 | POST | `/api/proxy-test`    | **代理可达性测试**（body: `{"proxy":"http://127.0.0.1:7890","url?":"https://..."}`）：经该代理发 HTTP GET（默认 gstatic `generate_204`），15s 超时，返回 `{ok,status|error}`，用于校验「拉取代理」是否可用 |
@@ -168,7 +169,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 
 左侧新增 **「设置」** 导航，把原先散落在「订阅管理」「合并 / 导出」等页面的配置集中到一处，并由**一套配置统一驱动**合并导出与网页订阅（`/sub`）：
 
-- **全局 Top-N**：合并导出与 `GET /sub` 网页订阅**统一受此数值控制**（单一真相源）。设为 N 时两者都只输出评分最高的前 N 个节点；关闭（0 / 留空）则输出全部。WebUI 不再有独立的「导出 Top-N 开关」，避免多套配置互相打架。
+- **全局 Top-N**：合并导出与 `GET /sub` 网页订阅**统一受此数值控制**（单一真相源）。设为 N 时两者都只输出评分最高的前 N 个节点（**只从可导出且未判死的节点中选取**，避免死节点占用名额后被过滤导致不足 N 个）；关闭（0 / 留空）则输出全部。WebUI 不再有独立的「导出 Top-N 开关」，避免多套配置互相打架。
 - **代理**：开关 + 默认拉取代理地址（`http` / `https` / `socks5`）。该地址作为**服务端单一真相源**，用于抓取被墙的订阅源（替代原来浏览器 localStorage 里的「记住」复选框）；`add_subscriptions` 仅在校验（`client_with_proxy().is_ok()`）通过后才写入默认。
 - **定时自动刷新**：自动刷新间隔（秒），等价于 `SUBHUB_AUTO_REFRESH_SEC`；0 / 留空则关闭。
 - **测速引擎**：外部引擎二进制路径，等价于 `SUBHUB_ENGINE_BIN`；留空则仅做 TCP 连通性延迟。
@@ -233,7 +234,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 - 默认端口 `3005`，可用 `SUBHUB_PORT` 覆盖（网址里的端口要跟着改）。
 - 只合并部分订阅：加 `&sub=id1,id2`（订阅 id 见 `GET /api/subscriptions`）。
-- 支持的算子参数：`sort`（`name`/`latency`/`tcplat`/`httplat`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（保留评分最高的前 N 个；`top_n=0` = 全部并覆盖全局设置，缺省才回落全局）、`min_bw`（带宽下限，**bps**，仅对历史实测带宽生效）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
+- 支持的算子参数：`sort`（`name`/`latency`/`tcplat`/`httplat`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（从可导出且未判死的节点中保留评分最高的前 N 个；`top_n=0` = 全部并覆盖全局设置，缺省才回落全局）、`min_bw`（带宽下限，**bps**，仅对历史实测带宽生效）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
 - 注意：分享网址只编码**包含类**筛选（名称/地区用 `contains`、类型用 `exact`）；**排除 / 正则类**筛选无法编码进网址，遇到时会提示，需要那种效果请改用「合并并导出」手动导出。
 
 ### 导出格式
@@ -254,8 +255,8 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 | 协议 | 解析 | clash-meta | v2ray | sing-box | surge | 说明 |
 |---|---|---|---|---|---|---|
 | SS | ✅ | ✅ | ✅ | ✅ | ✅ | 加密方法兼容 `method`（URI）与 `cipher`（YAML）两种存储 |
-| VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / tls / SNI |
-| VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | 含 **REALITY**（`pbk` / `sid`）；缺公钥的 REALITY 节点视为不完整、不导出 |
+| VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / h2 / tls / SNI |
+| VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | 含 **REALITY**（`pbk` / `sid`）与 ws / grpc / h2；缺公钥的 REALITY 节点视为不完整、不导出 |
 | Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | 始终 TLS |
 | Hysteria2 | ✅ | ✅ | — | ✅ | — | v2ray-core 无法表示；sing-box 强制 TLS |
 | TUIC | ✅ | ✅ | — | ✅ | — | 同上 |

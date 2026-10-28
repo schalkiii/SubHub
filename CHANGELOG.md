@@ -2,6 +2,32 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P23] 第二轮复核增强（导出命名 / Top-N / 备份保真 / 传输补全）
+
+### Fixed
+
+- **导出名去重与既有后缀冲突**：`ensure_unique_names` 现在把生成的 ` #N` 名称也登记到已用集合。此前 `["A", "A", "A #2"]` 会产出两个 `A #2`，客户端报 `duplicate name` 拒绝整份配置。
+- **Top-N 只选可用节点**：`merge_export`、`/sub` 与 `/api/nodes/top` 在评分前先过滤 `is_usable()`（可导出且未判死），避免死节点 / Other 类型占用名额后被 `export_filter` 丢弃，最终不足 N 个。
+- **备份保留健康与用量元数据**：`SubExportDoc` 升级到 `version: 2`，`SubExportItem` 新增 `last_checked_at` / `last_updated_at` / `last_healthy_at` / `last_error` / `upload` / `download` / `total` / `expire`；导入时原样恢复（旧备份缺字段时回退到原行为），流量卡片、错误状态与「连续 N 天无可用」计时不再在备份恢复后丢失。
+- **Gist 扩展名与所有者**：上传 Gist 时按格式使用 `subscription.yaml` / `.json` / `.conf` / `.txt`，raw 地址使用 Gist 响应里的实际 owner，避免 v2ray/sing-box/surge 内容伪装成 yaml、或多账号 token 导致 raw URL 指向错误用户。
+- **引擎进度 host 错位**：`EngineProgress` 直接携带 `server`，SSE 不再用回调计数反查输入列表；批次中出现不可导出节点（不回调）时后续节点的 host 不会错位。
+- **VMess 端口与 alterId**：字符串端口 `"0"` 会被丢弃（此前直接 parse 成 0）；数字形式 `aid` 也能解析并做 u32 范围校验。
+- **h2 / HTTP 传输补全**：解析 clash `h2-opts` 与 sing-box `transport.type=http`（host 数组），并导出到 clash `h2-opts`、v2ray `httpSettings`、sing-box `transport.type=http`。
+- **REALITY 强制 TLS**：clash 导入时即使源里写 `tls: false`，只要存在 `reality-opts` 也按 TLS 处理。
+- **订阅列表错误态**：`loadSubs` 请求失败时显示「订阅列表加载失败：…」，不再误显示「还没有订阅」。
+- **分享 URL 重复筛选**：同一字段（q/region/type）出现多条 include 筛选时只保留第一条并提示，避免生成服务端无法反序列化的重复键 URL。
+- **DB 读取顺序**：`load_all` 增加 `ORDER BY rowid`，重启后订阅顺序保持稳定。
+
+### Changed
+
+- 移除未使用的直接依赖：`tower`、`tower-http`（server）、`anyhow`（core/server）。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**110 个测试全通过**（core 90 + server 20）。
+- `cargo clippy --release -p subhub-core -p subhub-server --all-targets -- -D warnings`：0 警告。
+- 隔离 DB 端到端：`docs/test_subhub.py` ALL CHECKS PASSED；额外验证 Top-N 不选中死节点、备份健康字段往返、分享 URL 重复筛选提示与订阅列表错误态（浏览器）。
+
 ## [P22] 全量复核修复（数据保护 / 协议保真 / 进度与文档一致性）
 
 ### Fixed
