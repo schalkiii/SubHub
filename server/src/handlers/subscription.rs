@@ -29,8 +29,10 @@ pub(crate) fn expand_input_entry(raw: &str) -> Vec<String> {
     if raw.is_empty() {
         return Vec::new();
     }
-    // 已经是普通订阅链接（subconverter / v2rayN 大多直接给 URL）。
-    if raw.contains("://") {
+    // 已经是普通订阅链接（subconverter / v2rayN 大多直接给 URL）。只认 http/https：
+    // 此前只要含 `://` 就算 URL，`file://…` / `ftp://…` 这类误粘贴会建出一条
+    // 永远 0 节点、还占着列表的订阅。
+    if raw.starts_with("http://") || raw.starts_with("https://") {
         return vec![raw.to_string()];
     }
     // 不是 URL：尝试按 base64 解码为「多行 URL 列表」。
@@ -69,6 +71,30 @@ pub(crate) async fn add_subscriptions(
     };
     let proxy_opt = effective_proxy.as_deref();
 
+    // 条数上限：每个 URL 都是串行 fetch（单请求最长 20s 超时）。贴入一个含几百条
+    // 链接的 base64 合集会让这个 HTTP 请求挂住几十分钟，前端只是转圈。
+    const MAX_URLS_PER_REQUEST: usize = 50;
+    let expanded: Vec<String> = req
+        .urls
+        .iter()
+        .flat_map(|raw| expand_input_entry(raw))
+        .collect();
+    if expanded.len() > MAX_URLS_PER_REQUEST {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "一次最多添加 {MAX_URLS_PER_REQUEST} 个订阅地址（本次 {} 个），请分批添加",
+                expanded.len()
+            ),
+        ));
+    }
+
+    // 整批共用一个 client：`reqwest::Client` 自带连接池与 TLS 上下文，
+    // 逐 URL 重建等于每条链接都重新分配一份。
+    let shared_client = client_with_proxy(proxy_opt);
+    // 为保持原有逐条 continue 语义，这里只克隆一次成功分支的 client。
+    let client_template = shared_client.as_ref().ok().cloned();
+
     let mut new_subs: Vec<Subscription> = Vec::new();
 
     // 每个输入框条目可能是一个普通订阅 URL，也可能是一段 base64（解码后为
@@ -84,10 +110,14 @@ pub(crate) async fn add_subscriptions(
             sub.health.last_checked_at = Some(now);
 
             // fetch through the optional upstream proxy when the master switch is on
-            let client = match client_with_proxy(proxy_opt) {
-                Ok(c) => c,
-                Err(e) => {
-                    sub.health.last_error = Some(e);
+            let client = match &client_template {
+                Some(c) => c.clone(),
+                None => {
+                    sub.health.last_error = shared_client
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .or_else(|| Some("拉取代理不可用".to_string()));
                     new_subs.push(sub);
                     continue;
                 }
@@ -189,8 +219,19 @@ pub(crate) async fn add_subscriptions(
 pub(crate) async fn import_raw(
     State(state): State<AppState>,
     Json(req): Json<ImportReq>,
-) -> Json<CountResp> {
+) -> Result<Json<CountResp>, (StatusCode, String)> {
     let parsed = parse_subscription(&req.content);
+    // 0 个节点就是失败：以前仍会 push 一条空「本地导入」订阅并返回 200，
+    // 用户粘贴了错格式（HTML 错误页、纯说明文本）时看到的是「成功」，
+    // 列表里还多出一条永远空的订阅。与按 URL 添加的「0 节点即失败」口径一致。
+    if parsed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "没有解析出任何节点：请确认粘贴的是订阅链接列表、clash/mihomo YAML、\
+             sing-box 或 v2ray JSON 配置之一"
+                .to_string(),
+        ));
+    }
     // Drop duplicate nodes *within* a single paste by fingerprint, so a
     // copy-paste of an already-deduplicated list (or a list with repeats)
     // never inflates the subscription with identical entries. Cross-paste
@@ -240,22 +281,24 @@ pub(crate) async fn import_raw(
 
     persist_all(&state);
 
-    Json(CountResp {
+    Ok(Json(CountResp {
         added,
 
         total,
 
         subscriptions: state.store.lock_ok().len(),
-    })
+    }))
 }
 
 /// GET /api/subscriptions/export — dump the full subscription list (with
 /// each subscription's nodes and measured results) as a self-contained JSON
 /// document for backup / transfer.
 pub(crate) async fn export_subscriptions(State(state): State<AppState>) -> Json<SubExportDoc> {
-    let subs = state.store.lock_ok().clone();
-    let items: Vec<SubExportItem> = subs
-        .into_iter()
+    // 持锁时直接映射成导出条目：旧写法先 `clone()` 整个 store，再在 map 里
+    // 对 `s.proxies` 第二次深拷贝，等于把几千个节点复制两遍。
+    let guard = state.store.lock_ok();
+    let items: Vec<SubExportItem> = guard
+        .iter()
         .map(|s| SubExportItem {
             id: s.id.clone(),
             uid: s.uid.clone(),
@@ -265,6 +308,7 @@ pub(crate) async fn export_subscriptions(State(state): State<AppState>) -> Json<
             fetch_proxy: s.fetch_proxy.clone(),
             health_enabled: s.health.enabled,
             proxies: s.proxies.clone(),
+            // (持锁迭代，s 是 &Subscription —— 这里的 clone 是导出内容必需的一份拷贝)
             last_checked_at: s.health.last_checked_at,
             last_updated_at: s.health.last_updated_at,
             last_healthy_at: s.health.last_healthy_at,
@@ -362,6 +406,7 @@ pub(crate) async fn import_subscriptions(
                 } else {
                     existing_uid
                 };
+                sub.health.recompute(&sub.proxies);
                 guard[idx] = sub;
                 replaced += 1;
             } else {
@@ -371,6 +416,7 @@ pub(crate) async fn import_subscriptions(
                     sub.uid = it.uid.clone();
                 }
                 let idx = guard.len();
+                sub.health.recompute(&sub.proxies);
                 guard.push(sub);
                 added += 1;
                 // Register the freshly appended remote so a *second* entry with
@@ -447,13 +493,15 @@ pub(crate) async fn delete_proxy(
     Json(req): Json<DeleteProxyReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut found = false;
+    let mut removed_count = 0usize;
     let mut sub_name = String::new();
     {
         let mut guard = state.store.lock_ok();
         if let Some(sub) = guard.iter_mut().find(|s| s.id == req.sub_id) {
             let before = sub.proxies.len();
             sub.proxies.retain(|p| p.fingerprint() != req.fingerprint);
-            found = sub.proxies.len() != before;
+            removed_count = before - sub.proxies.len();
+            found = removed_count > 0;
             if found {
                 sub.health.recompute(&sub.proxies);
                 sub_name = sub.name.clone();
@@ -466,7 +514,8 @@ pub(crate) async fn delete_proxy(
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
-                "removed": 1,
+                // 同指纹理论上可能有多条，如实回报而不是硬编码 1。
+                "removed": removed_count,
                 "sub_id": req.sub_id,
                 "sub_name": sub_name,
             })),
@@ -690,6 +739,9 @@ pub(crate) async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_j
             new_nodes = added;
 
             sub.proxies = merged;
+            // 节点列表变了就重算派生健康计数，否则紧随其后的 persist_all
+            // 会把上一轮的 node_count / healthy / avg 写进库里。
+            sub.health.recompute(&sub.proxies);
 
             if let Some((up, dl, tot, exp)) = usage_hint {
                 sub.health.upload = up;

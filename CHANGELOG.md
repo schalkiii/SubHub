@@ -2,6 +2,48 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P28] 第七轮复核增强（解析保真 / 引擎健壮性 / 处理器一致性）
+
+按模块分头复核了此前几轮没细看的三块：`parse.rs`（订阅格式识别与字段还原）、`engine.rs`（外部引擎编排）、`handlers/*`（HTTP 处理器）。结论以单测 + 真实 `verge-mihomo.exe` 实跑为准。
+
+### Added
+
+- **v2ray / Xray JSON 可导入**：`outbounds[].protocol` + `settings.vnext[].users[]` / `settings.servers[]` + `streamSettings`（`tlsSettings` / `realitySettings` / `wsSettings` / `grpcSettings` / `httpSettings` / `xhttpSettings`），裸数组形态（v2rayN 的 `outbounds.json`、也是本项目 `to_v2ray_json` 的输出形状）同样支持。此前入口注释声称支持却完全没有对应分支：导入任何 v2ray/Xray 配置——**包括本项目自己导出的那份**——都得到 0 个节点且无任何提示。新增往返测试 `v2ray_export_round_trips_back_into_the_same_nodes`。
+- **sing-box 字段补全**：`flow`、REALITY（`tls.reality.enabled` / `public_key` / `short_id`）、uTLS 指纹（`tls.utls.fingerprint`）、socks/http 的 `username`。之前这些全丢：REALITY 节点被降级成普通 TLS（必然握手失败）、vision 节点丢了 flow 连不上、SOCKS 导出成无认证节点。
+- **用量字段宽容取值**：`download/upload/total` 接受数字、数字字符串与浮点；`expire` 额外支持日期字符串（`"2026-12-31 23:59:59"`，自实现 days-from-civil，不引 chrono）与微秒/纳秒时间戳。
+
+### Fixed
+
+- **字符串端口静默丢节点**：clash 的 `port: "443"`、sing-box 的 `"server_port": "8443"`、v2ray 的 `"port": 443` 与 `alterId: "1"` 都是真实生成器的常见写法，旧写法只认整数 → 整个节点被 `continue`/`return None` 掉，表现为「导入后节点数莫名少一批」。统一走 `port_from_yaml` / `port_from_json` / `u32_from_*`。
+- **UTF-8 BOM 让整份订阅解析为 0**：`trim()` 不剥 U+FEFF，带 BOM 的本地粘贴会让 base64 解码、`starts_with('{')`、`proxies:` 检测同时失效。
+- **URI query 键大小写敏感**：`?Type=ws` / `?SNI=` / `?Path=` / `?Host=` / `?allowInsecure` / `?serviceName` 被静默忽略（导出出错误传输、缺 SNI 的节点），`?Security=None` 反而被当成「启用了安全层」→ 明文节点强加 TLS。现统一小写存储 + 值大小写不敏感比较。
+- **userinfo 不做百分号解码**：密码里的 `%40` / `%3A` 按字面发出 → 认证失败、整节点全灭（query 值一直是解码的，userinfo 漏了）。
+- **`socks5://pass@host:1080`（单段 userinfo）凭据全丢**；`sing-box` 的 `tls: {enabled: false}` 被当成启用 TLS；sing-box 未知类型静默丢弃而 clash 分支保留为 `other`（口径不一致）；SSR 每节点一行 stderr（5000 节点刷 5000 行）→ 改为每次解析一行汇总。
+- **WireGuard 不再进 clash 导出**：模型里没有 private-key / peer 公钥 / allowed-ips 的容身处，导出的 `type: wireguard` 只有 name+server+port，而 mihomo 对缺必填键的 proxy 是**整份配置拒载** —— 一个 WG 节点能拖垮几千个正常节点。现在 `is_exportable(Wireguard) == false`：节点在列表里可见，导出与引擎前被过滤。
+- **引擎进程与临时目录泄漏**：`EngineGuard::drop` 只 `kill()` 就立刻 `remove_dir_all`，Windows 上 mihomo 还持有 `config.yaml` 句柄 → 删除必然失败且错误被吞，每批测速留下一个 `subhub-engine-*` 目录。现在有限等待进程真正退出（≤ ~500ms）再删，失败再重试一次。实测真实 mihomo 跑完后临时目录残留为 0。
+- **端口分配竞态**：`mixed-port` 与 `external-controller` 由两次「bind 后立刻释放」取得，可能拿到**同一个号**（listener 已关，OS 可立刻复用），mihomo 启动失败、整批节点静默回落 TCP；并发批次之间也会撞号。改为端口租约 `PortLease`：一批一次性取两个互不相同且未被占用的端口，引擎进程回收后才归还。
+- **`MAX_ENGINE_PROCESSES` 不再是全局上限**：信号量原先建在每次 `probe_all` 里，同时点「测速 / 出口地区 / 解锁」时存活引擎进程会成倍超过注释承诺的 4。改为进程级信号量 + 原有调用级上限双重约束。
+- **引擎故障与节点不通混为一谈**：引擎起不来时只有一行「未就绪」，用户看到的是「全部节点变成未实测」，无从判断是引擎坏了还是订阅坏了（判定语义本身是正确的：整批 `None` 走「只降级不升级」，不会把死节点标绿）。日志补上批大小与「引擎故障，非节点不通」。
+- **探测任务异常被静默吞掉**：shared 路径的 `if let Ok(..)` 会让 panic/被取消任务对应的节点在 SSE 里永远停在「未实测」且无日志；per-process 路径的 `unwrap_or_default()` 同理。现在写日志并保留返回向量与节点数等长（`n` 少于节点数时补齐，索引映射不会错位）。
+- **处理器一致性**：`cleanup_bad` / 刷新替换节点列表 / 备份恢复覆盖订阅后都补 `health.recompute()`（此前过期的 `node_count`/`healthy`/`avg` 会被 `persist_all` 写进库，重启后口径失真且与 `delete_proxy` 行为不一致）；`delete_proxy` 如实回报删除条数而非硬编码 1；`export_subscriptions` 不再「整库 clone + 每项再 clone 一次 proxies」。
+- **输入校验**：`POST /api/import` 解析出 0 个节点时返回 400 而不是悄悄落一条空订阅；`POST /api/subscriptions` 展开后超过 50 条地址直接拒绝（每个 URL 串行 fetch、单个最长 20s，贴入几百条合集会让请求挂住几十分钟）；`file://` / `ftp://` 不再被当成订阅链接建出永久 0 节点条目；`top_n` 与其他数值字段一样做 sanity clamp。
+- 文档注释错位：`settings.rs` 上方挂着的「streaming-unlock detection」注释属 `detect.rs`；`maintenance.rs` 的 `—/// so a proxy client` 排版残留；`engine.rs` 两处重复的 bin 存在性检查说明。
+
+### Performance
+
+- 一次请求共用一个 `reqwest::Client`（原来逐 URL 重建，每次重新分配连接池与 TLS 上下文）。
+- `nodes_top` 与 `/sub` 侧不再「把每个节点渲染成 JSON 后按字符串键查 score 排序」：类型化分数排序 + 只序列化真正返回的前 N 条。
+- 解析入口对 JSON 文档最多走一次 `serde_json` 解析路径（v2ray 分支只在含 `"protocol"` 时追加尝试），并去掉 base64 探测里对非 base64 输入的整串 `replace` 拷贝的必要性依赖（配合上一轮的 BOM/trim 收敛）。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**159 个测试全通过**（core 135 + server 24），本轮新增 11 个解析用例。
+- `cargo fmt --all -- --check` 通过；clippy `--all-targets -D warnings` 0 警告。
+- 隔离 DB 端到端 `docs/test_subhub.py` ALL CHECKS PASSED，新增「第七轮：格式识别与字段保真」用例组（v2ray JSON 导入、字符串端口、`tls.enabled=false`、大小写 query、百分号凭据、WG 不进导出、垃圾粘贴 400）。
+- **真实引擎实跑**：以 `verge-mihomo.exe` 为 `SUBHUB_ENGINE_BIN` 跑 SSE 测速，日志显示引擎正常启动就绪（0.5s）、delay 探测按预期返回 503→不可测，运行结束后 `%TEMP%` 下 `subhub-engine*` 目录残留 **0 个**（改动前每批都会留下一个）。
+- `cargo build --release -p subhub-app` 通过。
+- 测试环境注意：清库要连 `-wal` / `-shm` 一起删，只删 `.db` 会被 WAL 重放成上一轮的数据（本轮排查时踩过一次，表现为「回环节点带上了假的 last_tested_at」）。
+
 ## [P27] 第六轮复核增强（逻辑正确性 / 大节点库性能）
 
 本轮不再动 Surge 格式，改为按「逻辑正确性 + 性能」复核核心与服务端；性能结论全部来自同一台机器、同一份 fixture 的新旧二进制对照实测（debug 构建，取 15 次最小值）。

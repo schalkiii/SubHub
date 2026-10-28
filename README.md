@@ -35,6 +35,7 @@
 | **P25** | **第四轮增强：ALPN / TUIC 拥塞与中继参数 / Hysteria2 上下行 · 本地备份 uid 幂等 · 协议参考索引 · CI/fmt/LICENSE/历史归档** | ✅ |
 | **P26** | **第五轮增强：Surge 协议/传输边界（vless 整节点跳过、grpc/h2 跳过、去非官方键）· Surge 补 Hysteria2/TUIC/AnyTLS/SOCKS/HTTP · Trojan 传输全格式 · 带宽单位换算 · TUIC UDP 承载互斥 · 导入同批重复 URL 幂等** | ✅ |
 | **P27** | **第六轮增强：逻辑正确性（SS 指纹归一 cipher/method、降序对 name/type 生效、地区改名去重、死节点不进延迟、NaN 带宽不误删、schema 变化容错恢复、停用的订阅不进后台任务）+ 大节点库性能（端点级测速缓存 6.3×、列表接口先排序后序列化 3.0×、按行摘要落库、去掉整库深拷贝、SSE 断开即取消）** | ✅ |
+| **P28** | **第七轮增强：解析保真（v2ray/Xray JSON 可导入并往返、sing-box `flow`/REALITY/`tls.enabled`、字符串端口与 aid、query 键大小写不敏感、userinfo 百分号解码、BOM、日期型 expire、微秒时间戳、未知类型落到 other、WireGuard 不再进导出）+ 引擎健壮性（端口租约、进程退出后再删临时目录、引擎进程全局上限、取消传播、故障与节点不通可区分）+ 处理器一致性（派生健康计数重算、垃圾粘贴返回 400、URL 条数上限与 client 复用、导出零多余拷贝）** | ✅ |
 
 ## 架构
 
@@ -265,6 +266,20 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - 支持的算子参数：`sort`（`name`/`latency`/`tcplat`/`httplat`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（从可导出且未判死的节点中保留评分最高的前 N 个；`top_n=0` = 全部并覆盖全局设置，缺省才回落全局）、`min_bw`（带宽下限，**字节/秒**，与 `download_speed_bps` 同单位，仅对历史实测带宽生效）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
 - 注意：分享网址只编码**包含类**筛选（名称/地区用 `contains`、类型用 `exact`）；**排除 / 正则类**筛选无法编码进网址，遇到时会提示，需要那种效果请改用「合并并导出」手动导出。
 
+### 订阅内容格式自动识别（导入侧）
+
+`POST /api/import`、`POST /api/subscriptions` 与本地订阅地址共用同一个解析入口 `parse_subscription()`，会自动识别并**混合处理**下列形态（一份文档里同时有 YAML 块和 `vmess://` 行也能全部收进来）：
+
+| 形态 | 说明 |
+|---|---|
+| 明文 URI 列表 | `ss://` / `vmess://` / `vless://`（含 **REALITY** `pbk`/`sid`/`fp`）/ `trojan://` / `hysteria2://` / `tuic://` / `anytls://` / `socks5://` / `http(s)://`，每行一条，行尾 `#名字` 支持百分号编码 |
+| base64 包裹 | 上面任一形态或 clash YAML 的 base64（标准 / URL-safe × 有 / 无 padding 四种都会试，支持最多两层嵌套 base64） |
+| clash / mihomo YAML(`proxies:`) | 也接受 `proxy-providers` 之外的常见嵌套字段（`ws-opts` / `h2-opts` / `grpc-opts` / `reality-opts` / `plugin-opts` / `obfs`）。`port` / `alterId` 允许字符串写法 |
+| sing-box JSON(`outbounds[]` + `type`) | `tls.enabled`、`tls.reality`、`tls.utls.fingerprint`、`transport`、`flow`、`username` 都会还原 |
+| v2ray / Xray JSON(`outbounds[]` + `protocol`) | `settings.vnext[].users[]` / `settings.servers[]` + `streamSettings`（`tlsSettings` / `realitySettings` / `wsSettings` / `grpcSettings` / `httpSettings`）。**本项目导出的 v2ray 配置可再被导入**（裸数组形态同样支持） |
+
+鲁棒性约定：UTF-8 BOM、CRLF、行内注释与 HTML 错误页都不会让整份订阅解析成空；`?Type=ws&SNI=…` 这类大写 query 键与 `%40` 编码的凭据都能正确还原；未知协议类型统一落到 `other`（列表里可见、导出前过滤并打日志），SSR 在解析阶段丢弃并按批汇总打日志。
+
 ### 导出格式
 `clash-meta`（默认）· `clash` · `v2ray`（v2rayN outbounds 数组）· `sing-box`（outbounds）· `surge` · `base64`（clash yaml 的 base64）。
 
@@ -289,7 +304,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 | Hysteria2 | ✅ | ✅ | — | ✅ | ✅ | obfs（salamander / gecko）、上下行带宽、ALPN；v2ray-core 无法表示；sing-box 强制 TLS；Surge 用 `salamander-password=` 单键、只认下行带宽数字 |
 | TUIC | ✅ | ✅ | — | ✅ | ✅ | 拥塞控制 / UDP 中继模式 / UDP-over-Stream / 0-RTT / ALPN；v2ray-core 无法表示；Surge 导出 `uuid/password/version=5`，QUIC 调优参数无对应键 |
 | SOCKS5 / HTTP(S) | ✅ | ✅ | — | ✅ | ✅ | HTTP 443 端口按 TLS 处理；Surge 用位置参数传凭据（`socks5, host, port, user, pass`），TLS 时分别为 `socks5-tls` / `https` |
-| WireGuard | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出（Surge 需独立 `[WireGuard]` 段，暂未支持） |
+| WireGuard | ✅（仅类型/地址） | ❌ | — | ❌ | ❌ | **模型里没有 private-key / peer 公钥 / allowed-ips，键材料无处存放**：缺必填键的 `type: wireguard` 条目会让 mihomo **整份配置拒载**，因此解析出来可看、导出前一律过滤（历史上一个 WG 节点就能让几千个正常节点一起失效） |
 | AnyTLS | ✅ | ✅ | — | — | ✅ | clash-meta 与 Surge（`anytls` + `password`/`sni`/`tls-fingerprint`）可导出 |
 | SSR | 跳过 | — | — | — | — | mihomo / Clash.Meta 不支持，导入时直接丢弃并打日志 |
 | Other（未知类型） | ✅ | — | — | — | — | 客户端会拒绝，导出前统一过滤 |
@@ -299,6 +314,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - SS 的 `v2ray-plugin` 只能导出到 clash / sing-box；v2ray 与 Surge 不支持该插件，导出时会跳过并打日志（obfs 在 Surge 中可用）。
 - Hysteria2 的 `ports` / `hop-interval`（端口跳跃）与 Gecko 包大小、TUIC 的 `heartbeat` / `fast-open` / `disable-sni` / `max-open-streams` 等少数调优参数尚未解析。
 - sing-box 导出跳过 WireGuard / AnyTLS；v2ray 导出跳过 Hysteria2 / TUIC / SOCKS5 / HTTP / WireGuard / AnyTLS（会打印跳过数量）。
+- WireGuard 目前**只解析不导出**（见上表）：需要 WG 请用上游原始配置，SubHub 不会把它塞进 clash / sing-box 订阅。
 - **Surge 侧丢字段**（键位不存在，只丢参数不丢节点）：Hysteria2 的上行带宽、TUIC 的拥塞控制与 UDP 中继模式、`alpn` 多值（Surge 需要引号包裹，只输出单值）。
 - TUIC 开启 `udp-over-stream` 时不再输出 `udp-relay-mode`（两者是互斥的 UDP 承载方式，同时给出会让内核忽略其一）。
 - `base64` 格式是 **clash-meta YAML 的 base64**，不是 v2rayN 的 URI 列表 base64。

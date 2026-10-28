@@ -80,7 +80,9 @@ pub(crate) fn apply_settings(state: &AppState, req: SettingsReq) -> SettingsResp
     }
 
     // Top-N export size: persisted so it survives restarts.
+    // 上限与其他数值字段一样做 sanity clamp（0 = 不限量，仍允许）。
     if let Some(n) = req.top_n {
+        let n = if n > 100_000 { 100_000 } else { n };
         *state.top_n.lock_ok() = n;
         if let Some(db) = &state.db {
             db.meta_set("top_n", &n.to_string());
@@ -174,9 +176,6 @@ pub(crate) fn apply_settings(state: &AppState, req: SettingsReq) -> SettingsResp
     build_settings_resp(state)
 }
 
-/// BestSub-style streaming-unlock detection: route each proxy through the
-/// external engine and probe the streaming services, persisting the per-service
-/// unlock matrix back onto each proxy. No-op (empty matrix) without an engine.
 /// Patch global runtime settings (persisted to the SQLite `meta` table).
 pub(crate) async fn set_settings(
     State(state): State<AppState>,

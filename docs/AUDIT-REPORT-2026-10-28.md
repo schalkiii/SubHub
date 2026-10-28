@@ -488,3 +488,66 @@
 - 为 `region()` / `score_proxy()` 做跨请求记忆化：需要给 `Proxy` 加内部可变缓存字段，代价与风险大于收益；改为保证「每个请求每个节点只算一次」。
 - `/sub` 全链路零拷贝（导出仍需要 owned 节点副本）；SQLite 改为按节点建表存储（当前快照模型在此规模下足够，且没有 schema 漂移风险）。
 - 测速 `measure_send_throughput` 的 1 s 预算不动：它是无引擎时「速度」列的唯一数据来源，缩短会牺牲读数质量。
+
+---
+
+## 十二、第七轮复核增强（2026-10-28 完成，P28）
+
+按模块分头复核此前未细看的三块：`core/src/parse.rs`（格式识别与字段还原）、`server/src/engine.rs`（外部引擎编排）、`server/src/handlers/*`（HTTP 处理器）。所有结论都经代码核实后才动手，性能/健壮性结论以单测与真实 `verge-mihomo.exe` 实跑为准。
+
+### 12.1 解析层问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| S1 | `parse.rs` JSON 分支 | 只有 sing-box 分支（`type` + 扁平字段），v2ray/Xray 形状（`protocol` + `settings.vnext/servers` + `streamSettings`）完全不认，**包括本项目 `to_v2ray_json` 自己的输出**：导入得 0 节点且无提示 | 高 | 新增 `parse_v2ray_json` + `v2ray_outbound`（含裸数组形态、`wsSettings`/`grpcSettings`/`httpSettings`/`xhttpSettings`/`realitySettings`/`tlsSettings`）；测试 `v2ray_json_config_is_parsed_including_reality`、`v2ray_export_round_trips_back_into_the_same_nodes` |
+| S2 | `parse.rs` sing-box 分支 | 不读 `flow`、REALITY、`tls.utls.fingerprint`、`username`：REALITY 降级成普通 TLS、vision 节点丢 flow、SOCKS 导出成无认证 | 高 | 全部补齐，并与 clash 侧同一存放位置；测试 `singbox_string_port_tls_object_and_flow_are_parsed` / `singbox_socks_username_is_kept_and_unknown_type_becomes_other` |
+| S3 | `from_clash_value` / sing-box / v2ray | 端口与 `alterId` 只认整数，`port: "443"` 这类字符串写法整节点静默丢弃 | 高 | `port_from_yaml/json`、`u32_from_yaml/json`（数字、数字字符串、整值浮点都接受，0/>65535 与溢出仍拒绝）；测试 `clash_string_port_and_aid_are_accepted`、端到端字符串端口用例 |
+| S4 | `parse_subscription_depth` | `trim()` 不剥 UTF-8 BOM，带 BOM 的粘贴让 base64/`{`/`proxies:` 三种检测同时失效 → 0 节点 | 高 | 先剥 BOM 再 trim；测试 `bom_prefixed_subscription_is_parsed` |
+| S5 | `split_authority` | query 键大小写敏感：`?Type=ws`、`?SNI=`、`?Path=`、`?Host=`、`?allowInsecure`、`?serviceName` 被忽略，`?Security=None` 反被判成启用 TLS | 高 | 键统一小写存储、值 `eq_ignore_ascii_case` 比较，读取侧同步；测试 `uri_query_keys_and_security_are_case_insensitive` |
+| S6 | `split_authority` | userinfo 不做百分号解码（query 值一直有解码），密码含 `%40`/`%3A` 按字面发出 → 认证失败 | 高 | userinfo 走 `decode_percent`；测试 `percent_encoded_userinfo_is_decoded` |
+| S7 | sing-box / clash | 未知类型口径不一致：clash 落到 `other`（可见、导出过滤），sing-box 直接丢弃且无日志 | 中 | sing-box 也落到 `other`，并在一次解析后汇总一行未知类型日志 |
+| S8 | `parse_socks` | `socks5://pass@host`（无冒号）既不填用户名也不填密码 → 导出成无认证节点 | 中 | 单段 userinfo 按口令处理；测试 `socks_single_segment_userinfo_is_kept_as_password` |
+| S9 | `normalize_epoch` | 只处理「<1e12 乘 1000」，16 位**微秒**时间戳原样返回 → 面板显示几万年后的到期时间 | 中 | 按数量级归一（秒/毫秒/微秒/纳秒）；测试 `usage_accepts_string_numbers_and_date_expires` |
+| S10 | `extract_subscription_usage` | 只认整数：`"100"`、`3.0`、`"2026-12-31 23:59:59"` 全部变 None，流量卡片/到期时间空掉 | 中 | `yaml_u64` 宽容取值 + `date_str_to_epoch_ms`（days-from-civil，不引 chrono，非法日期返回 None）；测试 `date_str_to_epoch_ms_matches_known_instants` |
+| S11 | `parse_ssr` | 每个 SSR 节点一行 eprintln（5000 节点 = 5000 行 stderr） | 低 | URI 循环里计数、每次解析一行汇总 |
+| S12 | WireGuard | 解析接受但模型无 private-key/peer/allowed-ips 可存放，导出的 `type: wireguard` 只有 name+server+port，而 mihomo 对缺必填键的 proxy 是**整份配置拒载** | 高 | `is_exportable(Wireguard) = false`（节点可见、导出与引擎前过滤）；README 协议矩阵同步；端到端断言 WG 不进 clash 导出 |
+
+### 12.2 引擎编排问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| E1 | `EngineGuard::drop` | `kill()` 后不等待进程退出就 `remove_dir_all`，Windows 上 mihomo 还持有 `config.yaml` 句柄 → 删除失败且错误被 `let _` 吞掉，每批测速留下一个临时目录（也无人回收进程） | 高 | 有限轮询等退出（≤ ~500ms）再删，失败重试一次；真实 mihomo 实跑后 `%TEMP%\subhub-engine*` 残留 0 个 |
+| E2 | `free_port` 两次调用 | bind-即-释放有 TOCTOU；同批两次调用可能拿到同一个号 → `mixed-port == external-controller`，mihomo 启动失败、整批 100 节点静默回落 TCP；并发批次之间也会撞号 | 中 | `alloc_ports(n)` + `PortLease`：一次性取互不相同且未被占用的端口，进程回收后才归还；旧的 `free_port` 删除 |
+| E3 | `MAX_ENGINE_PROCESSES` | 信号量建在每次 `probe_all` 内，只约束单次调用；「测速 + 出口地区 + 解锁」并发时存活引擎进程成倍超过承诺的硬上限 4 | 中 | 进程级信号量（`OnceLock`）叠加原有调用级上限 |
+| E4 | shared 路径任务回收 | `if let Ok(..)` 丢弃 join 错误：panic/被取消的节点既无结果也无回调，前端那一行永远停在「未实测」且日志无痕；per-process 路径 `unwrap_or_default()` 同样，且 `n` 小于节点数时返回向量会与输入索引错位 | 中 | 两处都写日志，并保证返回向量与节点数等长 |
+| E5 | 引擎就绪失败 | 只有一行「未就绪」，用户看到「全部节点未实测」，无法区分引擎坏了还是订阅坏了（判定语义本身正确：整批 `None` 走「只降级不升级」，不会把死节点标绿） | 低 | 日志补上批大小与「引擎故障，非节点不通」 |
+| E6 | 注释/死码 | `ProbeTask.concurrency` 文档称「会被 clamp 到 MAX」但 shared 路径不使用；重复的 bin 存在性检查；`EngineGuard` 文档注释粘连 | 低 | 文档与注释订正 |
+
+### 12.3 处理器层问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| H1 | `maintenance.rs::cleanup_bad`、`subscription.rs::do_refresh_one`、`import_subscriptions` | 替换/删除节点列表后不 `health.recompute()`，过期的 `node_count`/`healthy`/`avg` 被 `persist_all` 写进库，重启后直接读持久化健康数的口径全部失真，且与 `delete_proxy`（有重算）不一致 | 中 | 三处补重算 |
+| H2 | `subscription.rs::import_raw` | 解析出 0 节点仍 push 一条空「本地导入」订阅并返回 200 | 中 | 返回 400（WebUI 已能显示 `导入失败：HTTP 400: …`），不落空订阅 |
+| H3 | `subscription.rs::add_subscriptions` | `req.urls` 条数无上限（base64 展开后同样不限制），每条串行 fetch（单个最长 20s）且逐条重建 `reqwest::Client` | 中 | 展开后上限 50 条并给出明确错误；整批共用一个 client |
+| H4 | `expand_input_entry` | 只要含 `://` 就当作订阅链接，`file://` / `ftp://` 会建出永久 0 节点的垃圾订阅 | 低 | 只认 http/https |
+| H5 | `delete_proxy` | `retain` 理论上可删多条同指纹节点，响应硬编码 `removed: 1` | 低 | 回报真实条数 |
+| H6 | `export_subscriptions` | `store.clone()` 之后又对每项 `s.proxies.clone()`，等于整库深拷贝两遍 | 中 | 持锁直接映射成导出条目 |
+| H7 | `maintenance.rs::nodes_top` | 持 store 锁把每个节点渲染成 JSON，再按字符串键查 score 排序、全量返回 | 中 | 类型化分数排序（同分保持原插入序）+ 只序列化返回的前 N 条 + `n` sanity 上限 |
+| H8 | `settings.rs` | `top_n` 无上限（同函数其他数值字段都有 clamp）；一段 streaming-unlock 文档注释错位挂在 `set_settings` 上 | 低 | clamp + 注释归位 |
+| H9 | 锁与凭据纪律复核 | — | — | 未发现跨 `.await` 持 store 锁；错误串路径仍全部走 `without_url()` / `redact_url()`；`POST /api/subscriptions` 成功响应回显 `source`（含 token）与列表接口既有行为一致，未改 |
+
+### 12.4 验证
+
+- `cargo test -p subhub-core -p subhub-server`：**159 个测试全通过**（core 135 + server 24），本轮新增 11 个解析用例。
+- `cargo fmt --all -- --check` 与 clippy `--all-targets -D warnings` 清零。
+- 隔离 DB 端到端 ALL CHECKS PASSED，新增第七轮格式识别用例组（v2ray JSON 导入、字符串端口、`tls.enabled=false`、大小写 query、百分号凭据、WG 不进导出、垃圾粘贴 400）。
+- 真实引擎实跑（`verge-mihomo.exe` 作 `SUBHUB_ENGINE_BIN`，SSE 测速）：引擎启动就绪 0.5s、delay 探测按预期 503→不可测、结束后临时目录残留 0 个。
+- `cargo build --release -p subhub-app` 通过。
+
+### 12.5 本轮明确不做
+
+- WireGuard 键材料建模（需要 private-key / peers / allowed-ips 一整组字段与 clash `wg-opts` 的双形状映射），当前只保证「不拖垮整份配置」。
+- `proxy-providers:` 的惰性拉取（Provider 只声明 URL，展开需要网络与二次解析，属功能设计而非缺陷）。
+- `hysteria://`（v1，参数为 `auth=`）按 HY2 形状解析的兼容层——这类节点仍会被丢弃，需要真实样本再定；`decode_form` 的 `+`→空格语义会改动已通过测试的 name 编码，暂不动以免引入回归。
+- 引擎测速就绪等待（两个端口串行轮询）改并行、geo/解锁多 channel 并发：需要真实节点样本反复实测，收益在手动操作路径上，风险在可用性判定上，留待有实测条件时再做。

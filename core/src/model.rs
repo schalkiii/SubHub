@@ -1069,9 +1069,15 @@ impl Proxy {
             ProxyType::Vless => has(&self.uuid) && (!self.reality || has(&self.reality_public_key)),
             ProxyType::Hysteria2 => has(&self.password),
             ProxyType::Tuic => has(&self.uuid) && has(&self.password),
-            // Socks5 / Http / Wireguard: no strict required fields.
+            // Socks5 / Http: no strict required fields.
             // Other: unknown type that clash-meta/mihomo will reject outright → skip.
-            ProxyType::Socks5 | ProxyType::Http | ProxyType::Wireguard => true,
+            //
+            // Wireguard 也必须判 false：模型里没有 private-key / peer 公钥 /
+            // allowed-ips，解析器无从填充，导出的 `type: wireguard` 只有
+            // name+server+port —— 而 mihomo 对缺必填键的 proxy 是**整份配置拒载**，
+            // 一个 WG 节点就能让几千个正常节点一起失效。宁可跳过并打日志。
+            ProxyType::Socks5 | ProxyType::Http => true,
+            ProxyType::Wireguard => false,
             _ => false,
         }
     }

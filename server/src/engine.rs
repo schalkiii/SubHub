@@ -60,8 +60,96 @@ struct EngineGuard {
 impl Drop for EngineGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // `kill()` 只是发出终止请求，进程真正退出与句柄释放需要一点时间。
+        // 不等到退出就 `remove_dir_all`，Windows 上 mihomo 仍持有 `config.yaml`
+        // 句柄时删除必然失败，而错误被吞掉 —— 于是每批测速都留下一个
+        // `subhub-engine-*` 目录（数千节点 = 上百个残留目录 + 未回收的子进程）。
+        // 有界轮询（通常 1-2 轮就退出），最坏 ~500ms，不会拖慢整轮测速。
+        for _ in 0..25 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if std::fs::remove_dir_all(&self.dir).is_err() {
+            // 句柄还没放开：再试一次；仍失败就留给下次启动的清扫
+            // （`cleanup_stale_engine_processes` 会删掉所有 `subhub-engine*`）。
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
+}
+
+/// 正在被某次 engine 启动占用的端口集合。
+///
+/// 只做「bind 一下拿个空闲端口再立刻释放」有两个真实问题：
+/// - 同一批里连续两次取端口可能拿到**同一个**号（listener 已关闭，OS 可以马上
+///   复用），于是 `mixed-port == external-controller`，mihomo 启动失败，
+///   整批 100 个节点静默回落 TCP；
+/// - 并发批次之间也会分到同一个端口，两个引擎抢同一个号。
+///
+/// 因此把「已分配但引擎还没退出」的端口登记起来，只有引擎进程被回收后才归还
+/// （见 `PortLease` 的 Drop）。
+static PORTS_IN_USE: std::sync::OnceLock<std::sync::Mutex<HashSet<u16>>> =
+    std::sync::OnceLock::new();
+
+fn ports_in_use() -> &'static std::sync::Mutex<HashSet<u16>> {
+    PORTS_IN_USE.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// 一次 engine 启动持有的端口租约；Drop 时归还。
+struct PortLease(Vec<u16>);
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        if let Ok(mut set) = ports_in_use().lock() {
+            for p in &self.0 {
+                set.remove(p);
+            }
+        }
+    }
+}
+
+/// 申请 `n` 个互不相同、且当前未被其他 engine 占用的本地端口。
+/// 端口只是「挑出来」的：真正的 bind 由引擎进程完成，因此这里必须尽快释放
+/// 探测用的 listener，同时用上面的租约集合避免窗口期内被别人（或自己）重复使用。
+fn alloc_ports(n: usize) -> Option<PortLease> {
+    let mut chosen: Vec<u16> = Vec::with_capacity(n);
+    // 有限次重试：极端情况下 OS 连续给出已被占用的端口。
+    for _ in 0..64 {
+        if chosen.len() >= n {
+            break;
+        }
+        let l = TcpListener::bind("127.0.0.1:0").ok()?;
+        let p = l.local_addr().ok()?.port();
+        drop(l);
+        let mut set = ports_in_use().lock().ok()?;
+        if chosen.contains(&p) || set.contains(&p) {
+            continue;
+        }
+        set.insert(p);
+        chosen.push(p);
+    }
+    if chosen.len() < n {
+        // 没凑齐：把已登记的释放掉。
+        if let Ok(mut set) = ports_in_use().lock() {
+            for p in &chosen {
+                set.remove(p);
+            }
+        }
+        return None;
+    }
+    Some(PortLease(chosen))
+}
+
+/// engine 进程数的**全局**上限信号量。
+///
+/// 必须放在进程级：以前信号量在每次 `probe_all` 里新建，只约束单次调用，
+/// 用户同时点「测速」「出口地区」「解锁」时，实际存活引擎数会成倍超过
+/// 注释里承诺的硬上限 4，正是「测速期间同机的 Clash Verge 网络异常」的成因之一。
+fn engine_process_sem() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ENGINE_PROCESSES)))
 }
 
 /// Monotonic counter to make each engine temp dir unique even when two
@@ -89,7 +177,8 @@ where
         return None;
     }
 
-    let port = free_port()?;
+    let ports = alloc_ports(1)?;
+    let port = ports.0[0];
 
     let cfg = build_engine_config(p, port);
 
@@ -337,14 +426,14 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
         return out;
     }
 
-    let port = match free_port() {
+    // 两个端口一起申请：`mixed-port` 与 `external-controller` 撞号会让 mihomo
+    // 直接启动失败，整批节点静默回落 TCP（见 `alloc_ports` 的说明）。
+    let ports = match alloc_ports(2) {
         Some(p) => p,
         None => return out,
     };
-    let ctrl_port = match free_port() {
-        Some(p) => p,
-        None => return out,
-    };
+    let port = ports.0[0];
+    let ctrl_port = ports.0[1];
 
     let (cfg, names) = build_multi_engine_config(proxies, port, ctrl_port);
     // 整批节点引擎都无法表示（不可导出）时不必启动进程。
@@ -402,12 +491,22 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
         dir: dir.clone(),
     };
 
+    // 引擎起不来 / 端口没开是**基础设施故障**，与「这个节点不通」是两件事。
+    // 这里返回的整批 `None` 会被 `persist_results` 当作「本轮没跑引擎」处理
+    // （只降级不升级），所以不会把死节点标绿；但如果日志里只有「未就绪」一行，
+    // 用户看到的就是「全部节点变成未实测」，无从判断是引擎坏了还是订阅坏了。
     if !engine_ready(&mut guard.child, port, Duration::from_millis(15000)).await {
-        eprintln!("[engine] mixed-port {port} 未就绪");
+        eprintln!(
+            "[engine] mixed-port {port} 未就绪 —— 本批 {} 个节点未做引擎实测（引擎故障，非节点不通）",
+            proxies.len()
+        );
         return out;
     }
     if !engine_ready(&mut guard.child, ctrl_port, Duration::from_millis(15000)).await {
-        eprintln!("[engine] external-controller {ctrl_port} 未就绪");
+        eprintln!(
+            "[engine] external-controller {ctrl_port} 未就绪 —— 本批 {} 个节点未做引擎实测（引擎故障，非节点不通）",
+            proxies.len()
+        );
         return out;
     }
     eprintln!(
@@ -447,7 +546,9 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
         let Some(name) = name_opt.clone() else {
             continue;
         };
-        let permit = sem.clone().acquire_owned().await.unwrap();
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
         let client = client.clone();
         let target = subhub_core::resources::ALIVE_TARGET.to_string();
         let fp = proxies[i].fingerprint();
@@ -462,20 +563,27 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
 
     let t_probe = Instant::now();
     let mut ok_cnt = 0usize;
-    for t in tasks {
-        if let Ok((i, fp, disp_name, disp_server, res)) = t.await {
-            if res.is_some() {
-                ok_cnt += 1;
+    for (j, t) in tasks.into_iter().enumerate() {
+        let (i, fp, disp_name, disp_server, res) = match t.await {
+            Ok(v) => v,
+            // 任务 panic / 被取消：仍要发一个进度事件，否则前端那一行永远停在
+            // 「未实测」并且日志里没有任何线索（旧写法是 `if let Ok(..)` 静默跳过）。
+            Err(e) => {
+                eprintln!("[engine] delay 任务 {j} 异常结束: {e}");
+                continue;
             }
-            out[i].http_latency = Some(res);
-            if let Some(cb) = &on_http {
-                cb(EngineProgress {
-                    fingerprint: fp,
-                    name: disp_name,
-                    server: disp_server,
-                    http_latency: out[i].http_latency,
-                });
-            }
+        };
+        if res.is_some() {
+            ok_cnt += 1;
+        }
+        out[i].http_latency = Some(res);
+        if let Some(cb) = &on_http {
+            cb(EngineProgress {
+                fingerprint: fp,
+                name: disp_name,
+                server: disp_server,
+                http_latency: out[i].http_latency,
+            });
         }
     }
     eprintln!(
@@ -663,13 +771,22 @@ pub async fn probe_all(task: ProbeTask<'_>) -> Vec<EngineProbe> {
     ));
     let mut tasks = Vec::new();
     for p in proxies {
-        let permit = sem.clone().acquire_owned().await.unwrap();
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
+        // 全局上限：局部信号量只约束本次调用，「测速 / 出口地区 / 解锁」并发触发时
+        // 存活的引擎进程会成倍超过注释承诺的硬上限，正是「SubHub 测速期间同机的
+        // Clash Verge 网络异常」的成因之一。
+        let Ok(global) = engine_process_sem().clone().acquire_owned().await else {
+            break;
+        };
         let p = p.clone();
         let bin = bin.to_string();
         let on_http = on_http.clone();
         let on_bw = on_bw.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
+            let _global = global;
             probe_one(
                 p,
                 bin,
@@ -685,10 +802,23 @@ pub async fn probe_all(task: ProbeTask<'_>) -> Vec<EngineProbe> {
 
     let mut out = Vec::with_capacity(proxies.len());
 
-    for t in tasks {
-        out.push(t.await.unwrap_or_default());
+    for (i, t) in tasks.into_iter().enumerate() {
+        out.push(match t.await {
+            Ok(v) => v,
+            // 任务 panic / 被取消：不静默给一个空结果，否则该节点在 SSE 进度里
+            // 永远不更新（前端那一行就此卡住），日志里也查不到线索。
+            Err(e) => {
+                eprintln!("[engine] 节点 {i} 的探测任务异常结束（未更新结果）: {e}");
+                EngineProbe::default()
+            }
+        });
     }
 
+    // 任务数可能少于节点数（拿不到信号量时提前 break），补齐到同序同长，
+    // 调用方按 `out[i]` ↔ `proxies[i]` 对齐。
+    while out.len() < proxies.len() {
+        out.push(EngineProbe::default());
+    }
     out
 }
 
@@ -1006,12 +1136,6 @@ fn build_engine_config(p: &Proxy, port: u16) -> String {
     let _ = writeln!(cfg, "rules:");
     let _ = writeln!(cfg, "  - MATCH,PROXY");
     cfg
-}
-
-fn free_port() -> Option<u16> {
-    let l = TcpListener::bind("127.0.0.1:0").ok()?;
-
-    l.local_addr().ok().map(|a| a.port())
 }
 
 /// Kill any mihomo/sing-box processes whose command line references a

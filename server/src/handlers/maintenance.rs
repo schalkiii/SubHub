@@ -22,7 +22,14 @@ pub(crate) async fn cleanup_bad(State(state): State<AppState>) -> Json<serde_jso
 
             sub.proxies.retain(|p| p.available != Some(false));
 
-            removed += before - sub.proxies.len();
+            let gone = before - sub.proxies.len();
+            removed += gone;
+            // 派生计数（node_count / healthy / avg / best）必须随节点列表一起更新：
+            // 否则紧随其后的 persist_all 会把过期计数写进库，重启后所有直接读
+            // 持久化健康数的口径都是旧的（与 delete_proxy 的行为也不一致）。
+            if gone > 0 {
+                sub.health.recompute(&sub.proxies);
+            }
         }
     }
 
@@ -87,41 +94,67 @@ pub(crate) async fn nodes_top(
     State(state): State<AppState>,
     Query(q): Query<TopNQuery>,
 ) -> Json<Vec<serde_json::Value>> {
+    struct TopRow<'a> {
+        p: &'a Proxy,
+        sub_id: &'a str,
+        sub_name: &'a str,
+        score: f64,
+        idx: usize,
+    }
+
     let guard = state.store.lock_ok();
-    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<TopRow> = Vec::new();
+    let mut idx = 0usize;
     for sub in guard.iter() {
         for p in &sub.proxies {
             // Top-N 列表只展示可导出且未判死的节点，与导出/订阅口径一致。
-            if !p.is_usable() {
-                continue;
+            if p.is_usable() {
+                rows.push(TopRow {
+                    p,
+                    sub_id: &sub.id,
+                    sub_name: &sub.name,
+                    score: score_proxy(p),
+                    idx,
+                });
+                idx += 1;
             }
-            let mut v = serde_json::to_value(p).unwrap_or(serde_json::Value::Null);
+        }
+    }
+    // 客户端传来的 n 与设置项同样受 sanity 上限约束（0 = 全部）。
+    let n = q.n.unwrap_or(*state.top_n.lock_ok()).min(100_000);
+    // 排序走类型化的分数，而不是把每个节点先渲染成 JSON、再按字符串键查
+    // `score` 比较；`idx` 兜底保证同分时仍是原来的插入顺序（稳定语义）。
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.idx.cmp(&b.idx))
+    });
+    let take = if n == 0 { rows.len() } else { n as usize };
+    // 只序列化真正返回的这 take 条。
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .take(take)
+        .map(|r| {
+            let mut v = serde_json::to_value(r.p).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("sub_id".into(), serde_json::Value::String(sub.id.clone()));
+                obj.insert("sub_id".into(), serde_json::Value::String(r.sub_id.into()));
                 obj.insert(
                     "sub_name".into(),
-                    serde_json::Value::String(sub.name.clone()),
+                    serde_json::Value::String(r.sub_name.into()),
                 );
                 obj.insert(
                     "region".into(),
-                    serde_json::Value::String(p.effective_region()),
+                    serde_json::Value::String(r.p.effective_region()),
                 );
                 obj.insert(
                     "score".into(),
-                    serde_json::to_value(score_proxy(p)).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(r.score).unwrap_or(serde_json::Value::Null),
                 );
             }
-            all.push(v);
-        }
-    }
-    let n = q.n.unwrap_or(*state.top_n.lock_ok());
-    all.sort_by(|a, b| {
-        let sa = a.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
-        let sb = b.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let take = if n == 0 { all.len() } else { n as usize };
-    let items: Vec<serde_json::Value> = all.into_iter().take(take).collect();
+            v
+        })
+        .collect();
     Json(items)
 }
 
@@ -178,7 +211,7 @@ pub(crate) async fn merge_export(
 
 /// Direct-pull local subscription endpoint. Merges every (or a subset of)
 /// subscription, applies the optional URL-encoded transform, and returns the
-/// resulting subscription as **raw text** with a client-friendly content type —/// so a proxy client (mihomo / clash / v2rayN / sing-box) can subscribe to
+/// resulting subscription as **raw text** with a client-friendly content type, so a proxy client (mihomo / clash / v2rayN / sing-box) can subscribe to
 /// `http://127.0.0.1:3005/sub` directly. No JSON wrapper, no auth.
 pub(crate) async fn sub_export(
     State(state): State<AppState>,

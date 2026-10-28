@@ -1,5 +1,6 @@
 import json
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -224,6 +225,138 @@ def main():
     assert '"realitySettings"' in v2_all and '"publicKey": "PUBKEY"' in v2_all
     print("  ✅ REALITY fields survive clash / sing-box / v2ray export")
 
+    print("== 第七轮：格式识别与字段保真（导入侧） ==")
+    # v2ray/Xray JSON：入口一直声称支持，实际解析出 0 个节点（含本项目自己的导出）。
+    v2ray_doc = json.dumps(
+        {
+            "outbounds": [
+                {
+                    "tag": "R7-VMess-WS",
+                    "protocol": "vmess",
+                    "settings": {
+                        "vnext": [
+                            {
+                                "address": "127.0.0.1",
+                                "port": 3005,
+                                "users": [{"id": "u-1", "alterId": "1", "security": "auto"}],
+                            }
+                        ]
+                    },
+                    "streamSettings": {
+                        "network": "ws",
+                        "security": "tls",
+                        "tlsSettings": {"serverName": "sni.example"},
+                        "wsSettings": {"path": "/vm", "headers": {"Host": "cdn.example"}},
+                    },
+                },
+                {
+                    "tag": "R7-VLESS-Reality",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [
+                            {
+                                "address": "127.0.0.1",
+                                "port": "3005",
+                                "users": [{"id": "u-2", "flow": "xtls-rprx-vision", "encryption": "none"}],
+                            }
+                        ]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "serverName": "www.r.com",
+                            "publicKey": "R7PUB",
+                            "shortId": "cd",
+                            "fingerprint": "firefox",
+                        },
+                    },
+                },
+            ]
+        }
+    )
+    call("/api/import", {"content": v2ray_doc, "name": "R7-v2ray"})
+    got = {x["name"]: x for x in call("/api/proxies?q=R7-")["items"]}
+    assert "R7-VMess-WS" in got and "R7-VLESS-Reality" in got, f"v2ray JSON 未导入: {list(got)}"
+    assert got["R7-VLESS-Reality"]["reality"] is True, "realitySettings 必须标记 REALITY"
+    assert got["R7-VLESS-Reality"]["reality_public_key"] == "R7PUB"
+    assert got["R7-VLESS-Reality"]["flow"] == "xtls-rprx-vision", "flow 不能丢"
+    v2_after = call("/api/export", {"format": "v2ray"})["content"]
+    assert "R7PUB" in v2_after and "xtls-rprx-vision" in v2_after
+    print("  ✅ v2ray/Xray JSON 导入 + REALITY/flow 保真（含字符串 port）")
+
+    # clash YAML 字符串端口；sing-box `tls: {enabled: false}` 不得被强推 TLS
+    call(
+        "/api/import",
+        {
+            "content": 'proxies:\n  - name: "R7-StrPort"\n    type: ss\n    server: 127.0.0.1\n    port: "3005"\n    cipher: aes-256-gcm\n    password: x\n',
+            "name": "R7-yaml",
+        },
+    )
+    assert call("/api/proxies?q=R7-StrPort")["total"] == 1, "字符串端口被静默丢弃"
+    call(
+        "/api/import",
+        {
+            "content": json.dumps(
+                {
+                    "outbounds": [
+                        {
+                            "type": "trojan",
+                            "tag": "R7-PlainTLS",
+                            "server": "127.0.0.1",
+                            "server_port": "3005",
+                            "password": "pw",
+                            "tls": {"enabled": False},
+                        }
+                    ]
+                }
+            ),
+            "name": "R7-singbox",
+        },
+    )
+    assert call("/api/proxies?q=R7-PlainTLS")["items"], "sing-box 字符串 server_port 未解析"
+    yaml_txt = call("/api/export", {"format": "clash-meta"})["content"]
+    assert "R7-StrPort" in yaml_txt, "字符串端口节点没进导出"
+    print("  ✅ 字符串端口（clash / sing-box）与 tls.enabled=false 都被正确处理")
+
+    # URI query 键大小写不敏感 + userinfo 百分号解码
+    call(
+        "/api/import",
+        {
+            "content": "trojan://p%40ss%3A2@127.0.0.1:3005?Type=ws&SNI=sni.example&Path=%2Ftj#R7-PctAuth",
+            "name": "R7-uri",
+        },
+    )
+    uri = call("/api/proxies?q=R7-PctAuth")["items"]
+    assert uri and uri[0]["password"] == "p@ss:2", f"userinfo 未解码: {uri and uri[0]['password']}"
+    assert "sni: sni.example" in yaml_txt or "sni: sni.example" in call(
+        "/api/export", {"format": "clash-meta"}
+    )["content"], "大写 SNI= 未被识别"
+    print("  ✅ query 键大小写不敏感 + userinfo 百分号解码")
+
+    # WireGuard 缺必填键：节点仍可见，但不得进 clash 导出（否则整份配置被 mihomo 拒载）
+    call(
+        "/api/import",
+        {
+            "content": 'proxies:\n  - name: "R7-WG"\n    type: wireguard\n    server: 1.2.3.4\n    port: 51820\n    public-key: k\n',
+            "name": "R7-wg",
+        },
+    )
+    assert call("/api/proxies?q=R7-WG")["total"] == 1, "WG 节点应仍被解析出来"
+    assert "R7-WG" not in call("/api/export", {"format": "clash-meta"})["content"], (
+        "缺 private-key 的 wireguard 条目会拖垮整份 clash 配置，必须被导出侧过滤"
+    )
+
+    # 粘贴内容解析为 0 节点 = 失败：返回 400，且不留下空订阅
+    before_subs = len(call("/api/subscriptions"))
+    try:
+        call("/api/import", {"content": "<html><body>403 Forbidden</body></html>", "name": "R7-junk"})
+        raise AssertionError("粘贴垃圾内容应返回 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400, e.code
+    assert len(call("/api/subscriptions")) == before_subs, "失败的导入不应留下空订阅"
+    print("  ✅ WG 不进导出；垃圾粘贴返回 400 且不落空订阅")
+
     print("== SS plugin / Hysteria2 obfs export fidelity ==")
     call(
         "/api/import",
@@ -378,7 +511,6 @@ proxies:
     print("  ✅ 1s intervals are clamped (0 still disables)")
 
     print("== gist upload goes through the pull proxy ==")
-    import urllib.error
     call(
         "/api/settings",
         {
@@ -409,7 +541,6 @@ proxies:
     print("  ✅ gist upload routed through proxy and failed cleanly")
 
     print("== delete / refresh non-existent subscription -> 404 ==")
-    import urllib.error
     try:
         call("/api/subscriptions/does-not-exist", method="DELETE")
         raise AssertionError("deleting a bogus id must return HTTP 404")

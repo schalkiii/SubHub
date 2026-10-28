@@ -21,7 +21,9 @@ pub fn parse_subscription(raw: &str) -> Vec<Proxy> {
 }
 
 fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
-    let raw = raw.trim();
+    // UTF-8 BOM 不属于 `trim()` 认的空白：带 BOM 的本地粘贴会让 base64 解码、
+    // `starts_with('{')` 与 `proxies:` 检测同时失效，最后解析出 0 个节点且无提示。
+    let raw = raw.trim_start_matches('\u{feff}').trim();
     if raw.is_empty() {
         return Vec::new();
     }
@@ -46,10 +48,17 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
 
     let mut out = Vec::new();
 
-    // 2) structured JSON (sing-box outbounds / clash json)
+    // 2) structured JSON (sing-box outbounds / v2ray-Xray config / clash json)
     if raw.starts_with('{') || raw.starts_with('[') {
-        if raw.contains("outbounds") {
+        // sing-box 用 `type` + 扁平字段，v2ray/Xray 用 `protocol` +
+        // `settings.vnext|servers`。两者的共同点是都有 `outbounds` —— 以前只认
+        // 前者，导入任何 v2ray/Xray 配置（**包括本项目自己的 v2ray 导出**）
+        // 都得到 0 个节点且毫无提示，表现为「订阅是空的」。
+        if raw.contains("outbounds") || raw.starts_with('[') {
             if let Ok(p) = parse_singbox_json(raw) {
+                out.extend(p);
+            }
+            if let Ok(p) = parse_v2ray_json(raw) {
                 out.extend(p);
             }
         }
@@ -66,10 +75,17 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
     //    *known* proxy schemes — a subscription body often contains other
     //    `http(s)://` lines (e.g. `update-url:`, `https://.../rule`) that would
     //    otherwise be misinterpreted as Http-type "ghost" nodes.
+    let mut ssr_skipped = 0usize;
     for line in raw.lines() {
         let line = line.trim();
         if let Some((scheme, rest)) = line.split_once("://") {
             if !is_known_scheme(scheme) {
+                continue;
+            }
+            // SSR 单独计数：mihomo 不支持、必然被丢弃，逐行 eprintln 在
+            // 5000 节点的订阅上会刷出 5000 行 stderr。
+            if scheme.eq_ignore_ascii_case("ssr") {
+                ssr_skipped += 1;
                 continue;
             }
             // Bare `http(s)://host:port` lines with NO userinfo are almost
@@ -87,6 +103,9 @@ fn parse_subscription_depth(raw: &str, depth: usize) -> Vec<Proxy> {
                 out.push(p);
             }
         }
+    }
+    if ssr_skipped > 0 {
+        eprintln!("[subhub] 跳过 {ssr_skipped} 个 SSR 节点（mihomo/Clash.Meta 不支持 SSR）");
     }
 
     out
@@ -233,36 +252,163 @@ pub fn extract_subscription_usage(raw: &str) -> SubscriptionUsage {
     let mut u = SubscriptionUsage::default();
     if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
         // 用量字段可能在顶层，也可能嵌套在 `info:` 块里（两种写法都常见）。
-        let pick = |key: &str| {
-            v.get(key).and_then(|x| x.as_u64()).or_else(|| {
-                v.get("info")
-                    .and_then(|i| i.get(key))
-                    .and_then(|x| x.as_u64())
-            })
+        let pick = |key: &str| -> Option<u64> {
+            yaml_u64(v.get(key)).or_else(|| yaml_u64(v.get("info").and_then(|i| i.get(key))))
         };
         u.download = pick("download");
         u.upload = pick("upload");
         u.total = pick("total");
-        if let Some(exp) = pick("expire") {
-            u.expire = Some(normalize_epoch(exp));
-        }
+        // `expire` 除了数字还常见日期字符串；数字再按数量级归一。
+        let exp_val = v
+            .get("expire")
+            .or_else(|| v.get("info").and_then(|i| i.get("expire")));
+        u.expire = match exp_val.and_then(|x| x.as_str()) {
+            Some(txt) => match yaml_u64(exp_val) {
+                Some(n) => Some(normalize_epoch(n)),
+                None => date_str_to_epoch_ms(txt),
+            },
+            None => yaml_u64(exp_val).map(normalize_epoch),
+        };
     }
     u
 }
 
 /// Clash `expire` (and the `Subscription-Userinfo` header) report seconds;
-/// the rest of the app uses epoch milliseconds, so promote sub-12-digit
-/// values to ms. Values already in ms (>= 1e12) pass through untouched.
+/// the rest of the app uses epoch milliseconds. 按数量级归一：
+/// 秒(1e9~1e12) → 毫秒，毫秒原样，微秒/纳秒 → 除以相应倍数。
+/// 以前只处理「小于 1e12 一律乘 1000」，所以 16 位的**微秒**时间戳会被当成
+/// 毫秒原样返回，面板上显示成几万年后的到期时间。
 pub fn normalize_epoch(v: u64) -> u64 {
-    if v < 1_000_000_000_000 {
-        v.saturating_mul(1000)
+    const MS: u64 = 1_000_000_000_000;
+    const US: u64 = 1_000_000_000_000_000;
+    const NS: u64 = 1_000_000_000_000_000_000;
+    if v == 0 {
+        0
+    } else if v < MS {
+        v.saturating_mul(1000) // 秒
+    } else if v < US {
+        v // 毫秒
+    } else if v < NS {
+        v / 1_000 // 微秒
     } else {
-        v
+        v / 1_000_000 // 纳秒
     }
+}
+
+/// 用量字段取值：数字、数字字符串（`"100"`）、浮点（`3.0`）都接受。
+/// 面板下发字符串数字很常见，旧写法只认 `as_u64` → 流量卡片直接空掉。
+fn yaml_u64(v: Option<&serde_yaml::Value>) -> Option<u64> {
+    let x = v?;
+    x.as_u64()
+        .or_else(|| {
+            x.as_str()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .or_else(|| {
+                    x.as_str()
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .map(|f| f.max(0.0) as u64)
+                })
+        })
+        .or_else(|| {
+            x.as_f64().and_then(|f| {
+                if f.is_finite() && f >= 0.0 {
+                    Some(f as u64)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+/// `expire: "2026-12-31 23:59:59"` / `"2026-12-31"` 这类日期写法（部分面板与
+/// clash `info` 块会这样下发）转成 epoch 毫秒（按 UTC 解释）。
+/// 解析失败返回 None，调用方回退到数字取值。
+fn date_str_to_epoch_ms(s: &str) -> Option<u64> {
+    let t = s.trim().replace('T', " ");
+    let (date, time) = match t.split_once(' ') {
+        Some((d, tm)) => (d, tm),
+        None => (t.as_str(), ""),
+    };
+    let mut dp = date.split('-');
+    let year: i64 = dp.next()?.parse().ok()?;
+    let month: u32 = dp.next()?.parse().ok()?;
+    let day: u32 = dp.next()?.parse().ok()?;
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut tp = time.split(':');
+    let hour: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let min: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let sec: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    if hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // days-from-civil（Howard Hinnant）：把 civil 日期换成 epoch 天数。
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp as u64 + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as u64 * 146097 + doe - 719468;
+    Some(days * 86_400_000 + (hour as u64 * 3600 + min as u64 * 60 + sec as u64) * 1000)
 }
 
 fn as_str<'a>(v: &'a serde_yaml::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
+}
+
+/// 端口取值：数字与数字字符串都接受。v2rayN、部分订阅生成器和手写配置里
+/// `port: "443"` 很常见，旧写法只认数字 → 整节点被静默丢弃，表现为
+/// 「导入后节点数莫名少了一批」。0 与 >65535 一律无效（不能 `as u16` 截断）。
+fn port_from_yaml(v: Option<&serde_yaml::Value>) -> Option<u16> {
+    let x = v?;
+    let p = x
+        .as_u64()
+        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    if (1..=65535).contains(&p) {
+        Some(p as u16)
+    } else {
+        None
+    }
+}
+
+fn port_from_json(v: Option<&serde_json::Value>) -> Option<u16> {
+    let x = v?;
+    let p = x
+        .as_u64()
+        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .or_else(|| {
+            x.as_f64().and_then(|f| {
+                if f.fract() == 0.0 {
+                    Some(f as u64)
+                } else {
+                    None
+                }
+            })
+        })?;
+    if (1..=65535).contains(&p) {
+        Some(p as u16)
+    } else {
+        None
+    }
+}
+
+/// `alterId` / `aid` 同样有数字与字符串两种写法；超出 u32 视为无效而不是回绕。
+fn u32_from_yaml(v: Option<&serde_yaml::Value>) -> Option<u32> {
+    let x = v?;
+    let n = x
+        .as_u64()
+        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    u32::try_from(n).ok()
+}
+
+fn u32_from_json(v: Option<&serde_json::Value>) -> Option<u32> {
+    let x = v?;
+    let n = x
+        .as_u64()
+        .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    u32::try_from(n).ok()
 }
 
 fn parse_bool(v: &str) -> bool {
@@ -331,8 +477,8 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
     let server = as_str(v, "server")?;
     // Reject out-of-range ports (e.g. 70000) instead of silently truncating to
     // a wrong value via `as u16` — a node with port 0 or >65535 can never connect.
-    let port = match v.get("port").and_then(|x| x.as_u64()) {
-        Some(p) if (1..=65535).contains(&p) => p as u16,
+    let port = match port_from_yaml(v.get("port")) {
+        Some(p) => p,
         _ => return None,
     };
     let name = as_str(v, "name").unwrap_or(server).to_string();
@@ -351,7 +497,7 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
 
     let mut p = Proxy::new(name, type_, server.to_string(), port);
     p.uuid = as_str(v, "uuid").map(str::to_string);
-    p.alter_id = v.get("alterId").and_then(|x| x.as_u64()).map(|x| x as u32);
+    p.alter_id = u32_from_yaml(v.get("alterId"));
     p.cipher = as_str(v, "cipher").map(str::to_string);
     p.flow = as_str(v, "flow").map(str::to_string);
     p.password = as_str(v, "password").map(str::to_string);
@@ -461,6 +607,7 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
 fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
     let v: serde_json::Value = serde_json::from_str(s)?;
     let mut out = Vec::new();
+    let mut unknown_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if let Some(outbounds) = v.get("outbounds").and_then(|o| o.as_array()) {
         for ob in outbounds {
             let type_str = ob.get("type").and_then(|x| x.as_str()).unwrap_or("");
@@ -468,8 +615,8 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            let port = match ob.get("server_port").and_then(|x| x.as_u64()) {
-                Some(p) if (1..=65535).contains(&p) => p as u16,
+            let port = match port_from_json(ob.get("server_port")) {
+                Some(p) => p,
                 _ => continue, // skip outbounds without a valid port
             };
             let name = ob
@@ -486,7 +633,12 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 "tuic" => ProxyType::Tuic,
                 "socks" => ProxyType::Socks5,
                 "wireguard" => ProxyType::Wireguard,
-                _ => continue,
+                // 未知类型落到 `Other` 而不是丢弃：与 clash 分支口径一致，
+                // 由导出侧统一过滤，用户至少能在节点列表里看到它。
+                other => {
+                    unknown_types.insert(other.to_string());
+                    ProxyType::Other
+                }
             };
             let mut p = Proxy::new(name, type_, server, port);
             p.password = ob
@@ -498,6 +650,15 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 .and_then(|x| x.as_str())
                 .map(str::to_string);
             p.uuid = ob.get("uuid").and_then(|x| x.as_str()).map(str::to_string);
+            // sing-box 的 socks/http 把用户名放在 `username`（不是 uuid），
+            // 此前不读 → 导出成无认证节点。与 clash 侧同一存放位置（extra.user）。
+            p.extra = ob
+                .get("username")
+                .and_then(|x| x.as_str())
+                .map(|u| serde_json::json!({ "user": u }));
+            // vless 的 `flow`（xtls-rprx-vision 等）必须保留：丢了 flow 的
+            // vision 节点在 xray 侧握手会失败。
+            p.flow = ob.get("flow").and_then(|x| x.as_str()).map(str::to_string);
             if type_ == ProxyType::Ss {
                 p.plugin = ob
                     .get("plugin")
@@ -539,6 +700,11 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
             // as unconditionally enabled (that forced TLS onto plaintext nodes).
             p.tls = Some(match ob.get("tls") {
                 Some(serde_json::Value::Bool(b)) => *b,
+                // sing-box 1.11+ 用对象形态 `{ "enabled": false }`：只看「键存在」
+                // 就判 TLS，会把明文节点强推成 TLS，握手必败。
+                Some(serde_json::Value::Object(o)) => {
+                    o.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true)
+                }
                 Some(_) => true,
                 None => false,
             });
@@ -558,6 +724,38 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                             .collect::<Vec<_>>()
                     })
                     .filter(|v| !v.is_empty());
+                // REALITY：sing-box 形如 `tls.reality.enabled` + `tls.reality.short_id`，
+                // 公钥在 `tls.public_key`（顶层）或 `tls.reality.public_key`。丢掉这些
+                // 字段会把 REALITY 节点降级成普通 TLS 节点——连不上且无从排查。
+                let reality = tls.get("reality");
+                let reality_on = reality
+                    .and_then(|r| r.get("enabled"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or_else(|| reality.is_some());
+                if reality_on {
+                    p.reality = true;
+                    p.reality_public_key = tls
+                        .get("public_key")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| {
+                            reality
+                                .and_then(|r| r.get("public_key"))
+                                .and_then(|x| x.as_str())
+                        })
+                        .map(str::to_string);
+                    p.reality_short_id = reality
+                        .and_then(|r| r.get("short_id"))
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    // REALITY 一定跑在 TLS 之上
+                    p.tls = Some(true);
+                }
+                p.fingerprint = tls
+                    .get("utls")
+                    .and_then(|u| u.get("fingerprint"))
+                    .and_then(|x| x.as_str())
+                    .or_else(|| tls.get("client_fingerprint").and_then(|x| x.as_str()))
+                    .map(str::to_string);
             }
             // Transport (ws / grpc / h2) — sing-box nests this under
             // `transport: { type, path, headers, host, service_name }`.
@@ -604,7 +802,224 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
             out.push(p);
         }
     }
+    if !unknown_types.is_empty() {
+        // 一行汇总而不是每节点一行（5000 节点会刷出 5000 行 stderr）。
+        let list: Vec<&str> = unknown_types.iter().map(String::as_str).collect();
+        eprintln!(
+            "[parse] sing-box 未知类型按 other 保留、导出时过滤: {}",
+            list.join(", ")
+        );
+    }
     Ok(out)
+}
+
+// ----------------------- v2ray / Xray JSON -----------------------
+
+/// 解析 v2ray / Xray 风格的配置 JSON：`outbounds[].protocol` +
+/// `settings.vnext[].users[]`（vmess/vless）或 `settings.servers[]`
+/// （trojan/shadowsocks），传输与 TLS 参数在 `streamSettings` 里。
+///
+/// 形状与 `export::to_v2ray_json` 一一对应，因此本项目导出的 v2rayN 配置
+/// 可以被重新导入（裸数组形态同样支持——v2rayN 的 `outbounds.json` 就是数组）。
+fn parse_v2ray_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
+    let v: serde_json::Value = serde_json::from_str(s)?;
+    let arr_owned;
+    let arr = if let Some(a) = v.get("outbounds").and_then(|o| o.as_array()) {
+        a
+    } else if let Some(a) = v.as_array() {
+        arr_owned = a.clone();
+        &arr_owned
+    } else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for ob in arr {
+        if let Some(p) = v2ray_outbound(ob) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// 单个 v2ray/Xray outbound → Proxy。无法表示的协议返回 `None`
+/// （hysteria / wireguard / tun / freedom 等不属于节点）。
+fn v2ray_outbound(ob: &serde_json::Value) -> Option<Proxy> {
+    let proto = ob.get("protocol").and_then(|x| x.as_str())?;
+    let stream = ob.get("streamSettings");
+    let tag = ob
+        .get("tag")
+        .and_then(|x| x.as_str())
+        .unwrap_or(proto)
+        .to_string();
+
+    // vmess / vless 走 `settings.vnext[]`，trojan / shadowsocks 走 `settings.servers[]`。
+    let target = ob
+        .get("settings")
+        .and_then(|st| st.get("vnext"))
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first().cloned())
+        .or_else(|| {
+            ob.get("settings")
+                .and_then(|st| st.get("servers"))
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.first().cloned())
+        })?;
+    // vless/vmess 的真实凭据在 users[0]，trojan/ss 直接在 servers[0]。
+    let user = target
+        .get("users")
+        .and_then(|u| u.as_array())
+        .and_then(|a| a.first().cloned())
+        .unwrap_or_else(|| target.clone());
+
+    let server = target
+        .get("address")
+        .and_then(|x| x.as_str())
+        .or_else(|| user.get("address").and_then(|x| x.as_str()))?
+        .to_string();
+    let port = port_from_json(target.get("port").or(user.get("port")))?;
+
+    let type_ = match proto {
+        "vmess" => ProxyType::Vmess,
+        "vless" => ProxyType::Vless,
+        "trojan" => ProxyType::Trojan,
+        "shadowsocks" => ProxyType::Ss,
+        _ => return None,
+    };
+    let mut p = Proxy::new(tag, type_, server, port);
+    p.uuid = user
+        .get("id")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            user.get("password")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        });
+    p.password = user
+        .get("password")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    p.cipher = user
+        .get("security")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    p.method = user
+        .get("method")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    p.alter_id = u32_from_json(user.get("alterId")).or_else(|| u32_from_json(user.get("aid")));
+    p.flow = user
+        .get("flow")
+        .and_then(|x| x.as_str())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            target
+                .get("flow")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        });
+
+    // streamSettings：传输 + 安全层
+    if let Some(st) = stream {
+        p.network = st
+            .get("network")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        let sec = st.get("security").and_then(|x| x.as_str()).unwrap_or("");
+        p.tls = Some(matches!(sec, "tls" | "reality"));
+        // 传输参数在 xray / v2ray 里是**每种传输一个对象**：
+        // `wsSettings{path, headers.Host}`、`grpcSettings{serviceName}`、
+        // `httpSettings{path, host[]}` / `xhttpSettings{}`。只读 `networkSettings`
+        // 会拿不到 path/Host，导出的 ws 节点没有伪装头 → CDN 中转节点连不上。
+        let ws = st.get("wsSettings");
+        let grpc = st.get("grpcSettings");
+        let http = st.get("httpSettings").or_else(|| st.get("xhttpSettings"));
+        let ns = st.get("networkSettings"); // 少数生成器的统一命名，容错读取
+        let text = |x: &serde_json::Value| -> Option<String> {
+            x.as_str().map(str::to_string).or_else(|| {
+                x.as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|f| f.as_str())
+                    .map(str::to_string)
+            })
+        };
+        p.path = ws
+            .and_then(|w| w.get("path"))
+            .and_then(text)
+            .or_else(|| http.and_then(|h| h.get("path")).and_then(text))
+            .or_else(|| ns.and_then(|n| n.get("path")).and_then(text));
+        p.host = ws
+            .and_then(|w| w.get("headers"))
+            .and_then(|h| h.get("Host"))
+            .and_then(text)
+            .or_else(|| http.and_then(|h| h.get("host")).and_then(text))
+            .or_else(|| {
+                ns.and_then(|n| n.get("headers"))
+                    .and_then(|h| h.get("Host"))
+                    .and_then(text)
+            });
+        p.service_name = grpc
+            .and_then(|g| g.get("serviceName"))
+            .and_then(text)
+            .or_else(|| ns.and_then(|n| n.get("serviceName")).and_then(text));
+
+        let tls = st.get("tlsSettings");
+        let reality = st.get("realitySettings");
+        p.sni = tls
+            .and_then(|t| t.get("serverName"))
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                reality
+                    .and_then(|r| r.get("serverName"))
+                    .and_then(|x| x.as_str())
+            })
+            .map(str::to_string);
+        p.skip_cert_verify = tls
+            .and_then(|t| t.get("allowInsecure"))
+            .and_then(|x| x.as_bool())
+            .or_else(|| {
+                reality
+                    .and_then(|r| r.get("allowInsecure"))
+                    .and_then(|x| x.as_bool())
+            });
+        p.alpn = match tls.and_then(|t| t.get("alpn")) {
+            Some(serde_json::Value::Array(a)) => {
+                let list: Vec<String> = a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::to_string)
+                    .collect();
+                (!list.is_empty()).then_some(list)
+            }
+            Some(serde_json::Value::String(str_val)) => parse_alpn(Some(&str_val.to_string())),
+            _ => None,
+        };
+        // uTLS 客户端指纹：xray 放在 `tlsSettings.fingerprint`，
+        // REALITY 放在 `realitySettings.fingerprint`。
+        p.fingerprint = tls
+            .and_then(|t| t.get("fingerprint"))
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                reality
+                    .and_then(|r| r.get("fingerprint"))
+                    .and_then(|x| x.as_str())
+            })
+            .map(str::to_string);
+        if sec == "reality" || reality.is_some() {
+            p.reality = true;
+            p.reality_public_key = reality
+                .and_then(|r| r.get("publicKey").or(r.get("id")))
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            p.reality_short_id = reality
+                .and_then(|r| r.get("shortId"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            p.tls = Some(true);
+        }
+    }
+    Some(p)
 }
 
 // ----------------------- URI schemes -----------------------
@@ -650,8 +1065,10 @@ fn split_authority(body: &str) -> Option<Auth> {
         Some((l, q)) => (l, q),
         None => (body, ""),
     };
+    // userinfo 也可能是百分号编码的（密码含 `%40` / `%3A` 很常见）。不解码就会
+    // 把字面 `%40` 当密码发出去 → 认证失败、整节点全灭。
     let (userinfo, hostport) = match left.rsplit_once('@') {
-        Some((u, h)) => (u.to_string(), h.to_string()),
+        Some((u, h)) => (decode_percent(u), h.to_string()),
         None => (String::new(), left.to_string()),
     };
     let (host, port) = if hostport.starts_with('[') {
@@ -683,10 +1100,13 @@ fn split_authority(body: &str) -> Option<Auth> {
         }
         (host, port)
     };
+    // 键统一小写：`?Type=ws`、`?SNI=x`、`?Security=reality` 这类大写写法在真实
+    // 订阅里存在，而读取侧全是小写字面量 —— 精确匹配会静默丢掉传输层/SNI，
+    // 导出出一个看着正常但连不上的节点。
     let query = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
-        .map(|(k, v)| (k.to_string(), decode_percent(v)))
+        .map(|(k, v)| (k.to_ascii_lowercase(), decode_percent(v)))
         .collect();
     Some(Auth {
         userinfo,
@@ -793,7 +1213,9 @@ fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
         .or_else(|| a.query.get("network"))
         .cloned();
     let security = a.query.get("security").map(String::as_str).unwrap_or("");
-    p.tls = Some(security != "none");
+    // 大小写不敏感：`?Security=None` 按精确比较会被当成「声明了某个安全层」，
+    // 于是明文节点被强制加 TLS。
+    p.tls = Some(!security.eq_ignore_ascii_case("none"));
     if security.eq_ignore_ascii_case("reality") {
         p.reality = true;
         p.reality_public_key = a.query.get("pbk").cloned().filter(|s| !s.is_empty());
@@ -804,12 +1226,12 @@ fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
     p.alpn = parse_alpn(a.query.get("alpn"));
     p.skip_cert_verify = a
         .query
-        .get("allowInsecure")
+        .get("allowinsecure")
         .or_else(|| a.query.get("insecure"))
         .map(|v| v == "1" || v == "true");
     p.path = a.query.get("path").cloned();
     p.host = a.query.get("host").cloned();
-    p.service_name = a.query.get("serviceName").cloned();
+    p.service_name = a.query.get("servicename").cloned();
     Some(p)
 }
 
@@ -832,7 +1254,7 @@ fn parse_trojan(body: &str, name: Option<String>) -> Option<Proxy> {
     p.alpn = parse_alpn(a.query.get("alpn"));
     p.skip_cert_verify = a
         .query
-        .get("allowInsecure")
+        .get("allowinsecure")
         .or_else(|| a.query.get("skip-cert-verify"))
         .map(|v| v == "1" || v == "true");
     Some(p)
@@ -914,7 +1336,7 @@ fn parse_ssr(_body: &str, _name: Option<String>) -> Option<Proxy> {
     // would emit a `type: ss` node that fails to connect with no obvious cause,
     // so we drop every SSR node up front and log why it went missing.
     // (We don't even bother decoding — there is nothing usable to keep.)
-    eprintln!("[subhub] 跳过 SSR 节点（mihomo/Clash.Meta 不支持 SSR，已忽略）");
+    // 汇总日志在 `parse_subscription_depth` 的 URI 循环里输出，这里不再逐行打印。
     None
 }
 
@@ -948,7 +1370,7 @@ fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
     p.skip_cert_verify = a
         .query
         .get("insecure")
-        .or_else(|| a.query.get("allowInsecure"))
+        .or_else(|| a.query.get("allowinsecure"))
         .map(|v| v == "1" || v == "true");
     Some(p)
 }
@@ -996,7 +1418,7 @@ fn parse_tuic(body: &str, name: Option<String>) -> Option<Proxy> {
     p.skip_cert_verify = a
         .query
         .get("insecure")
-        .or_else(|| a.query.get("allowInsecure"))
+        .or_else(|| a.query.get("allowinsecure"))
         .map(|v| v == "1" || v == "true");
     Some(p)
 }
@@ -1034,9 +1456,14 @@ fn parse_socks(body: &str, name: Option<String>, t: ProxyType, tls: bool) -> Opt
     let a = split_authority(body)?;
     let mut p = Proxy::new(name.unwrap_or_else(|| a.host.clone()), t, a.host, a.port);
     if !a.userinfo.is_empty() {
-        if let Some((u, pass)) = a.userinfo.rsplit_once(':') {
-            p.extra = Some(serde_json::json!({"user": u}));
-            p.password = Some(pass.to_string());
+        match a.userinfo.rsplit_once(':') {
+            Some((u, pass)) => {
+                p.extra = Some(serde_json::json!({ "user": u }));
+                p.password = Some(pass.to_string());
+            }
+            // `socks5://pass@host:1080`（只有一段 userinfo）：旧写法什么都不做，
+            // 结果导出成**无认证**节点。按 URI 惯例单段 userinfo 是口令。
+            None => p.password = Some(a.userinfo.clone()),
         }
     }
     // `https://` 链接是 HTTPS 代理（HTTP over TLS）。此前 scheme 的 http/https
@@ -1544,5 +1971,265 @@ mod tests {
         let one = base64::engine::general_purpose::STANDARD.encode(inner);
         let out1 = parse_subscription(&one);
         assert_eq!(out1.len(), 1, "single base64 layer must still parse");
+    }
+
+    // ===================== 第七轮：格式识别与字段保真 =====================
+
+    #[test]
+    fn clash_string_port_and_aid_are_accepted() {
+        // 真实生成器与手写配置常见 `port: "443"` / `alterId: "0"`。
+        // 旧写法只认数字，整节点被静默丢弃（表现为导入后节点数莫名变少）。
+        let yaml = "proxies:\n  - name: A\n    type: vmess\n    server: h.example\n    port: \"443\"\n    uuid: u1\n    alterId: \"0\"\n    cipher: auto\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out.len(), 1, "字符串端口必须能解析: {out:?}");
+        assert_eq!(out[0].port, 443);
+        assert_eq!(out[0].alter_id, Some(0));
+    }
+
+    #[test]
+    fn bom_prefixed_subscription_is_parsed() {
+        // UTF-8 BOM 不是 `trim()` 的空白：带 BOM 的本地粘贴此前会让所有
+        // 格式检测同时失效，用户看到的是「0 个节点」。
+        let yaml = "\u{feff}proxies:\n  - name: A\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-256-gcm\n    password: x\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out.len(), 1, "带 BOM 的 YAML 必须照常解析");
+    }
+
+    #[test]
+    fn singbox_string_port_tls_object_and_flow_are_parsed() {
+        // sing-box：`server_port` 可能是字符串；`tls` 是对象且 `enabled: false`
+        // 表示明文；vless 的 `flow` 与 REALITY 必须保留。
+        let json = r#"{
+          "outbounds": [
+            { "type": "vless", "tag": "V", "server": "v.example", "server_port": "443",
+              "uuid": "u-1", "flow": "xtls-rprx-vision",
+              "tls": { "enabled": true, "server_name": "www.x.com",
+                       "reality": { "enabled": true, "short_id": "ab12" },
+                       "public_key": "PUB", "utls": { "fingerprint": "chrome" },
+                       "alpn": ["h2"] } },
+            { "type": "trojan", "tag": "T", "server": "t.example", "server_port": 443,
+              "password": "pw", "tls": { "enabled": false } },
+            { "type": "hysteria2", "tag": "H", "server": "h.example", "server_port": 443,
+              "password": "hp" }
+          ]
+        }"#;
+        let out = parse_subscription(json);
+        assert_eq!(out.len(), 3, "三个 outbound 都要落地: {out:?}");
+        let v = out.iter().find(|x| x.name == "V").unwrap();
+        assert_eq!(v.port, 443);
+        assert_eq!(v.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert!(v.reality, "tls.reality.enabled 必须标记 REALITY");
+        assert_eq!(v.reality_public_key.as_deref(), Some("PUB"));
+        assert_eq!(v.reality_short_id.as_deref(), Some("ab12"));
+        assert_eq!(v.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(v.sni.as_deref(), Some("www.x.com"));
+        let t = out.iter().find(|x| x.name == "T").unwrap();
+        assert_eq!(t.tls, Some(false), "tls.enabled=false 不能被当成启用 TLS");
+    }
+
+    #[test]
+    fn singbox_socks_username_is_kept_and_unknown_type_becomes_other() {
+        let json = r#"{
+          "outbounds": [
+            { "type": "socks", "tag": "S", "server": "10.0.0.1", "server_port": 1080,
+              "username": "bob", "password": "pw" },
+            { "type": "tor", "tag": "X", "server": "10.0.0.2", "server_port": 9050 }
+          ]
+        }"#;
+        let out = parse_subscription(json);
+        assert_eq!(out.len(), 2, "未知类型不得静默丢弃（与 clash 分支一致）");
+        let so = out.iter().find(|x| x.name == "S").unwrap();
+        assert_eq!(
+            so.extra
+                .as_ref()
+                .and_then(|e| e.get("user"))
+                .and_then(|x| x.as_str()),
+            Some("bob")
+        );
+        let x = out.iter().find(|x| x.name == "X").unwrap();
+        assert_eq!(x.type_, ProxyType::Other);
+        assert!(!x.is_exportable(), "other 类型必须由导出侧过滤");
+    }
+
+    #[test]
+    fn v2ray_json_config_is_parsed_including_reality() {
+        // v2ray/Xray 形状（`protocol` + `settings.vnext/servers` + `streamSettings`）。
+        // 入口注释一直声称支持，实际解析结果是 0 个节点。
+        let json = r#"{
+          "outbounds": [
+            { "tag": "VM", "protocol": "vmess",
+              "settings": { "vnext": [{ "address": "v.example", "port": 443,
+                    "users": [{ "id": "u-1", "alterId": "1", "security": "auto" }] }] },
+              "streamSettings": { "network": "ws", "security": "tls",
+                "tlsSettings": { "serverName": "sni.example", "alpn": ["h2"], "fingerprint": "chrome" },
+                "wsSettings": { "path": "/vm", "headers": { "Host": "cdn.example" } } } },
+            { "tag": "VL", "protocol": "vless",
+              "settings": { "vnext": [{ "address": "r.example", "port": "443",
+                    "users": [{ "id": "u-2", "flow": "xtls-rprx-vision", "encryption": "none" }] }] },
+              "streamSettings": { "network": "tcp", "security": "reality",
+                "realitySettings": { "serverName": "www.r.com", "publicKey": "PUB2", "shortId": "cd", "fingerprint": "firefox" } } },
+            { "tag": "TR", "protocol": "trojan",
+              "settings": { "servers": [{ "address": "t.example", "port": 443, "password": "tpw" }] },
+              "streamSettings": { "network": "tcp", "security": "tls", "tlsSettings": { "serverName": "t.example" } } },
+            { "tag": "SS", "protocol": "shadowsocks",
+              "settings": { "servers": [{ "address": "s.example", "port": 8388, "password": "spw", "method": "aes-256-gcm" }] },
+              "streamSettings": { "network": "tcp", "security": "" } }
+          ]
+        }"#;
+        let out = parse_subscription(json);
+        assert_eq!(out.len(), 4, "v2ray 配置必须解析出 4 个节点: {out:?}");
+        let by = |n: &str| out.iter().find(|x| x.name == n).unwrap().clone();
+        let vm = by("VM");
+        assert_eq!(
+            (vm.type_, vm.port, vm.uuid.as_deref()),
+            (ProxyType::Vmess, 443, Some("u-1"))
+        );
+        assert_eq!(vm.alter_id, Some(1), "alterId 的字符串写法也要接受");
+        assert_eq!(
+            (
+                vm.network.as_deref(),
+                vm.path.as_deref(),
+                vm.host.as_deref()
+            ),
+            (Some("ws"), Some("/vm"), Some("cdn.example"))
+        );
+        assert_eq!(vm.sni.as_deref(), Some("sni.example"));
+        assert_eq!(vm.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(vm.tls, Some(true));
+        let vl = by("VL");
+        assert!(vl.reality && vl.tls == Some(true));
+        assert_eq!(vl.reality_public_key.as_deref(), Some("PUB2"));
+        assert_eq!(vl.reality_short_id.as_deref(), Some("cd"));
+        assert_eq!(vl.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(vl.port, 443, "字符串 port 也要能吃");
+        let tr = by("TR");
+        assert_eq!(
+            (tr.type_, tr.password.as_deref()),
+            (ProxyType::Trojan, Some("tpw"))
+        );
+        let ss = by("SS");
+        assert_eq!(
+            (ss.type_, ss.password.as_deref(), ss.method.as_deref()),
+            (ProxyType::Ss, Some("spw"), Some("aes-256-gcm"))
+        );
+        assert_eq!(ss.tls, Some(false), "security 为空不得判成 TLS");
+    }
+
+    #[test]
+    fn v2ray_export_round_trips_back_into_the_same_nodes() {
+        // 本项目自己的 v2ray 导出必须能被本项目重新导入（裸数组形态）。
+        let mut vm = Proxy::new("N1".into(), ProxyType::Vmess, "a.example".into(), 443);
+        vm.uuid = Some("u-9".into());
+        vm.network = Some("ws".into());
+        vm.path = Some("/p".into());
+        vm.host = Some("cdn.example".into());
+        vm.tls = Some(true);
+        vm.sni = Some("cdn.example".into());
+        let exported = crate::export::to_v2ray_json(std::slice::from_ref(&vm));
+        let back = parse_subscription(&exported);
+        assert_eq!(back.len(), 1, "导出的 v2ray 数组应可重新导入: {exported}");
+        assert_eq!(
+            (
+                back[0].name.as_str(),
+                back[0].server.as_str(),
+                back[0].port,
+                back[0].uuid.as_deref().unwrap(),
+                back[0].network.as_deref().unwrap(),
+                back[0].path.as_deref().unwrap()
+            ),
+            ("N1", "a.example", 443, "u-9", "ws", "/p")
+        );
+        assert_eq!(back[0].sni.as_deref(), Some("cdn.example"));
+    }
+
+    #[test]
+    fn uri_query_keys_and_security_are_case_insensitive() {
+        // `?Type=ws&SNI=x` 与 `?Security=None` 都是真实下发写法。
+        let out = parse_subscription(
+            "vless://u-3@h.example:443?Type=ws&SNI=sni.example&Security=None&Path=/q&Host=cdn.example#Q",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].network.as_deref(), Some("ws"), "大写 Type 被忽略");
+        assert_eq!(
+            out[0].sni.as_deref(),
+            Some("sni.example"),
+            "大写 SNI 被忽略"
+        );
+        assert_eq!(out[0].path.as_deref(), Some("/q"), "大写 Path 被忽略");
+        assert_eq!(
+            out[0].host.as_deref(),
+            Some("cdn.example"),
+            "大写 Host 被忽略"
+        );
+        assert_eq!(out[0].tls, Some(false), "Security=None 不得被判成启用 TLS");
+    }
+
+    #[test]
+    fn percent_encoded_userinfo_is_decoded() {
+        // 密码里的 `%40` / `%3A` 不解码就会按字面发出 → 认证失败、整节点全灭。
+        let out = parse_subscription("trojan://p%40ss%3A2@h.example:443?sni=h.example#P");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].password.as_deref(), Some("p@ss:2"));
+
+        let socks = parse_subscription("socks5://bob:p%40w@10.0.0.1:1080#S");
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].password.as_deref(), Some("p@w"));
+        assert_eq!(
+            socks[0]
+                .extra
+                .as_ref()
+                .and_then(|e| e.get("user"))
+                .and_then(|x| x.as_str()),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn socks_single_segment_userinfo_is_kept_as_password() {
+        // `socks5://secret@host:1080`：旧写法既不填用户名也不填密码，
+        // 导出成无认证节点。按 URI 惯例单段 userinfo 是口令。
+        let out = parse_subscription("socks5://secret@10.0.0.1:1080#SO");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn usage_accepts_string_numbers_and_date_expires() {
+        // `total: 3.0`、`expire: "2026-12-31 23:59:59"`、微秒时间戳都是真实写法。
+        let yaml = "info:\n  download: \"100\"\n  upload: 50\n  total: 3.0\n  expire: \"2026-12-31 23:59:59\"\nproxies:\n  - name: a\n    type: ss\n    server: 1.2.3.4\n    port: 1\n    cipher: x\n    password: y\n";
+        let u = extract_subscription_usage(yaml);
+        assert_eq!(u.download, Some(100), "字符串数字应取值");
+        assert_eq!(u.upload, Some(50));
+        assert_eq!(u.total, Some(3), "浮点数字应取值");
+        assert_eq!(
+            u.expire,
+            Some(1_798_761_599_000),
+            "日期字符串应换成 epoch 毫秒: {:?}",
+            u.expire
+        );
+
+        // 微秒 / 纳秒时间戳归一到毫秒（旧实现原样返回，面板显示几万年以后）。
+        assert_eq!(normalize_epoch(1_700_000_000_000_000), 1_700_000_000_000);
+        assert_eq!(
+            normalize_epoch(1_700_000_000_000_000_000),
+            1_700_000_000_000
+        );
+        assert_eq!(normalize_epoch(0), 0);
+    }
+
+    #[test]
+    fn date_str_to_epoch_ms_matches_known_instants() {
+        assert_eq!(date_str_to_epoch_ms("1970-01-01"), Some(0));
+        assert_eq!(
+            date_str_to_epoch_ms("2000-02-29 12:00"),
+            Some(951_825_600_000)
+        );
+        assert_eq!(
+            date_str_to_epoch_ms("2026-12-31T23:59:59"),
+            Some(1_798_761_599_000)
+        );
+        // 非法日期一律 None，不能瞎猜。
+        assert_eq!(date_str_to_epoch_ms("2026-13-01"), None);
+        assert_eq!(date_str_to_epoch_ms("nonsense"), None);
     }
 }
