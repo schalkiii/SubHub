@@ -349,11 +349,12 @@ mod tests {
         PROGRESS_CALLS.store(0, Ordering::SeqCst);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
-                if let Ok((mut s, _)) = listener.accept() {
-                    let _ = s.read(&mut [0u8; 8]);
-                }
+        let _acceptor = std::thread::spawn(move || {
+            // 无限 accept + 不 join：三个节点共用一个端点，端点缓存生效后整轮
+            // 只拨号一次。按节点数固定循环 accept 再 join 会永久等后面的连接
+            // （Linux runner 上就是这么挂住的，Windows 只是碰巧被并发抢先）。
+            while let Ok((mut s, _)) = listener.accept() {
+                let _ = s.read(&mut [0u8; 8]);
             }
         });
         let proxies: Vec<Proxy> = (0..3)
@@ -364,8 +365,7 @@ mod tests {
             true
         };
         let out = tcp_ping_all(&proxies, 2000, 4, Some(cb));
-        let _ = handle.join();
-        assert_eq!(out.len(), 3, "结果数 == 节点数");
+        assert_eq!(out.len(), 3, "每个节点各有一条结果");
         assert!(out.iter().all(|r| r.available), "loopback 节点应全部可达");
         assert_eq!(PROGRESS_CALLS.load(Ordering::SeqCst), 3, "每节点回调一次");
     }
