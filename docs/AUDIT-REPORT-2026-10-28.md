@@ -482,7 +482,7 @@
 - 隔离 DB 端到端 `docs/test_subhub.py` ALL CHECKS PASSED（含跨页全局排序回归，正好覆盖重写的 `list_proxies`）。
 - 浏览器实测节点列表页：15 列渲染正常，`q=HK` → 1 条、`type=ss` → 5 条全 ss、`region=US` → 1 条、`page=2&page_size=3&sort=score&desc=1` 切片正确，行数据 47 个字段齐备（含 `score`/`region`/`fingerprint`/`sub_name`/`tcp_latency_ms`/`http_latency_ms`/`bandwidth_measured`），控制台无报错。
 - `cargo build --release -p subhub-app` 通过。
-- 性能对照方法：同一台机器、同一份 1000 节点 fixture、debug 构建、15 次取最小值；基线二进制由 `git stash` 回到 `0620efc` 后单独构建。绝对值是 debug 数字（release 更快），倍数关系即结构性收益。
+- 性能对照方法：同一台机器、同一份 1000 节点 fixture、debug 构建、15 次取最小值；基线二进制由 `git stash` 回到本轮之前的提交后单独构建（旧 commit 号不写在这里——历史重写后旧对象在 GitHub 侧尚未回收，公布等于给出取回历史文件的指针）。绝对值是 debug 数字（release 更快），倍数关系即结构性收益。
 
 ### 11.4 本轮明确不做
 
@@ -557,21 +557,34 @@
 
 ### 13.1 事实
 
-`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 是早期一次性批量导入脚本，硬编码了**私有订阅链接**（含 `subscribe?token=` 形式的面板 token、`/api/v1/share/node/` 形式的分享链接）与**个人 Gist 原始地址**。它们随 `611e85b` 进入仓库，此后一直存在于每一版历史中，而仓库是 public——等于凭据公开可读。
+`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 是早期一次性批量导入脚本，硬编码了**私有订阅链接**（含 `subscribe?token=` 形式的面板 token、`/api/v1/share/node/` 形式的分享链接）与**个人 Gist 原始地址**。它们在早期一次功能提交里进入仓库（具体旧 commit 号不写在这里——旧对象在 GitHub 侧尚未回收，公布等于给出取回凭据的指针），此后一直存在于每一版历史中，而仓库是 public——等于凭据公开可读。
 
-本次全历史扫描（逐 commit `git grep`）确认：泄露面**只有这两个文件**，且只在这两个路径上出现；另外单独扫过 GitHub PAT（`ghp_` / `github_pat_`）、私钥块（`BEGIN PRIVATE KEY` / `CERTIFICATE`）与 `.env` / secret 类文件，历史与当前 HEAD 均无命中。
+本次全历史扫描（逐 commit `git grep`）先确认这两个脚本是唯一携带**订阅链接**的路径；另外单独扫过 GitHub PAT（`ghp_` / `github_pat_`）、私钥块（`BEGIN PRIVATE KEY` / `CERTIFICATE`）与 `.env` / secret 类文件，历史与当前 HEAD 均无命中。
+
+随后按「真实主机名 / 真实凭据」再扫一遍测试夹具，又抓出**第二类泄露**：`core/src/parse.rs` 与 `core/src/export.rs` 的 AnyTLS 用例直接把用户一个**在用节点**的真实密码（userinfo 段）和真实服务器域名写进了断言。测试夹具本来就该用合成值（同文件其他协议都用 `example.com` / `11111111-2222-…`），这两处是从「复现用户报障」时把原文粘进来没脱敏。见 13.4。
 
 ### 13.2 处置
 
-1. 两个脚本复制到 gitignored 的 `local/`（`.gitignore` 新增 `/local` 与说明），本机继续可用，仓库不再持有。
-2. 从 `docs/` 删除并从**全部历史**抹除：`git filter-repo --invert-paths` 重写 45 个 commit 与 `v0.1.0` / `v0.2.0` 两个 tag，随后强推 `master` 与 tag。
+1. 两个脚本复制到 gitignored 的 `local/`（`.gitignore` 新增 `/local` 与说明），本机继续可用，仓库不再持有。具体凭据值只保留在本机副本里，本文档不复述。
+2. 从 `docs/` 删除并从**全部历史**抹除：`git filter-repo --invert-paths` 重写全部 46 个 commit 与 `v0.1.0` / `v0.2.0` 两个 annotated tag（无 commit 因清空而消失——它们都还带着其他改动），随后 `--force --atomic` 强推 `master` 与两个 tag。重写前先 `git bundle create --all` 存了完整历史备份（本机 Temp 目录）。
 3. 清理文档死引用：`README.md`、`docs/competitive-analysis-and-plan.md` 中对 `import_sparkle_subs.py` 的「脚本修复」描述已删除，仅保留 `docs/test_subhub.py` 的部分。
 4. `AGENTS.md` 增加红线：**仓库是 public，任何带 token 的订阅地址、面板分享链接、Gist/代理凭据一律不得提交**；一次性脚本放 `local/`（已 ignore）。
 5. 顺带删除根目录 `data/subhub.db`（8 月 31 日的陈旧副本，本来就被 `*.db` ignore；现役库在 `target/release/data/`，未动）。
 
+推送后服务端复核（`gh api`，均已实测）：`refs/heads/master` 与两个 tag 都指向重写后的 SHA；`commits?path=<两个脚本>` 返回空；`contents/<脚本>?ref=master` 返回 404；forks 数为 0；v0.2.0 Release 及其 `subhub-app.exe` 资产（digest 未变）仍在；新 master 的 CI 三个 job 全绿。
+
 ### 13.3 仍然存在的风险（如实记录）
 
-**强推 + 历史重写不等于凭据失效。** GitHub 对已推送对象有服务端缓存与 GC 延迟，且 fork / 已 clone 的副本、任何按旧 SHA 访问过的人都可能已经拿到。因此：
+**强推 + 历史重写不等于凭据失效。** 实测证据：重写并强推之后，`GET /repos/<repo>/commits/<旧 master SHA>` 仍返回该提交，且 `GET /repos/<repo>/contents/docs/import_sparkle_subs.py?ref=<旧 SHA>` 仍能把原文件（含凭据）整份取回。GitHub 的服务端对象不会因为 ref 改写而立刻回收，缓存与既有访问者也可能已经拿到。
 
-- **真正的修复是轮换（rotate）那两个私有订阅 token / 分享链接**，以及把个人 Gist 中若含同样链接的内容改掉或设为 secret。这一步只能在面板服务商侧完成，AI 无法代做。
-- 历史重写后，仓库内已无这些字符串（`git grep` 全 refs 验证），但如果服务商侧不轮换，泄露后果不会因为这次清理而消失。
+因此：
+
+- **唯一真正的修复是轮换（rotate）那两个私有订阅 token / 分享链接**，并把个人 Gist 中含同样链接的内容改掉或设为 secret。这一步只能在面板服务商侧完成，AI 无法代做，也不应被这次清理的「历史已抹除」结论替代。
+- 如需让 GitHub 尽快回收旧对象，走官方支持工单（联系 Support，请求对仓库做 GC 并清理缓存 / 搜索索引），这不是仓库侧能自执行的。forks 已确认为 0，不存在 fork 网络扩散。
+- 仓库的**当前 refs 已彻底不含这些字符串**：全 commit `git grep`、两个 path 的历史查询、HEAD 树检查均为空。如果服务商侧不轮换，泄露后果不会因为这次清理而消失——但仓库本身不再是主动泄露源。
+
+### 13.4 第二类泄露：测试夹具里的在用节点（同次处置）
+
+- **事实**：`core/src/parse.rs::anytls_uri_is_parsed` / `base64_of_anytls_uri_list_is_decoded` 与 `core/src/export.rs::anytls_to_clash_meta_emits_password_no_top_level_tls` 用了用户一个**真实在跑的 AnyTLS 节点**的原始 URI——真实密码（userinfo）+ 真实服务器域名。起因是从用户报障原文直接粘进用例当 fixture，没按仓库既有约定换成合成值。`docs/competitive-analysis-and-plan.md` 里也有一处半截（`df28c004-...` + 真实域名）的引用。
+- **处置**：夹具统一换成 `00000000-0000-4000-8000-000000000001@anytls.example.com`，文档处改成 `<uuid>@<host>:<port>` 占位；再跑一次 `git filter-repo --replace-text`（映射表放在仓库外的临时文件，用完删除），把真实密码与真实域名从**全部历史 blob** 中替换掉，强推 `master` 与两个 tag。5 个 `anytls` 用例与全量 `cargo test` / fmt / clippy 在替换后复跑通过。
+- **教训（已写进 `AGENTS.md`）**：**任何从用户报障原文复制进来的样本，进测试前必须先脱敏**——主机名、密码、token、Gist id 一律换成 `example.com` / 全零 uuid / 占位串。真实样本留在本机 DB 与 `local/`。

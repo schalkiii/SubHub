@@ -424,7 +424,7 @@ fn looks_like_subscription(text: &str) -> bool {
 
 ### 12.7 加固：`anytls://` 协议支持 + 端口后多余 `/` 解析（同大类第三例）
 
-用户复报：粘贴的订阅内容解码后是 **base64 包裹的 `anytls://` URI 列表**（形如 `anytls://df28c004-...@anytls.example.com:56147/?type=tcp&insecure=1&fp=chrome&sni=updates.cdn-apple.com#...`），subhub 仍显示 0 节点。
+用户复报：粘贴的订阅内容解码后是 **base64 包裹的 `anytls://` URI 列表**（形如 `anytls://<uuid>@<host>:<port>/?type=tcp&insecure=1&fp=chrome&sni=<sni>#<name>`；真实主机与凭据已脱敏），subhub 仍显示 0 节点。
 
 排查发现两处根因：
 

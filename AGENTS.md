@@ -8,6 +8,7 @@
 - 发布：`cargo build --release -p subhub-app` → `target/release/subhub-app.exe`
 - 端口 3005（`SUBHUB_PORT` 覆盖）；SQLite `data/subhub.db`（`SUBHUB_DB` 覆盖）；测速引擎 `SUBHUB_ENGINE_BIN`
 - **仓库是 public：任何带 token 的订阅地址、面板分享链接、Gist/代理凭据一律不得提交**（含一次性脚本与测试用例——`docs/test_subhub.py` 只用 `127.0.0.1` + 占位密码）。真实订阅列表只留在本地 DB 与本地脚本里；需要保留带凭据的一次性脚本，放 `local/`（已 gitignore），不要放 `docs/`。
+- **用户报障原文复制进测试 / 文档前必须先脱敏**：主机名换成 `*.example.com`、凭据换成全零 uuid 或占位串。AnyTLS 夹具就踩过这个坑——直接把用户在用节点的密码和真实域名写进了断言，事后要重写历史才能抹掉。
 
 ## 不踩坑的硬规则（改前必读）
 - **用户实际跑的是 `subhub-app.exe`（Tauri 内嵌 server），不是 `subhub-server.exe`。** 任何改动要生效，必须 `cargo build --release -p subhub-app` + 重启 `subhub-app.exe`；只构建/重启 server 对用户**完全无效**。

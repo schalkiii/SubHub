@@ -13,10 +13,11 @@
 
 ## [安全] 凭据外泄处置（2026-10-28）
 
-- **移除并抹除**：`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 硬编码了私有订阅 token、面板分享链接与个人 Gist 地址，随早期提交进入 public 仓库。脚本本机副本移入 gitignored 的 `local/`，仓库侧从 HEAD 与**全部历史**（`git filter-repo` 重写 45 commit + `v0.1.0`/`v0.2.0` tag）移除。
+- **移除并抹除**：`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 硬编码了私有订阅 token、面板分享链接与个人 Gist 地址，随早期提交进入 public 仓库。脚本本机副本移入 gitignored 的 `local/`，仓库侧从 HEAD 与**全部历史**（`git filter-repo --invert-paths` 重写全部 commit + `v0.1.0`/`v0.2.0` tag）移除。
+- **第二类**：AnyTLS 的三处测试夹具（`core/src/parse.rs`、`core/src/export.rs`）与一处文档引用直接用了**在用的真实节点**（真实密码 + 真实域名）。夹具换成合成值（`00000000-0000-4000-8000-000000000001@anytls.example.com`）后，再用 `git filter-repo --replace-text` 把真实密码与真实域名从全部历史 blob 中替换掉并强推；替换后 159 测试全通过、fmt 与 clippy 清零。
 - **扫描结论**：逐 commit `git grep` 确认泄露面仅这两个路径；GitHub PAT、私钥块、`.env`/secret 类文件在历史与 HEAD 中均无命中。
-- **文档同步**：清理 `README.md` 与 `docs/competitive-analysis-and-plan.md` 中对已删脚本的死引用；`AGENTS.md` 新增「public 仓库禁止提交任何带 token 的订阅地址，一次性脚本放 `local/`」红线；详情见 `docs/AUDIT-REPORT-2026-10-28.md` 第十三节。
-- **仍未闭环**：历史重写不等于凭据失效（GitHub 服务端缓存、既有 clone/fork 副本）。**必须在服务商侧轮换那两个订阅 token / 分享链接**，这是唯一真正的修复。
+- **文档同步**：清理 `README.md` 与 `docs/competitive-analysis-and-plan.md` 中对已删脚本的死引用；`AGENTS.md` 新增两条红线——「public 仓库禁止提交任何带 token 的订阅地址，一次性脚本放 `local/`」与「用户报障原文进测试前必须脱敏」；详情见 `docs/AUDIT-REPORT-2026-10-28.md` 第十三节。
+- **仍未闭环**：历史重写不等于凭据失效——实测强推后按**旧 commit SHA** 仍能通过 API 取回原文件。forks 为 0，但 GitHub 服务端对象回收需要官方支持工单。**必须在服务商侧轮换那两个订阅 token / 分享链接、改掉个人 Gist 里的同样链接，并更换该 AnyTLS 节点的密码**，这是唯一真正的修复。
 
 ## [P28] 第七轮复核增强（解析保真 / 引擎健壮性 / 处理器一致性）
 
