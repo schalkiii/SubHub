@@ -2,6 +2,29 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P24] 第三轮复核增强（插件协议 / 隐私脱敏 / Gist 代理 / 调度边界）
+
+### Added
+
+- **SS 插件支持**：解析 SIP002 `plugin=obfs-local;obfs=http;obfs-host=...` 与 clash `plugin` / `plugin-opts`，支持 obfs 与 v2ray-plugin；导出到 clash-meta、sing-box 与 Surge（Surge 仅 obfs）。v2ray 不支持 SS 插件，导出时跳过并打日志，避免生成丢失插件的错误节点。插件参数纳入节点指纹。
+- **Hysteria2 obfs**：解析 URI 的 `obfs` / `obfs-password` 与 clash `obfs` / `obfs-password`，导出到 clash-meta 与 sing-box 的 `obfs: {type, password}`；纳入指纹。
+- **订阅用量 `info:` 块**：`extract_subscription_usage` 现在同时读取顶层与嵌套 `info:` 下的 `download` / `upload` / `total` / `expire`（顶层优先）。
+
+### Fixed
+
+- **错误信息泄露订阅令牌**：`fetch_subscription_text` 的 reqwest 错误改用 `without_url()`，代理地址错误用 `redact_url()`；`last_error` 不再包含带 token 的完整订阅 URL / 代理凭据。
+- **Gist 上传走拉取代理**：开启全局拉取代理时，GitHub API 请求复用该代理（60s 超时）；未配置代理时保持系统默认行为。上传前 WebUI 增加“公开 Gist、包含节点凭据”的确认提示。
+- **刷新不存在订阅返回 404**：`POST /api/subscriptions/:id/refresh` 与其他删除/测速接口一致，不再返回 200 + `status:error`；前端刷新失败会弹窗提示。
+- **调度间隔下限**：`auto_refresh_sec` / `node_health_check_sec` 的非零值统一 clamp 到至少 60 秒（0 仍表示关闭），防止 API/环境变量误设 1 秒导致后台循环打满网络。
+- **Surge 节点名清洗**：节点名中的换行、逗号、`=` 替换为 `_`，防止破坏 Surge 配置行或注入额外代理条目。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**119 个测试全通过**（core 98 + server 21）。
+- clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端：`docs/test_subhub.py` ALL CHECKS PASSED（新增 SS 插件/HY2 obfs 导出、错误脱敏、调度 clamp、Gist 代理、刷新 404 用例）。
+- 浏览器验证：Gist 公开确认提示、刷新失败弹窗。
+
 ## [P23] 第二轮复核增强（导出命名 / Top-N / 备份保真 / 传输补全）
 
 ### Fixed

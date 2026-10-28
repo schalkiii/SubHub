@@ -9,7 +9,7 @@
 
 ## 状态
 
-**P0 ~ P23 全部完成并端到端验证。** 更晚的 P16–P23（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY 支持与两轮复核修复/增强等）见 [`CHANGELOG.md`](CHANGELOG.md)。
+**P0 ~ P24 全部完成并端到端验证。** 更晚的 P16–P24（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY/SS 插件/Hysteria2 obfs 支持与三轮复核修复/增强等）见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -31,6 +31,7 @@
 | **P16–P21.6** | **无可用订阅自动清理 + 配置备份导入导出 · 订阅使用量展示 · base64 链接导入 · 测速引擎参数/模式修复 · 地区筛选与导出一致性 · 导出按实测出口重命名** | ✅ |
 | **P22** | **复核修复：刷新空结果保护 · 增量刷新保留延迟/失败计数 · 重复添加只测新增 · TCP-only 健康检查不误判 · SSE 进度修正 · SS cipher 跨格式回退 · Hysteria2/TUIC 强制 TLS · VLESS REALITY 解析/导出 · WebUI 内嵌兜底** | ✅ |
 | **P23** | **第二轮增强：导出名去重与既有后缀冲突 · Top-N 只选可用节点 · 备份保留健康/用量元数据 · Gist 按格式命名与 owner · h2/HTTP 传输 · VMess 端口/aid 校验 · 订阅列表错误态与分享 URL 重复筛选** | ✅ |
+| **P24** | **第三轮增强：SS obfs/v2ray-plugin · Hysteria2 obfs · 用量 info 块 · 错误 URL 脱敏 · Gist 走拉取代理 + 公开确认 · 刷新 404 · 调度最小 60s · Surge 名清洗** | ✅ |
 
 ## 架构
 
@@ -92,11 +93,11 @@
 
 > 💾 **持久化（默认开启）**：订阅与测速结果默认存入 `data/subhub.db`（SQLite，`rusqlite` bundled 编译，**零外部依赖**），重启不丢。可用 `SUBHUB_DB=/path/to/app.db` 覆盖路径；设为空字符串 `SUBHUB_DB=` 退回纯内存（重启即清空）。删除该文件即可重置全部数据。
 
-> ⏱️ **定时自动刷新（可选）**：设置 `SUBHUB_AUTO_REFRESH_SEC=1800`（秒）后，后台会按间隔自动重拉所有**远程**订阅并重新测速（Resin 式自动检测），remote 订阅会沿用各自的 `fetch_proxy`。默认关闭。<br>**其中「重新测速」仅对本次新增节点生效**，已有节点沿用旧测速数据（与「刷新」语义一致，避免无谓重测）。若要对**全部**节点周期性重测连通性 / 延迟，请用 `SUBHUB_HEALTH_CHECK_SEC`（节点健康定时重测，见下），二者职责不同：前者负责「内容更新 + 增量测速」，后者负责「全量健康重探」。
+> ⏱️ **定时自动刷新（可选）**：设置 `SUBHUB_AUTO_REFRESH_SEC=1800`（秒）后，后台会按间隔自动重拉所有**远程**订阅并重新测速（Resin 式自动检测），remote 订阅会沿用各自的 `fetch_proxy`。默认关闭；非零间隔最小 60 秒（避免误设 1 秒打满网络）。<br>**其中「重新测速」仅对本次新增节点生效**，已有节点沿用旧测速数据（与「刷新」语义一致，避免无谓重测）。若要对**全部**节点周期性重测连通性 / 延迟，请用 `SUBHUB_HEALTH_CHECK_SEC`（节点健康定时重测，见下），二者职责不同：前者负责「内容更新 + 增量测速」，后者负责「全量健康重探」。
 
 > 🔌 **其它可选环境变量**：
 > - `SUBHUB_USE_PROXY=0`（或 `false`）—— 关闭所有订阅抓取 / 刷新的上游代理（即使订阅存了 `fetch_proxy`）。
-> - `SUBHUB_HEALTH_CHECK_SEC=3600` —— 节点健康定时重测间隔（秒），后台周期性重探每个节点的连通性 / 延迟；0 = 关闭。
+> - `SUBHUB_HEALTH_CHECK_SEC=3600` —— 节点健康定时重测间隔（秒），后台周期性重探每个节点的连通性 / 延迟；0 = 关闭，非零最小 60 秒。
 > - `SUBHUB_DEFAULT_PROXY=http://127.0.0.1:7890` —— 默认拉取代理（「设置」页也可配，二者取其一），用于预填「拉取代理」并作为添加订阅时的兜底。
 > - `SUBHUB_BIND=127.0.0.1` —— 仅监听本机（默认 `0.0.0.0`，允许局域网 / 公网其他设备访问 `/sub`）。
 > - `SUBHUB_WEBUI_DIR=/path/to/webui` —— 覆盖静态 WebUI 目录（默认依次尝试源码 `webui/`、exe 同级目录；都没有时使用 exe 内嵌副本）。
@@ -138,7 +139,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | GET  | `/api/health`        | 健康检查 |
 | GET  | `/api/subscriptions` | 订阅来源列表（**含逐个健康度**：`status` / `source_type` / `node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` / `last_checked_at` / `last_updated_at` / `last_error`） |
 | POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加经代理访问 Google 204 的 HTTP 延迟；当前版本不采集下载带宽）；**支持以 base64 形式粘贴的订阅链接集合（自动解码展开为多行 URL）** |
-| POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}`。**注意：刷新只重测新增节点，已有节点沿用旧测速数据，不会重测** |
+| POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}`；订阅不存在返回 404。**注意：刷新只重测新增节点，已有节点沿用旧测速数据，不会重测；远端返回 0 节点时按失败处理并保留旧节点** |
 | GET  | `/api/subscriptions/:id/speedtest` | **对单个订阅单独重测**（不碰其他订阅）：返回 SSE 流，事件与全局 `/api/speedtest` 同构（`progress`/`done`），只测该订阅的节点；订阅不存在或无节点返回 404。订阅页卡片的「测速」按钮即调用此端点（区别于「刷新」——刷新不重测已有节点，此端点强制重测该订阅全部节点） |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
 | PATCH | `/api/subscriptions/:id` | **重命名订阅来源**（body: `{"name":"新名字"}`），仅更新展示名，不影响其节点与测速数据 |
@@ -171,7 +172,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 
 - **全局 Top-N**：合并导出与 `GET /sub` 网页订阅**统一受此数值控制**（单一真相源）。设为 N 时两者都只输出评分最高的前 N 个节点（**只从可导出且未判死的节点中选取**，避免死节点占用名额后被过滤导致不足 N 个）；关闭（0 / 留空）则输出全部。WebUI 不再有独立的「导出 Top-N 开关」，避免多套配置互相打架。
 - **代理**：开关 + 默认拉取代理地址（`http` / `https` / `socks5`）。该地址作为**服务端单一真相源**，用于抓取被墙的订阅源（替代原来浏览器 localStorage 里的「记住」复选框）；`add_subscriptions` 仅在校验（`client_with_proxy().is_ok()`）通过后才写入默认。
-- **定时自动刷新**：自动刷新间隔（秒），等价于 `SUBHUB_AUTO_REFRESH_SEC`；0 / 留空则关闭。
+- **定时自动刷新**：自动刷新间隔（秒），等价于 `SUBHUB_AUTO_REFRESH_SEC`；0 / 留空则关闭，非零最小 60 秒。节点健康定时重测同样如此。
 - **测速引擎**：外部引擎二进制路径，等价于 `SUBHUB_ENGINE_BIN`；留空则仅做 TCP 连通性延迟。
 - **自动移除**：连续不可用达到该阈值的节点在测速 / 刷新后自动熔断清理（见坏节点熔断清理）。
 
@@ -254,11 +255,11 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 | 协议 | 解析 | clash-meta | v2ray | sing-box | surge | 说明 |
 |---|---|---|---|---|---|---|
-| SS | ✅ | ✅ | ✅ | ✅ | ✅ | 加密方法兼容 `method`（URI）与 `cipher`（YAML）两种存储 |
+| SS | ✅ | ✅ | ✅ | ✅ | ✅ | 加密方法兼容 `method`（URI）与 `cipher`（YAML）；支持 obfs / v2ray-plugin（v2ray 跳过插件节点，Surge 仅支持 obfs） |
 | VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / h2 / tls / SNI |
 | VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | 含 **REALITY**（`pbk` / `sid`）与 ws / grpc / h2；缺公钥的 REALITY 节点视为不完整、不导出 |
 | Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | 始终 TLS |
-| Hysteria2 | ✅ | ✅ | — | ✅ | — | v2ray-core 无法表示；sing-box 强制 TLS |
+| Hysteria2 | ✅ | ✅ | — | ✅ | — | 支持 obfs（salamander）；v2ray-core 无法表示；sing-box 强制 TLS |
 | TUIC | ✅ | ✅ | — | ✅ | — | 同上 |
 | SOCKS5 / HTTP(S) | ✅ | ✅ | — | ✅ | — | HTTP 443 端口按 TLS 处理 |
 | WireGuard | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出 |
@@ -268,8 +269,8 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 已知限制（暂不支持，遇到时会丢字段/整节点）：
 
-- SS `plugin` / `plugin-opts`（obfs、v2ray-plugin）未解析，导出后插件丢失。
-- Hysteria2 的 `obfs` / `alpn`、TUIC 的拥塞控制 / `alpn` 等高级参数未解析。
+- SS 的 `v2ray-plugin` 只能导出到 clash / sing-box；v2ray 与 Surge 不支持该插件，导出时会跳过并打日志（obfs 在 Surge 中可用）。
+- Hysteria2 的 `alpn`、TUIC 的拥塞控制 / `alpn` 等高级参数未解析。
 - sing-box 导出跳过 WireGuard / AnyTLS；v2ray 导出跳过 Hysteria2 / TUIC / SOCKS5 / HTTP / WireGuard / AnyTLS（会打印跳过数量）。
 - `base64` 格式是 **clash-meta YAML 的 base64**，不是 v2rayN 的 URI 列表 base64。
 
@@ -300,7 +301,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **逐个订阅健康度**（借 Resin `SubscriptionResponse` 模型）：`status`(healthy/degraded/down/error/empty/untested/disabled/pending)、`node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` 均随节点派生
 - 坏订阅（不可达源）→ `status:"error"` + `last_error` 填充；好订阅正确区分为 `untested` 而非 `down`
 - **添加后自动健康度检测 + 测速**：导入 / 添加订阅后立即对节点跑 TCP 测速，`available` / `latency_ms` 自动写回（本机可达节点 `available:true`、不可达 `available:false`），健康度卡片随之即时刷新
-- **订阅使用量展示**：自动解析订阅的 `Subscription-Userinfo` 响应头与 clash `info` 块（`download` / `upload` / `total` / `expire`），在「订阅管理」每张订阅卡片上显示流量用量进度条、已用 / 总量与到期日；无使用量信息的订阅自动隐藏。数据随订阅抓取 / 刷新自动刷新
+- **订阅使用量展示**：自动解析订阅的 `Subscription-Userinfo` 响应头与 clash 用量字段（顶层或嵌套 `info:` 块中的 `download` / `upload` / `total` / `expire`），在「订阅管理」每张订阅卡片上显示流量用量进度条、已用 / 总量与到期日；无使用量信息的订阅自动隐藏。数据随订阅抓取 / 刷新自动刷新
 - **通过代理拉取订阅**：`POST /api/subscriptions` 的 `fetch_proxy` 字段（或 WebUI 批量添加面板的「拉取代理」）支持 `http` / `https` / `socks5` 代理，用于抓取被墙的订阅源；代理地址无效会令该订阅 `status:"error"` 并写入 `last_error`
 - **订阅刷新** `POST /api/subscriptions/:id/refresh` 生效（重拉源、更新 `last_checked_at`/`last_updated_at`；remote 订阅会沿用其存储的 `fetch_proxy`）
 - **出口地区探测** `POST /api/geo-detect` 无引擎时安全返回空列表、不报错；配置引擎后写回 `outbound_country`

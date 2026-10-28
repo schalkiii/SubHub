@@ -336,3 +336,36 @@
 - SS `plugin` / `plugin-opts`、Hysteria2 `obfs`/`alpn`、TUIC 拥塞控制等高级参数未解析（B19/B20，已在 README 声明）。
 - 无 CI、无全量 `cargo fmt`、无 LICENSE；根目录 `nul` 与 `docs/review-round-*.html` 为待确认删除候选。
 - 本地 / 粘贴类订阅的备份恢复仍靠「新增一条」而非幂等更新；如需完全幂等需引入内容指纹或受控 id 匹配（设计取舍，未在本轮改动）。
+
+---
+
+## 八、第三轮复核增强（2026-10-28 再续）
+
+第三轮聚焦“剩余协议字段、隐私泄露面、分发通道与调度/名称边界”。
+
+### 8.1 新发现问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| D1 | `core/src/parse.rs` / `export.rs` | SS `plugin` / `plugin-opts` 未解析，obfs/v2ray-plugin 节点导出后插件丢失；v2ray 导出会生成看似正常但必然连不上的节点 | 高 | 模型新增 `plugin`/`plugin_opts`；解析 SIP002 与 clash；导出 clash/sing-box/Surge（Surge 仅 obfs）；v2ray 跳过并告警；指纹纳入插件；补三格式测试 |
+| D2 | `core/src/parse.rs` / `export.rs` | Hysteria2 `obfs` / `obfs-password` 未解析，sing-box/clash 导出丢混淆 | 中 | 模型新增 `obfs`/`obfs_password`；解析 URI/clash/sing-box，导出 clash/sing-box；指纹纳入；补测试 |
+| D3 | `core/src/parse.rs::extract_subscription_usage` | 只读顶层用量字段，嵌套 `info:` 块（常见）被漏掉，用量卡片不显示 | 中 | 同时读取顶层与 `info:`（顶层优先）；新增嵌套/混合测试 |
+| D4 | `server/src/lib.rs::fetch_subscription_text` / `client_with_proxy` | reqwest 错误 Display 含完整 URL（订阅 token / 代理凭据），写入 `last_error` 后显示在 UI | 高（隐私） | 使用 `without_url()`；代理错误用 `redact_url()`；端到端断言 `SUPERSECRET` 不出现在错误中 |
+| D5 | `server/src/handlers/speedtest.rs::gist_upload` | Gist 请求不走全局拉取代理，GitHub 被墙时上传不可用；WebUI 无公开上传确认 | 中 | 开启代理时复用 `default_fetch_proxy`（60s 超时）；前端增加“公开 Gist”确认；端到端验证代理失败路径 |
+| D6 | `server/src/handlers/subscription.rs::refresh_subscription` | 不存在的 id 返回 200 + `status:error`，与删除/测速 404 契约不一致 | 低 | 改为 404；端到端新增断言；前端刷新失败弹窗 |
+| D7 | `server/src/handlers/settings.rs` + `run_server` | `auto_refresh_sec` / `node_health_check_sec` 可被设成 1 秒，后台循环高频打网络 | 中 | `clamp_schedule`：0 保持关闭，非零最小 60s；环境变量、meta 读取与 API 写入统一；单测覆盖 |
+| D8 | `core/src/export.rs::to_surge` | 节点名含换行/逗号/`=` 会破坏 Surge 配置行，甚至注入额外代理条目 | 中（安全） | `surge_safe()` 清洗名称与 obfs 参数；新增换行注入测试 |
+
+### 8.2 验证
+
+- `cargo test -p subhub-core -p subhub-server`：**119 个测试全通过**（core 98 + server 21）。
+- clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端 ALL CHECKS PASSED：新增 SS 插件/HY2 obfs 三格式导出、错误脱敏、调度 clamp、Gist 代理失败、刷新 404 断言。
+- 浏览器验证：Gist 公开确认、刷新失败弹窗、合并/设置页无控制台错误。
+
+### 8.3 仍为 pending
+
+- TUIC 拥塞控制/`alpn`、Hysteria2 `alpn` 等高级参数未解析（已于 README 声明）。
+- 本地 / 粘贴类订阅备份恢复非幂等（每次新增一条），需内容指纹或受控 id 匹配的设计取舍。
+- 无 CI、无全量 `cargo fmt`、无 LICENSE；`nul` 与 `docs/review-round-*.html` 仍为待确认删除候选。
+- 默认监听 `0.0.0.0` 且 API 无鉴权：这是为局域网 `/sub` 设计的既有行为，若在不可信网络使用建议设置 `SUBHUB_BIND=127.0.0.1` 或加防火墙。
