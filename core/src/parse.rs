@@ -306,15 +306,24 @@ fn yaml_string_list(v: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
 
 /// Parse `"30 Mbps"` / `"30"` / `"30Mbps"` into Mbps.
 fn parse_mbps(s: &str) -> Option<u64> {
-    let numeric: String = s
-        .trim()
+    let lower = s.trim().to_ascii_lowercase();
+    let numeric: String = lower
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
-    numeric
-        .parse::<f64>()
-        .ok()
-        .map(|n| n.max(0.0).round() as u64)
+    let value: f64 = numeric.parse().ok()?;
+    let unit = lower[numeric.len()..].trim();
+    let factor = if unit.starts_with("gb") {
+        1000.0
+    } else if unit.starts_with("kb") {
+        0.001
+    } else if unit.starts_with("b") {
+        0.000_001
+    } else {
+        // `mbps` / `mb` / 无单位一律按 Mbps。
+        1.0
+    };
+    Some((value.max(0.0) * factor).round() as u64)
 }
 
 fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
@@ -1482,6 +1491,12 @@ mod tests {
         assert_eq!(out[0].up_mbps, Some(30));
         assert_eq!(out[0].down_mbps, Some(200));
         assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
+
+        // mihomo 允许 Gbps/kbps 单位；必须换算而不是只取数字前缀。
+        let units = "proxies:\n  - name: H\n    type: hysteria2\n    server: hy.example.com\n    port: 443\n    password: pw\n    up: \"1 Gbps\"\n    down: \"500 kbps\"\n";
+        let out = parse_subscription(units);
+        assert_eq!(out[0].up_mbps, Some(1000));
+        assert_eq!(out[0].down_mbps, Some(1));
 
         let json = r#"{
             "outbounds": [

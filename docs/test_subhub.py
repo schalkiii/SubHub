@@ -248,6 +248,20 @@ def main():
     assert "HY-OBFS" not in v2_all, "v2ray 不应导出 hysteria2 节点"
     print("  ✅ SS plugin / HY2 obfs survive clash/sing-box and are skipped by v2ray")
 
+    print("== Surge type/transport boundaries ==")
+    # Surge 的 [Proxy] 关键字表里没有 vless，传输层只有 TCP / WebSocket；
+    # hysteria2 的 salamander 混淆用单键 salamander-password=。
+    sg_all = call("/api/export", {"format": "surge"})["content"]
+    assert "REALITY-Test" not in sg_all, "surge 不能导出 vless 节点（Surge 无该协议）"
+    assert " = vless," not in sg_all, "surge 输出中出现 vless 行"
+    assert "network=" not in sg_all, "surge 输出不应带非 Surge 关键字 network="
+    hy_lines = [l for l in sg_all.splitlines() if "HY-OBFS" in l]
+    assert hy_lines and "hysteria2" in hy_lines[0], f"surge 缺少 hysteria2 行: {hy_lines}"
+    assert "salamander-password=secret" in hy_lines[0], hy_lines[0]
+    ss_lines = [l for l in sg_all.splitlines() if "SS-PLUGIN" in l]
+    assert ss_lines and "obfs=http" in ss_lines[0], f"surge 缺少 SS obfs: {ss_lines}"
+    print("  ✅ Surge skips vless, has no network= key, exports hysteria2/SS obfs")
+
     print("== export filters out invalid (other-type) nodes (Round E/F regression) ==")
     # An unrecognized proxy type is parsed as ProxyType::Other and MUST NOT be exported,
     # otherwise mihomo/clash reject the whole subscription (Sparkle: 'unsupport proxy type: other').
@@ -441,6 +455,25 @@ proxies:
     kept = next(s for s in doc2["subscriptions"] if s["name"] == "LOCAL-RESTORE")
     assert kept["uid"] == "u_test_fixed", kept
     print("  ✅ repeated local restore updates in place and keeps uid")
+
+    print("== same remote URL twice inside ONE import batch stays one sub ==")
+    # by_url 原先只在批次开始前建索引，同批第二条会 miss 并再追加一条重复订阅。
+    dup = {
+        "id": "sub_900",
+        "name": "DUP-REMOTE",
+        "source": "http://127.0.0.1:9/dup-batch",
+        "source_type": "remote",
+        "fetch_proxy": None,
+        "proxies": [],
+    }
+    before = len(call("/api/subscriptions"))
+    r = call("/api/subscriptions/import", {"subscriptions": [dup, dict(dup)]})
+    dups = [s for s in call("/api/subscriptions") if s["source"] == dup["source"]]
+    assert len(dups) == 1, f"同批重复 URL 追加了 {len(dups)} 条订阅"
+    assert r["added"] == 1 and r["replaced"] == 1, r
+    assert len(call("/api/subscriptions")) == before + 1, (before, r)
+    call(f"/api/subscriptions/{dups[0]['id']}", method="DELETE")
+    print("  ✅ second entry in the same batch updates instead of duplicating")
 
     print("== unlock-detect (no engine -> list, must not error) ==")
     r = call("/api/unlock-detect", {"timeout_ms": 3000})

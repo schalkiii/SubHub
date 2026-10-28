@@ -133,8 +133,10 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "password", &p.password);
             insert_opt(&mut m, "sni", &p.sni);
             insert_opt(&mut m, "flow", &p.flow);
+            insert_opt(&mut m, "network", &p.network);
             insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
             insert_string_list(&mut m, "alpn", &p.alpn);
+            insert_transport_opts(&mut m, p);
             m.insert(Value::from("tls"), Value::from(true));
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
         }
@@ -198,7 +200,12 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "sni", &p.sni);
             insert_string_list(&mut m, "alpn", &p.alpn);
             insert_opt(&mut m, "congestion-controller", &p.congestion_control);
-            insert_opt(&mut m, "udp-relay-mode", &p.udp_relay_mode);
+            // UDP-over-Stream replaces the relay mode entirely (UDP rides the
+            // authenticated stream instead of a QUIC relay); emitting both
+            // gives the kernel two contradictory instructions.
+            if !p.udp_over_stream.unwrap_or(false) {
+                insert_opt(&mut m, "udp-relay-mode", &p.udp_relay_mode);
+            }
             insert_opt_bool(&mut m, "udp-over-stream", p.udp_over_stream);
             insert_opt_bool(&mut m, "reduce-rtt", p.zero_rtt_handshake);
         }
@@ -694,6 +701,9 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
             o["password"] = json!(p.password.clone().unwrap_or_default());
+            if let Some(t) = singbox_transport(p) {
+                o["transport"] = t;
+            }
             if let Some(tls) = singbox_tls(p) {
                 o["tls"] = tls;
             }
@@ -742,8 +752,10 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             if let Some(cc) = &p.congestion_control {
                 o["congestion_control"] = json!(cc);
             }
-            if let Some(mode) = &p.udp_relay_mode {
-                o["udp_relay_mode"] = json!(mode);
+            if !p.udp_over_stream.unwrap_or(false) {
+                if let Some(mode) = &p.udp_relay_mode {
+                    o["udp_relay_mode"] = json!(mode);
+                }
             }
             if let Some(v) = p.udp_over_stream {
                 o["udp_over_stream"] = json!(v);
@@ -812,9 +824,154 @@ fn surge_safe(s: &str) -> String {
         .collect()
 }
 
+/// Surge's `[Proxy]` type keywords are a closed set (Surge manual → Policies
+/// Overview): `ss` / `vmess` / `trojan` / `tuic` / `hysteria2` / `anytls` /
+/// `socks5` / `https` / `http`. There is **no `vless`** keyword and no
+/// `flow=` / REALITY parameters, and `wireguard` lives in a separate
+/// `[WireGuard]` section — emitting either would produce a line Surge cannot
+/// parse, so the node is skipped with a log instead.
+///
+/// Transport-wise Surge implements TCP and WebSocket only: `grpc` / `h2` /
+/// `httpupgrade` have no `[Proxy]` equivalent, and degrading such a node to a
+/// plain TCP line yields a proxy that always fails the handshake.
+fn surge_supported(p: &Proxy) -> bool {
+    match p.type_ {
+        ProxyType::Ss => match ss_plugin(p) {
+            Some((name, _)) => {
+                let ok = name.to_ascii_lowercase().contains("obfs");
+                if !ok {
+                    eprintln!(
+                        "[export] surge 不支持 SS 插件「{name}」节点「{}」，已跳过",
+                        p.name
+                    );
+                }
+                ok
+            }
+            None => true,
+        },
+        ProxyType::Vmess | ProxyType::Trojan => match p.network.as_deref().unwrap_or("tcp") {
+            "" | "tcp" | "ws" => true,
+            other => {
+                eprintln!(
+                    "[export] surge 不支持 {other} 传输节点「{}」，已跳过",
+                    p.name
+                );
+                false
+            }
+        },
+        ProxyType::Vless => {
+            eprintln!(
+                "[export] surge 无 vless 协议，节点「{}」已跳过（请改用 clash-meta / sing-box）",
+                p.name
+            );
+            false
+        }
+        ProxyType::Wireguard => {
+            eprintln!(
+                "[export] surge wireguard 需要独立 [WireGuard] 段，节点「{}」已跳过",
+                p.name
+            );
+            false
+        }
+        ProxyType::Hysteria2 => {
+            let obfs = p.obfs.as_deref().unwrap_or_default();
+            if obfs.is_empty() {
+                return true;
+            }
+            let known = matches!(obfs.to_ascii_lowercase().as_str(), "salamander" | "gecko");
+            if !known {
+                eprintln!(
+                    "[export] surge 不支持 hysteria2 混淆「{obfs}」节点「{}」，已跳过",
+                    p.name
+                );
+                return false;
+            }
+            if p.obfs_password.as_deref().unwrap_or_default().is_empty() {
+                eprintln!(
+                    "[export] surge hysteria2 节点「{}」缺少混淆密码，已跳过",
+                    p.name
+                );
+                return false;
+            }
+            true
+        }
+        ProxyType::Tuic | ProxyType::Socks5 | ProxyType::Http | ProxyType::AnyTls => true,
+        ProxyType::Other => false,
+    }
+}
+
+/// Flat WebSocket parameters. `path` / `host` are only emitted for the `ws`
+/// transport — a TCP node carrying them would advertise a transport it does
+/// not use.
+fn push_surge_ws(s: &mut String, p: &Proxy) {
+    if p.network.as_deref() != Some("ws") {
+        return;
+    }
+    s.push_str(", ws=true");
+    if let Some(path) = &p.path {
+        s.push_str(&format!(", ws-path={}", surge_safe(path)));
+    }
+    if let Some(host) = &p.host {
+        s.push_str(&format!(", ws-headers=Host:{}", surge_safe(host)));
+    }
+}
+
+/// TLS keys shared by Surge's TLS-based proxy types. Our `fingerprint` field
+/// is mihomo's `client-fingerprint` (uTLS), whose Surge key is
+/// `tls-fingerprint=`; `alpn=` is only emitted for a single value because a
+/// comma-separated list needs quoting that older Surge builds reject.
+///
+/// `tls=` is deliberately *not* emitted: in Surge only vmess defaults to
+/// plaintext and needs the explicit switch (trojan / anytls / hysteria2 / tuic
+/// imply TLS from the protocol itself).
+fn push_surge_tls(s: &mut String, p: &Proxy) {
+    if let Some(sni) = &p.sni {
+        s.push_str(&format!(", sni={}", surge_safe(sni)));
+    }
+    if p.skip_cert_verify.unwrap_or(false) {
+        s.push_str(", skip-cert-verify=true");
+    }
+    if let Some(fp) = &p.fingerprint {
+        s.push_str(&format!(", tls-fingerprint={}", surge_safe(fp)));
+    }
+    if let Some([single]) = p.alpn.as_deref() {
+        s.push_str(&format!(", alpn={}", surge_safe(single)));
+    }
+}
+
+/// SOCKS5 / HTTP take username and password as *positional* arguments
+/// (`socks5, host, port, username, password`). A password without a username
+/// has no slot, so it is dropped with a log rather than shifted into the
+/// username field.
+fn surge_positional_auth(p: &Proxy) -> String {
+    let user = p
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("user"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default();
+    if user.is_empty() {
+        if p.password.is_some() {
+            eprintln!(
+                "[export] surge {} 节点「{}」只有密码没有用户名，凭据已丢弃",
+                p.type_.as_str(),
+                p.name
+            );
+        }
+        return String::new();
+    }
+    match &p.password {
+        Some(pw) => format!(", {}, {}", surge_safe(user), surge_safe(pw)),
+        None => format!(", {}", surge_safe(user)),
+    }
+}
+
 pub fn to_surge(proxies: &[Proxy]) -> String {
-    let mut lines = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     for p in proxies {
+        if !surge_supported(p) {
+            continue;
+        }
         let name = surge_safe(&p.name);
         let line = match p.type_ {
             ProxyType::Ss => {
@@ -826,22 +983,15 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
                     ss_method(p),
                     p.password.clone().unwrap_or_default()
                 );
-                if let Some((plugin_name, opts)) = ss_plugin(p) {
-                    let lower = plugin_name.to_ascii_lowercase();
-                    if lower.contains("obfs") {
-                        if let Some((_, mode)) =
-                            opts.iter().find(|(k, _)| k == "obfs" || k == "mode")
-                        {
-                            s.push_str(&format!(", obfs={}", surge_safe(mode)));
-                        }
-                        if let Some((_, host)) =
-                            opts.iter().find(|(k, _)| k == "obfs-host" || k == "host")
-                        {
-                            s.push_str(&format!(", obfs-host={}", surge_safe(host)));
-                        }
-                    } else {
-                        eprintln!("[export] surge 不支持 SS 插件节点「{}」，已跳过", p.name);
-                        continue;
+                // `surge_supported` already rejected the non-obfs plugins.
+                if let Some((_, opts)) = ss_plugin(p) {
+                    if let Some((_, mode)) = opts.iter().find(|(k, _)| k == "obfs" || k == "mode") {
+                        s.push_str(&format!(", obfs={}", surge_safe(mode)));
+                    }
+                    if let Some((_, host)) =
+                        opts.iter().find(|(k, _)| k == "obfs-host" || k == "host")
+                    {
+                        s.push_str(&format!(", obfs-host={}", surge_safe(host)));
                     }
                 }
                 s
@@ -854,67 +1004,144 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
                     p.port,
                     p.password.clone().unwrap_or_default()
                 );
-                if let Some(sni) = &p.sni {
-                    s.push_str(&format!(", sni={sni}"));
-                }
-                if p.tls.unwrap_or(false) {
-                    s.push_str(", tls=true");
-                }
-                if p.skip_cert_verify.unwrap_or(false) {
-                    s.push_str(", skip-cert-verify=true");
-                }
+                push_surge_tls(&mut s, p);
+                push_surge_ws(&mut s, p);
                 s
             }
             ProxyType::Vmess => {
                 let mut s = format!(
-                    "{} = vmess, {}, {}, username={}, network={}",
-                    name,
-                    p.server,
-                    p.port,
-                    p.uuid.clone().unwrap_or_default(),
-                    p.network.clone().unwrap_or_else(|| "tcp".into())
-                );
-                if p.tls.unwrap_or(false) {
-                    s.push_str(", tls=true");
-                }
-                if let Some(sni) = &p.sni {
-                    s.push_str(&format!(", sni={sni}"));
-                }
-                if p.network.as_deref() == Some("ws") {
-                    s.push_str(", ws=true");
-                }
-                if let Some(path) = &p.path {
-                    s.push_str(&format!(", ws-path={path}"));
-                }
-                if let Some(host) = &p.host {
-                    s.push_str(&format!(", ws-headers=Host:{host}"));
-                }
-                s
-            }
-            ProxyType::Vless => {
-                let mut s = format!(
-                    "{} = vless, {}, {}, username={}",
+                    "{} = vmess, {}, {}, username={}",
                     name,
                     p.server,
                     p.port,
                     p.uuid.clone().unwrap_or_default()
                 );
-                if let Some(flow) = &p.flow {
-                    s.push_str(&format!(", flow={flow}"));
+                if let Some(cipher) = &p.cipher {
+                    s.push_str(&format!(", encrypt-method={}", surge_safe(cipher)));
                 }
                 if p.tls.unwrap_or(false) {
                     s.push_str(", tls=true");
                 }
-                if let Some(sni) = &p.sni {
-                    s.push_str(&format!(", sni={sni}"));
-                }
+                push_surge_tls(&mut s, p);
+                push_surge_ws(&mut s, p);
                 s
+            }
+            ProxyType::Hysteria2 => {
+                let mut s = format!(
+                    "{} = hysteria2, {}, {}, password={}",
+                    name,
+                    p.server,
+                    p.port,
+                    p.password.clone().unwrap_or_default()
+                );
+                // Surge has no `obfs=` key: the type is implied by the
+                // password key. Bandwidth is a plain number (no ` Mbps`) and
+                // only the download direction has a key.
+                if let Some(obfs) = p.obfs.as_deref().filter(|o| !o.is_empty()) {
+                    let key = if obfs.eq_ignore_ascii_case("gecko") {
+                        "gecko-password"
+                    } else {
+                        "salamander-password"
+                    };
+                    s.push_str(&format!(
+                        ", {key}={}",
+                        p.obfs_password.clone().unwrap_or_default()
+                    ));
+                }
+                if let Some(down) = p.down_mbps {
+                    s.push_str(&format!(", download-bandwidth={down}"));
+                }
+                push_surge_tls(&mut s, p);
+                s
+            }
+            ProxyType::Tuic => {
+                // Surge needs the explicit `version=5`; without it it falls
+                // back to the v4 token-only handshake and the node fails.
+                // Congestion control / udp-relay-mode have no Surge key and are
+                // left out.
+                format!(
+                    "{} = tuic, {}, {}, uuid={}, password={}, version=5",
+                    name,
+                    p.server,
+                    p.port,
+                    p.uuid.clone().unwrap_or_default(),
+                    p.password.clone().unwrap_or_default()
+                )
+            }
+            ProxyType::AnyTls => {
+                let mut s = format!(
+                    "{} = anytls, {}, {}, password={}",
+                    name,
+                    p.server,
+                    p.port,
+                    p.password.clone().unwrap_or_default()
+                );
+                push_surge_tls(&mut s, p);
+                s
+            }
+            ProxyType::Socks5 => {
+                let kw = if p.tls.unwrap_or(false) {
+                    "socks5-tls"
+                } else {
+                    "socks5"
+                };
+                format!(
+                    "{} = {kw}, {}, {}{}",
+                    name,
+                    p.server,
+                    p.port,
+                    surge_positional_auth(p)
+                )
+            }
+            ProxyType::Http => {
+                // Same rule as the clash export: port 443 is treated as TLS,
+                // and Surge's TLS HTTP proxy is the `https` keyword.
+                let kw = if p.tls.unwrap_or(false) || p.port == 443 {
+                    "https"
+                } else {
+                    "http"
+                };
+                format!(
+                    "{} = {kw}, {}, {}{}",
+                    name,
+                    p.server,
+                    p.port,
+                    surge_positional_auth(p)
+                )
             }
             _ => continue,
         };
         lines.push(line);
     }
-    lines.join("\n")
+
+    // Dedupe on the finished lines: sanitizing can turn two distinct names into
+    // the same string ("a,b" / "a_b"), and nodes skipped above must not shift
+    // the ` #N` suffixes of the nodes that were actually emitted.
+    // `surge_safe` strips `=` from the name, so the first " = " is the separator.
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        match line.split_once(" = ") {
+            Some((head, rest)) => {
+                let mut name = head.to_string();
+                if !seen_names.insert(name.clone()) {
+                    let base = name.clone();
+                    let mut i = 2;
+                    loop {
+                        let candidate = format!("{base} #{i}");
+                        if seen_names.insert(candidate.clone()) {
+                            name = candidate;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                out.push(format!("{name} = {rest}"));
+            }
+            None => out.push(line),
+        }
+    }
+    out.join("\n")
 }
 
 #[cfg(test)]
@@ -1261,6 +1488,144 @@ mod tests {
     }
 
     #[test]
+    fn surge_skips_vless_and_unsupported_transports() {
+        // Surge 的 [Proxy] 类型表里没有 vless，传输层只有 TCP / WebSocket。
+        // 输出这些节点只会得到一行 Surge 解析不了、或握手必败的配置。
+        let mut vl = mk(ProxyType::Vless, "1.1.1.1", 443);
+        vl.uuid = Some("u".into());
+        vl.tls = Some(true);
+        let mut grpc = mk(ProxyType::Vmess, "2.2.2.2", 443);
+        grpc.uuid = Some("u".into());
+        grpc.network = Some("grpc".into());
+        let mut hy2_grpc = mk(ProxyType::Trojan, "3.3.3.3", 443);
+        hy2_grpc.password = Some("pw".into());
+        hy2_grpc.network = Some("h2".into());
+
+        assert!(
+            super::to_surge(std::slice::from_ref(&vl)).is_empty(),
+            "vless 必须整节点跳过"
+        );
+        assert!(
+            super::to_surge(std::slice::from_ref(&grpc)).is_empty(),
+            "grpc 必须整节点跳过"
+        );
+        assert!(
+            super::to_surge(std::slice::from_ref(&hy2_grpc)).is_empty(),
+            "h2 必须整节点跳过"
+        );
+    }
+
+    #[test]
+    fn surge_websocket_params_are_flat_and_tls_key_is_vmess_only() {
+        let mut vm = mk(ProxyType::Vmess, "vm.example.com", 443);
+        vm.uuid = Some("uuid-1".into());
+        vm.network = Some("ws".into());
+        vm.path = Some("/ws-path".into());
+        vm.host = Some("cdn.example.com".into());
+        vm.tls = Some(true);
+        vm.sni = Some("cdn.example.com".into());
+
+        let vm_out = super::to_surge(std::slice::from_ref(&vm));
+        assert!(vm_out.contains(", ws=true"), "{vm_out}");
+        assert!(vm_out.contains("ws-path=/ws-path"), "{vm_out}");
+        assert!(
+            vm_out.contains("ws-headers=Host:cdn.example.com"),
+            "{vm_out}"
+        );
+        assert!(vm_out.contains("tls=true"), "{vm_out}");
+        // `network=` 不是 Surge 的关键字（Surge 用 ws=true 表示传输层）。
+        assert!(!vm_out.contains("network="), "{vm_out}");
+
+        let mut tr = mk(ProxyType::Trojan, "tr.example.com", 443);
+        tr.password = Some("pw".into());
+        tr.network = Some("ws".into());
+        tr.path = Some("/t".into());
+        tr.tls = Some(true);
+        let tr_out = super::to_surge(std::slice::from_ref(&tr));
+        assert!(tr_out.contains("ws-path=/t"), "{tr_out}");
+        // trojan 由协议本身隐含 TLS，Surge 不认该键。
+        assert!(!tr_out.contains("tls="), "{tr_out}");
+    }
+
+    #[test]
+    fn surge_exports_hysteria2_tuic_anytls_socks_and_http() {
+        let mut hy = mk(ProxyType::Hysteria2, "hy.example.com", 8443);
+        hy.password = Some("pw".into());
+        hy.obfs = Some("salamander".into());
+        hy.obfs_password = Some("secret".into());
+        hy.down_mbps = Some(200);
+        hy.up_mbps = Some(100);
+        let hy_out = super::to_surge(std::slice::from_ref(&hy));
+        assert!(
+            hy_out.starts_with("node = hysteria2, hy.example.com, 8443, password=pw"),
+            "{hy_out}"
+        );
+        assert!(hy_out.contains("salamander-password=secret"), "{hy_out}");
+        // Surge 的带宽键是纯数字，且只有下行键。
+        assert!(hy_out.contains("download-bandwidth=200"), "{hy_out}");
+        assert!(!hy_out.contains("100"), "{hy_out}");
+
+        let mut tu = mk(ProxyType::Tuic, "tu.example.com", 443);
+        tu.uuid = Some("u".into());
+        tu.password = Some("pw".into());
+        let tu_out = super::to_surge(std::slice::from_ref(&tu));
+        assert!(tu_out.contains("uuid=u"), "{tu_out}");
+        assert!(tu_out.contains("version=5"), "{tu_out}");
+
+        let mut an = mk(ProxyType::AnyTls, "an.example.com", 56147);
+        an.password = Some("tok".into());
+        an.sni = Some("apple.com".into());
+        an.skip_cert_verify = Some(true);
+        let an_out = super::to_surge(std::slice::from_ref(&an));
+        assert!(
+            an_out.starts_with("node = anytls, an.example.com, 56147, password=tok"),
+            "{an_out}"
+        );
+        assert!(an_out.contains("sni=apple.com"), "{an_out}");
+        assert!(an_out.contains("skip-cert-verify=true"), "{an_out}");
+
+        let mut so = mk(ProxyType::Socks5, "10.0.0.1", 1080);
+        so.extra = Some(serde_json::json!({ "user": "bob" }));
+        so.password = Some("secretpw".into());
+        let so_out = super::to_surge(std::slice::from_ref(&so));
+        // SOCKS5 的用户名/密码是位置参数。
+        assert_eq!(so_out, "node = socks5, 10.0.0.1, 1080, bob, secretpw");
+
+        let mut ht = mk(ProxyType::Http, "10.0.0.2", 443);
+        ht.extra = Some(serde_json::json!({ "user": "bob" }));
+        // 443 端口的 http 按 TLS 处理，与 clash 导出同一规则。
+        assert_eq!(
+            super::to_surge(std::slice::from_ref(&ht)),
+            "node = https, 10.0.0.2, 443, bob"
+        );
+    }
+
+    #[test]
+    fn surge_hysteria2_unknown_obfs_is_skipped() {
+        let mut hy = mk(ProxyType::Hysteria2, "hy.example.com", 8443);
+        hy.password = Some("pw".into());
+        hy.obfs = Some("gecko-ish".into());
+        hy.obfs_password = Some("secret".into());
+        assert!(super::to_surge(std::slice::from_ref(&hy)).is_empty());
+    }
+
+    #[test]
+    fn surge_dedupes_names_that_collide_after_sanitizing() {
+        let mut a = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        a.name = "a,b".into();
+        a.method = Some("aes-256-gcm".into());
+        a.password = Some("pw".into());
+        let mut b = a.clone();
+        b.name = "a_b".into();
+        let out = super::to_surge(&[a, b]);
+        let names: Vec<&str> = out
+            .lines()
+            .map(|l| l.split(" = ").next().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a_b", "a_b #2"], "清洗后同名必须加后缀: {out}");
+    }
+
+    #[test]
     fn tuic_advanced_fields_exported() {
         let mut p = mk(ProxyType::Tuic, "tu.example.com", 443);
         p.uuid = Some("u".into());
@@ -1268,14 +1633,12 @@ mod tests {
         p.alpn = Some(vec!["h3".into()]);
         p.congestion_control = Some("bbr".into());
         p.udp_relay_mode = Some("quic".into());
-        p.udp_over_stream = Some(true);
+        p.udp_over_stream = Some(false);
         p.zero_rtt_handshake = Some(true);
 
         let clash = super::to_clash_meta(std::slice::from_ref(&p));
         assert!(clash.contains("congestion-controller: bbr"), "{clash}");
         assert!(clash.contains("udp-relay-mode: quic"));
-        assert!(clash.contains("udp-over-stream: true"));
-        assert!(clash.contains("reduce-rtt: true"));
         assert!(clash.contains("alpn:"));
 
         let sb = super::to_singbox_json(std::slice::from_ref(&p));
@@ -1283,9 +1646,36 @@ mod tests {
         let o = &sv["outbounds"][0];
         assert_eq!(o["congestion_control"], "bbr");
         assert_eq!(o["udp_relay_mode"], "quic");
-        assert_eq!(o["udp_over_stream"], true);
         assert_eq!(o["zero_rtt_handshake"], true);
         assert_eq!(o["tls"]["alpn"][0], "h3");
+    }
+
+    #[test]
+    fn tuic_udp_over_stream_supersedes_relay_mode() {
+        // UDP-over-Stream and udp-relay-mode are mutually exclusive ways to
+        // carry UDP. Emitting both makes the kernel ignore one of them, so the
+        // relay mode is dropped when udp-over-stream is on.
+        let mut p = mk(ProxyType::Tuic, "tu.example.com", 443);
+        p.uuid = Some("u".into());
+        p.password = Some("pw".into());
+        p.udp_relay_mode = Some("quic".into());
+        p.udp_over_stream = Some(true);
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("udp-over-stream: true"), "{clash}");
+        assert!(
+            !clash.contains("udp-relay-mode"),
+            "udp-over-stream 已开启时不得再写 udp-relay-mode: {clash}"
+        );
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        let o = &sv["outbounds"][0];
+        assert_eq!(o["udp_over_stream"], true);
+        assert!(
+            o.get("udp_relay_mode").is_none(),
+            "sing-box 同时给出两种 UDP 承载方式: {o}"
+        );
     }
 
     #[test]
@@ -1329,6 +1719,31 @@ mod tests {
         let sb = super::to_singbox_json(std::slice::from_ref(&p));
         let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
         assert_eq!(sv["outbounds"][0]["tls"]["alpn"][1], "http/1.1");
+    }
+
+    #[test]
+    fn trojan_websocket_transport_exported_to_clash_and_singbox() {
+        // trojan 的 ws path / Host 此前只解析、不导出，客户端拿到的是裸 TCP
+        // 条目，经 CDN 中转时握手必败。
+        let mut p = mk(ProxyType::Trojan, "tr.example.com", 443);
+        p.password = Some("pw".into());
+        p.network = Some("ws".into());
+        p.path = Some("/trojan".into());
+        p.host = Some("cdn.example.com".into());
+        p.sni = Some("cdn.example.com".into());
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("network: ws"), "{clash}");
+        assert!(clash.contains("ws-opts:"), "{clash}");
+        assert!(clash.contains("path: /trojan"), "{clash}");
+        assert!(clash.contains("Host: cdn.example.com"), "{clash}");
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        let o = &sv["outbounds"][0];
+        assert_eq!(o["transport"]["type"], "ws");
+        assert_eq!(o["transport"]["path"], "/trojan");
+        assert_eq!(o["transport"]["headers"]["Host"], "cdn.example.com");
     }
 
     #[test]

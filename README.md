@@ -33,6 +33,7 @@
 | **P23** | **第二轮增强：导出名去重与既有后缀冲突 · Top-N 只选可用节点 · 备份保留健康/用量元数据 · Gist 按格式命名与 owner · h2/HTTP 传输 · VMess 端口/aid 校验 · 订阅列表错误态与分享 URL 重复筛选** | ✅ |
 | **P24** | **第三轮增强：SS obfs/v2ray-plugin · Hysteria2 obfs · 用量 info 块 · 错误 URL 脱敏 · Gist 走拉取代理 + 公开确认 · 刷新 404 · 调度最小 60s · Surge 名清洗** | ✅ |
 | **P25** | **第四轮增强：ALPN / TUIC 拥塞与中继参数 / Hysteria2 上下行 · 本地备份 uid 幂等 · 协议参考索引 · CI/fmt/LICENSE/历史归档** | ✅ |
+| **P26** | **第五轮增强：Surge 协议/传输边界（vless 整节点跳过、grpc/h2 跳过、去非官方键）· Surge 补 Hysteria2/TUIC/AnyTLS/SOCKS/HTTP · Trojan 传输全格式 · 带宽单位换算 · TUIC UDP 承载互斥 · 导入同批重复 URL 幂等** | ✅ |
 
 ## 架构
 
@@ -257,14 +258,14 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 | 协议 | 解析 | clash-meta | v2ray | sing-box | surge | 说明 |
 |---|---|---|---|---|---|---|
 | SS | ✅ | ✅ | ✅ | ✅ | ✅ | 加密方法兼容 `method`（URI）与 `cipher`（YAML）；支持 obfs / v2ray-plugin（v2ray 跳过插件节点，Surge 仅支持 obfs） |
-| VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / h2 / tls / SNI |
-| VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | 含 **REALITY**（`pbk` / `sid`）与 ws / grpc / h2；缺公钥的 REALITY 节点视为不完整、不导出 |
-| Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | 始终 TLS |
-| Hysteria2 | ✅ | ✅ | — | ✅ | — | obfs（salamander）、上下行带宽、ALPN；v2ray-core 无法表示；sing-box 强制 TLS |
-| TUIC | ✅ | ✅ | — | ✅ | — | 拥塞控制 / UDP 中继模式 / UDP-over-Stream / 0-RTT / ALPN；v2ray-core 无法表示 |
-| SOCKS5 / HTTP(S) | ✅ | ✅ | — | ✅ | — | HTTP 443 端口按 TLS 处理 |
-| WireGuard | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出 |
-| AnyTLS | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出 |
+| VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / h2 / tls / SNI。**Surge 只实现 tcp+ws**，grpc/h2 节点整节点跳过 |
+| VLESS | ✅ | ✅ | ✅ | ✅ | ❌ | 含 **REALITY**（`pbk` / `sid`）与 ws / grpc / h2；缺公钥的 REALITY 节点视为不完整、不导出。**Surge 协议表里没有 vless**，导出时整节点跳过并打日志 |
+| Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | 始终 TLS；ws/grpc/h2 传输的 `ws-opts` / `grpc-opts` / `h2-opts` 全格式导出（Surge 仅 tcp+ws） |
+| Hysteria2 | ✅ | ✅ | — | ✅ | ✅ | obfs（salamander / gecko）、上下行带宽、ALPN；v2ray-core 无法表示；sing-box 强制 TLS；Surge 用 `salamander-password=` 单键、只认下行带宽数字 |
+| TUIC | ✅ | ✅ | — | ✅ | ✅ | 拥塞控制 / UDP 中继模式 / UDP-over-Stream / 0-RTT / ALPN；v2ray-core 无法表示；Surge 导出 `uuid/password/version=5`，QUIC 调优参数无对应键 |
+| SOCKS5 / HTTP(S) | ✅ | ✅ | — | ✅ | ✅ | HTTP 443 端口按 TLS 处理；Surge 用位置参数传凭据（`socks5, host, port, user, pass`），TLS 时分别为 `socks5-tls` / `https` |
+| WireGuard | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出（Surge 需独立 `[WireGuard]` 段，暂未支持） |
+| AnyTLS | ✅ | ✅ | — | — | ✅ | clash-meta 与 Surge（`anytls` + `password`/`sni`/`tls-fingerprint`）可导出 |
 | SSR | 跳过 | — | — | — | — | mihomo / Clash.Meta 不支持，导入时直接丢弃并打日志 |
 | Other（未知类型） | ✅ | — | — | — | — | 客户端会拒绝，导出前统一过滤 |
 
@@ -273,6 +274,8 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - SS 的 `v2ray-plugin` 只能导出到 clash / sing-box；v2ray 与 Surge 不支持该插件，导出时会跳过并打日志（obfs 在 Surge 中可用）。
 - Hysteria2 的 `ports` / `hop-interval`（端口跳跃）与 Gecko 包大小、TUIC 的 `heartbeat` / `fast-open` / `disable-sni` / `max-open-streams` 等少数调优参数尚未解析。
 - sing-box 导出跳过 WireGuard / AnyTLS；v2ray 导出跳过 Hysteria2 / TUIC / SOCKS5 / HTTP / WireGuard / AnyTLS（会打印跳过数量）。
+- **Surge 侧丢字段**（键位不存在，只丢参数不丢节点）：Hysteria2 的上行带宽、TUIC 的拥塞控制与 UDP 中继模式、`alpn` 多值（Surge 需要引号包裹，只输出单值）。
+- TUIC 开启 `udp-over-stream` 时不再输出 `udp-relay-mode`（两者是互斥的 UDP 承载方式，同时给出会让内核忽略其一）。
 - `base64` 格式是 **clash-meta YAML 的 base64**，不是 v2rayN 的 URI 列表 base64。
 
 字段级映射（模型 ↔ mihomo ↔ sing-box ↔ Xray）与参考实现链接见 [`docs/protocol-reference-index.md`](docs/protocol-reference-index.md)。

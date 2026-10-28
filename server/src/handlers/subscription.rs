@@ -370,8 +370,15 @@ pub(crate) async fn import_subscriptions(
                 if !is_remote && !it.uid.trim().is_empty() {
                     sub.uid = it.uid.clone();
                 }
+                let idx = guard.len();
                 guard.push(sub);
                 added += 1;
+                // Register the freshly appended remote so a *second* entry with
+                // the same URL inside this very batch updates it instead of
+                // creating a third duplicate subscription.
+                if is_remote {
+                    by_url.insert(it.source.clone(), idx);
+                }
             }
         }
         (added, replaced)

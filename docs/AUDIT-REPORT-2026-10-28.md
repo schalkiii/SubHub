@@ -399,3 +399,42 @@
 
 - Hysteria2 `ports` / `hop-interval` 端口跳跃与 Gecko 包大小；TUIC `heartbeat` / `fast-open` / `disable-sni` / `max-open-streams`；SS 外部插件（shadow-tls / kcptun）；VLESS `packet-encoding` / ECH。
 - 这些字段在 mihomo 与 sing-box 间的单位/结构差异较大，贸然透传会产生“看似成功、实际错误”的配置；索引中已记录原因与后续入口。
+
+---
+
+## 十、第五轮复核增强（2026-10-28 完成，P26）
+
+本轮以「导出的配置客户端到底能不能解析」为唯一标尺，对照 Surge 官方策略类型表与 mihomo↔Surge 字段差异表逐行核对 `to_surge`，并回看第四轮新字段的单位与互斥语义。
+
+### 10.1 新发现问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| F1 | `core/src/export.rs::to_surge` | 输出 `vless` 行，但 Surge 的 `[Proxy]` 类型关键字是封闭集合、其中没有 vless，也没有 `flow=` / REALITY 参数页；README 长期把 VLESS 标成「Surge ✅」 | 高（产出无效配置） | 整节点跳过并打日志（提示改用 clash-meta / sing-box）；README 协议矩阵 VLESS×surge 改为 ❌ 并写明原因 |
+| F2 | `core/src/export.rs::to_surge` | vmess / trojan 不校验传输层，`grpc` / `h2` / `httpupgrade` 节点会被写成普通 TCP 行，Surge 连上即握手失败且无从排查 | 高 | `surge_supported()` 统一放行 tcp/ws，其余整节点跳过并告警 |
+| F3 | `core/src/export.rs::to_surge` | 输出 `network=`（Clash 键）与 trojan 的 `tls=`（Surge 由协议隐含），且 ws 的 path/Host 在非 ws 传输上也会输出 | 中 | 删除非官方键；`tls=` 仅 vmess 输出；path / `ws-headers` 只在 `network=ws` 时输出 |
+| F4 | `core/src/export.rs::to_surge` | Hysteria2 / TUIC / AnyTLS / SOCKS5 / HTTP 节点在 Surge 产物里静默消失（`_ => continue`） | 中（功能缺漏） | 按官方键名补全：`salamander-password=` / `gecko-password=` / `download-bandwidth=`、`tuic + uuid/password/version=5`、`anytls + password/sni/tls-fingerprint`、SOCKS5/HTTP 位置参数凭据与 `socks5-tls` / `https` |
+| F5 | `core/src/export.rs::to_surge` | 名称去重发生在行构造之前：被跳过的节点会占掉 ` #N` 序号，导致唯一可见节点被命名为 `A #2` | 低 | 改为构造完成后按行首去重（`surge_safe` 已剔除 `=`，首个 `" = "` 必为分隔符） |
+| F6 | `core/src/parse.rs::parse_mbps` | 只截取数字前缀、忽略单位：`1 Gbps` → 1 Mbps、`500 kbps` → 500 Mbps，Hysteria2 带宽差 1000 倍 | 中 | 按 `gb` / `mb` / `kb` / `b` 换算为 Mbps；补 `1 Gbps` / `500 kbps` 断言 |
+| F7 | `core/src/export.rs`（clash + sing-box TUIC） | `udp-over-stream` 与 `udp-relay-mode` 同时输出，两者是 UDP 的两种互斥承载方式，内核只认其一，配置语义自相矛盾 | 中 | `udp_over_stream == true` 时不再输出 relay mode；`tuic_udp_over_stream_supersedes_relay_mode` 覆盖 |
+| F8 | `core/src/export.rs`（Trojan） | 第四轮补的 `network` 只到 URI/clash 解析，trojan 的 ws/grpc/h2 传输在 clash 与 sing-box 导出里丢失，Surge 更没有 | 高 | clash 补 `network` + `ws-opts`/`grpc-opts`/`h2-opts`，sing-box 补 `transport`，Surge 补 `ws=true`/`ws-path`/`ws-headers`；`trojan_websocket_transport_exported_to_clash_and_singbox` |
+| F9 | `server/src/handlers/subscription.rs::import_subscriptions` | `by_url` 只在批次开始前建索引，同一次导入里两条相同远程地址会追加两条重复订阅（跨批次幂等正常） | 中 | 新追加的远程项即时登记进 `by_url`，第二条走更新路径；端到端断言 `added=1 / replaced=1` |
+
+### 10.2 参考来源（已登记进 `docs/protocol-reference-index.md`）
+
+- Surge 策略类型表（`[Proxy]` 关键字封闭集合，无 vless）：https://manual.nssurge.com/policies/overview.html
+- Surge Mac / iOS Release Notes（`salamander-password` / `gecko-password` / `port-hopping` / AnyTLS / `alpn` 的最低版本）：https://kb.nssurge.com/surge-knowledge-base/release-notes/surge-mac-legacy
+- mihomo ↔ Surge 逐项映射（第三方 NodeDeck 项目，标注 [CS]/[C]/[S]，用于交叉验证 `tls-fingerprint=` 是 uTLS 客户端指纹等键名）：https://github.com/MingSpace/NodeDeck/blob/main/docs/protocol-mapping.md
+
+### 10.3 验证
+
+- `cargo test -p subhub-core -p subhub-server`：**132 个测试全通过**（core 111 + server 21）。
+- `cargo fmt --all -- --check` 通过；clippy `--all-targets -D warnings` 0 警告。
+- 隔离 DB（`D:/tmp/sa_round5/subhub.db`）端到端 ALL CHECKS PASSED，新增 Surge 边界与导入同批重复两组用例。
+- 11 协议混合样本实测导出 Surge 文本逐行核对：两条 vless 与 trojan+grpc 被跳过并打日志，vmess ws / trojan ws / hy2 salamander / tuic v5 / anytls / socks5 / https 行与官方键名一致。
+- `cargo build --release -p subhub-app` 通过。
+
+### 10.4 仍明确不做（已登记）
+
+- Surge `wireguard`（需独立 `[WireGuard]` 段，与单行模型不同）、Hysteria2 上行带宽与端口跳跃、TUIC QUIC 调参、`alpn` 多值引号写法。
+- 第四轮遗留的 Hysteria2 `ports`/`hop-interval`、TUIC `heartbeat`/`fast-open`、SS 外部插件、VLESS ECH 维持不做。

@@ -2,6 +2,33 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P26] 第五轮复核增强（Surge 协议边界 / 传输保真 / 单位换算 / 导入幂等）
+
+对照 Surge 官方策略类型表与 mihomo↔Surge 字段差异表逐项核对导出器，修掉「导出了但客户端根本解析不了」的一类问题。
+
+### Added
+
+- **Surge 导出补全 Hysteria2 / TUIC / AnyTLS / SOCKS5 / HTTP(S)**：此前这些节点在 Surge 产物里静默消失。现在按官方键名输出 —— `hysteria2, ..., password=, salamander-password=/gecko-password=, download-bandwidth=`（纯数字）、`tuic, ..., uuid=, password=, version=5`、`anytls, ..., password=, sni=, tls-fingerprint=`、SOCKS5/HTTP 用位置参数 `socks5, host, port, user, pass`，TLS 场景分别为 `socks5-tls` / `https`（443 端口按 TLS，与 clash 导出同一规则）。
+- **Trojan 传输导出到全部格式**：clash 补 `network` + `ws-opts` / `grpc-opts` / `h2-opts`，sing-box 补 `transport`；Surge 补 `ws=true` / `ws-path=` / `ws-headers=Host:`。
+- **参考索引新增 Surge 来源**：`docs/protocol-reference-index.md` 加入 Surge 策略类型表、Surge Mac/iOS Release Notes 与第三方 mihomo↔Surge 映射表，并新增「2.6 Surge `[Proxy]` 行」逐字段对照（`tls-fingerprint=` vs `client-fingerprint`、只有 vmess 需要显式 `tls=`、HY2 混淆由密码键名隐含等）。
+
+### Fixed
+
+- **Surge 不再输出 vless 节点**：Surge 的类型关键字是封闭集合，里面没有 `vless`，也不存在 `flow=` / REALITY 参数页，产出的行无法被解析。现在整节点跳过并打日志提示改用 clash-meta / sing-box。
+- **Surge 传输边界**：vmess / trojan 的 `grpc` / `h2` / `httpupgrade` 在 Surge 没有对应写法，此前会输出一行「看着正常、握手必败」的 TCP 配置；现在整节点跳过。
+- **Surge 去掉非官方键 `network=`**：Surge 用 `ws=true` 表达传输层，`network=` 是 Clash 的键；同时 trojan 不再输出 `tls=`（协议隐含，只有 vmess 默认明文需要显式）。
+- **Surge 名称去重时机**：去重移到行构造之后，被跳过的节点不再占掉 ` #N` 序号；清洗后撞名（`a,b` / `a_b`）仍会正确加后缀。
+- **带宽单位换算**：`parse_mbps()` 原先只截数字前缀，`1 Gbps` 会被读成 `1 Mbps`、`500 kbps` 会被读成 `500 Mbps`。现在按 `gb` / `mb` / `kb` / `b` 换算成 Mbps。
+- **TUIC UDP 承载互斥**：`udp-over-stream` 开启时不再同时输出 `udp-relay-mode` / `udp_relay_mode`（两者是同一件事的两种实现，同时给出内核只认一个）。
+- **导入同批重复远程 URL**：`by_url` 索引原先只在批次开始前构建，一次导入里出现两条相同订阅地址会追加两条重复订阅；现在新追加的远程项即时登记进索引，第二条更新而非重复。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**132 个测试全通过**（core 111 + server 21），新增 Surge 边界/多协议行、Trojan ws 传输、TUIC 互斥、Gbps 换算用例。
+- `cargo fmt --all -- --check` 通过；clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端：`docs/test_subhub.py` ALL CHECKS PASSED，新增「Surge type/transport boundaries」与「same remote URL twice inside ONE import batch」两组用例。
+- 多协议样本实测：11 条 vless/vmess/trojan/hy2/tuic/ss/anytls/socks/http 链接导入后导出的 Surge 文本逐行核对，vless 与 trojan+grpc 被跳过、其余类型键名与官方一致。
+
 ## [P25] 第四轮增强（高级协议参数 / 备份幂等 / 参考索引 / 工程收尾）
 
 ### Added
