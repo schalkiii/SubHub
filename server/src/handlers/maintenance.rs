@@ -1,9 +1,7 @@
 //! 维护类 handler：清理无效 / 连续失败的节点、淘汰长期无可用节点的订阅、
 //! Top-N 聚合导出，以及订阅内容的构建（过滤 / 排序 / 重命名 / 格式化）。
 use crate::*;
-use crate::{
-    flatten_dedup, now_ms, persist_all, resolve_top_n, transform_from_sub_query, LockExt,
-};
+use crate::{flatten_dedup, now_ms, persist_all, resolve_top_n, transform_from_sub_query, LockExt};
 use axum::{
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
@@ -225,10 +223,7 @@ pub(crate) fn build_sub_content(
     // (if present and positive) overrides the global `top_n` setting; this is
     // what makes the standing subscription honour the same single Top-N
     // configuration as the manual export — both driven by the Settings page.
-    let url_top = q
-        .top_n
-        .as_ref()
-        .and_then(|s| s.trim().parse::<u64>().ok());
+    let url_top = q.top_n.as_ref().and_then(|s| s.trim().parse::<u64>().ok());
     let global_top = *state.top_n.lock_ok();
     let top_n = resolve_top_n(url_top, global_top);
     let mut transformed = if let Some(n) = top_n {

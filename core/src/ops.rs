@@ -942,7 +942,7 @@ mod tests {
         let mut c = node("香港节点", "3.3.3.3", 3); // 名字已有地区 → 不改
         c.outbound_country = Some("JP".into());
         let d = node("未实测节点", "4.4.4.4", 4); // 无出口地区 → 不改
-        // region() 应为 OTHER（名字无地区信号）以验证「不改」分支
+                                                  // region() 应为 OTHER（名字无地区信号）以验证「不改」分支
         assert_eq!(d.region(), "OTHER");
 
         let mut all = vec![a, b, c, d];

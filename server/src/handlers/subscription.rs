@@ -258,6 +258,7 @@ pub(crate) async fn export_subscriptions(State(state): State<AppState>) -> Json<
         .into_iter()
         .map(|s| SubExportItem {
             id: s.id.clone(),
+            uid: s.uid.clone(),
             name: s.name.clone(),
             source: s.source.clone(),
             source_type: s.health.source_type.clone(),
@@ -276,7 +277,7 @@ pub(crate) async fn export_subscriptions(State(state): State<AppState>) -> Json<
         .collect();
     Json(SubExportDoc {
         kind: "subhub-subscriptions",
-        version: 2,
+        version: 3,
         exported_at: now_ms(),
         engine_bin: engine_bin_of(&state),
         subscriptions: items,
@@ -310,23 +311,33 @@ pub(crate) async fn import_subscriptions(
         let mut added = 0usize;
         let mut replaced = 0usize;
         for it in &req.subscriptions {
-            // Match only by source URL (never the client-supplied id) so a
-            // re-import of a remote subscription is idempotent without letting a
-            // caller target/overwrite an arbitrary existing subscription.
-            let target = if it.source.starts_with("http://") || it.source.starts_with("https://") {
+            let is_remote = it.source.starts_with("http://") || it.source.starts_with("https://");
+            // Remote subs match by source URL; local subs have no URL, so they
+            // match by the stable backup uid (never the sequential id). An old
+            // backup without uid falls back to a *unique* local name match.
+            let target = if is_remote {
                 by_url.get(&it.source).copied()
+            } else if !it.uid.trim().is_empty() {
+                guard
+                    .iter()
+                    .position(|s| s.source == "pasted" && s.uid == it.uid)
             } else {
-                None
+                let matches: Vec<usize> = guard
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.source == "pasted" && s.name == it.name)
+                    .map(|(i, _)| i)
+                    .collect();
+                (matches.len() == 1).then(|| matches[0])
             };
             let mut sub = Subscription::new(it.name.clone(), it.source.clone(), it.proxies.clone());
             sub.fetch_proxy = it.fetch_proxy.clone();
             sub.health.enabled = it.health_enabled;
-            sub.health.source_type =
-                if it.source.starts_with("http://") || it.source.starts_with("https://") {
-                    "remote".to_string()
-                } else {
-                    it.source_type.clone()
-                };
+            sub.health.source_type = if is_remote {
+                "remote".to_string()
+            } else {
+                it.source_type.clone()
+            };
             // 新备份携带健康/用量元数据，原样恢复；旧备份缺这些字段时
             // 回退到“刚刚检查/更新”的旧行为。
             sub.health.last_checked_at = it.last_checked_at.or(Some(now));
@@ -338,11 +349,27 @@ pub(crate) async fn import_subscriptions(
             sub.health.total = it.total;
             sub.health.expire = it.expire;
             if let Some(idx) = target {
-                // keep the original id so refresh/delete links stay valid
+                // keep the original id/uid so refresh/delete links and later
+                // backup restores stay stable.
                 sub.id = guard[idx].id.clone();
+                let existing_uid = guard[idx].uid.clone();
+                sub.uid = if existing_uid.is_empty() {
+                    if it.uid.is_empty() {
+                        sub.uid.clone()
+                    } else {
+                        it.uid.clone()
+                    }
+                } else {
+                    existing_uid
+                };
                 guard[idx] = sub;
                 replaced += 1;
             } else {
+                // A local restore keeps the backup uid so importing the same
+                // backup twice updates instead of appending a duplicate.
+                if !is_remote && !it.uid.trim().is_empty() {
+                    sub.uid = it.uid.clone();
+                }
                 guard.push(sub);
                 added += 1;
             }

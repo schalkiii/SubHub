@@ -591,6 +591,9 @@ pub struct SubExportItem {
     /// `source` URL, never by this id, so a crafted file cannot overwrite an
     /// unrelated subscription; a re-imported remote sub keeps its local id.
     pub id: String,
+    /// Stable backup identity; used to make local/pasted restores idempotent.
+    #[serde(default)]
+    pub uid: String,
     pub name: String,
     pub source: String,
     pub source_type: String,
@@ -1158,7 +1161,11 @@ fn persist_results(
 
                 // 完整测速：配置引擎时以引擎实测为准（TCP 不兜底），
                 // 未配置引擎时 TCP 是唯一信号。
-                let avail = if engine_configured { h.is_some() } else { *tcp_avail };
+                let avail = if engine_configured {
+                    h.is_some()
+                } else {
+                    *tcp_avail
+                };
                 p.available = Some(avail);
                 p.last_tested_at = Some(now);
 
@@ -1641,10 +1648,8 @@ fn static_response(path: &str, bytes: Vec<u8>) -> Response {
         HeaderValue::from_static(asset_content_type(path)),
     );
     // WebUI 改动后重启即应生效，禁止 webview 缓存旧 app.js/style.css。
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     resp
 }
 
@@ -1688,7 +1693,21 @@ pub async fn run_server() {
 
     let db = db::Db::open(std::env::var("SUBHUB_DB").ok().map(PathBuf::from));
 
-    let initial = db.as_ref().map(|d| d.load_all()).unwrap_or_default();
+    let mut initial = db.as_ref().map(|d| d.load_all()).unwrap_or_default();
+
+    // Backfill the backup identity for entries persisted before `uid` existed.
+    let mut uid_backfilled = false;
+    for sub in &mut initial {
+        if sub.uid.trim().is_empty() {
+            sub.ensure_uid();
+            uid_backfilled = true;
+        }
+    }
+    if uid_backfilled {
+        if let Some(d) = &db {
+            d.save_all(&initial);
+        }
+    }
 
     // Rebase the subscription id counter so new ids never collide with
 
@@ -2387,20 +2406,23 @@ mod tests {
     #[test]
     fn sub_export_item_round_trips_health_metadata() {
         // 旧备份（仅节点）缺健康字段时：enabled 默认 true，其余为 None。
-        let old = r#"{"id":"sub_1","name":"A","source":"pasted","source_type":"local","proxies":[]}"#;
+        let old =
+            r#"{"id":"sub_1","name":"A","source":"pasted","source_type":"local","proxies":[]}"#;
         let item: super::SubExportItem = serde_json::from_str(old).unwrap();
         assert!(item.health_enabled, "旧备份缺省应视为启用");
         assert!(item.last_checked_at.is_none());
         assert!(item.upload.is_none());
+        assert!(item.uid.is_empty(), "旧备份没有 uid");
 
-        // 新备份必须原样保留健康/用量字段。
+        // 新备份必须原样保留 uid 与健康/用量字段。
         let json = r#"{
-            "id":"sub_2","name":"B","source":"https://b.example/sub","source_type":"remote",
-            "health_enabled":true,"proxies":[],
+            "id":"sub_2","uid":"u_abc","name":"B","source":"https://b.example/sub",
+            "source_type":"remote","health_enabled":true,"proxies":[],
             "last_checked_at":111,"last_updated_at":222,"last_healthy_at":333,
             "last_error":"boom","upload":1,"download":2,"total":3,"expire":4
         }"#;
         let item: super::SubExportItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.uid, "u_abc");
         assert_eq!(item.last_checked_at, Some(111));
         assert_eq!(item.last_healthy_at, Some(333));
         assert_eq!(item.last_error.as_deref(), Some("boom"));

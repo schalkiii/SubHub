@@ -35,7 +35,10 @@ pub(crate) async fn gist_upload(
         min_bw: req.min_bw.clone(),
         max_lat: req.max_lat.clone(),
     };
-    let fmt = req.format.clone().unwrap_or_else(|| "clash-meta".to_string());
+    let fmt = req
+        .format
+        .clone()
+        .unwrap_or_else(|| "clash-meta".to_string());
     let (content, _ct) = build_sub_content(&state, &q)?;
     let file_name = gist_file_name(&fmt);
 
@@ -176,9 +179,7 @@ pub(crate) async fn gist_upload(
     // 带上与格式匹配的文件名（yaml/json/conf/txt），让 GitHub 直接以正确
     // 扩展名返回，避免部分移动端客户端无法从裸 URL 识别格式而拉到空订阅。
     let owner = owner.unwrap_or(user);
-    let raw_url = format!(
-        "https://gist.githubusercontent.com/{owner}/{final_id}/raw/{file_name}"
-    );
+    let raw_url = format!("https://gist.githubusercontent.com/{owner}/{final_id}/raw/{file_name}");
     Ok(Json(GistUploadResp {
         ok: true,
         url: raw_url,

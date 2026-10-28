@@ -8,8 +8,8 @@ pub mod speedtest;
 
 pub use export::{export_filter, export_str, to_clash_meta};
 pub use model::{
-    merge, new_sub_id, rebase_sub_counter, Proxy, ProxyType, ProxyUnlock, Subscription,
-    SubscriptionHealth, UnlockResult,
+    merge, new_sub_id, new_sub_uid, rebase_sub_counter, Proxy, ProxyType, ProxyUnlock,
+    Subscription, SubscriptionHealth, UnlockResult,
 };
 pub use ops::{apply as apply_transform, region_fixup_for_export, top_n_by_score, Transform};
 pub use parse::{

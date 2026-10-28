@@ -3,10 +3,25 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SUB_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SUB_UID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Stable-ish unique id for a subscription (dependency-free).
 pub fn new_sub_id() -> String {
     format!("sub_{}", SUB_COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Stable, unguessable identity used by backup/restore. Sequential `sub_N` ids
+/// are user-visible and easy to spoof; local subscriptions have no source URL,
+/// so they need their own key to make repeated imports idempotent.
+pub fn new_sub_uid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "u_{nanos:x}_{:x}",
+        SUB_UID_COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 /// Re-base the subscription id counter so the next `new_sub_id()` returns
@@ -132,6 +147,10 @@ impl SubscriptionHealth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: String,
+    /// Stable backup/restore identity (see [`new_sub_uid`]). Old persisted
+    /// entries lack it; `run_server` backfills them at startup.
+    #[serde(default)]
+    pub uid: String,
     pub name: String,
     /// original source: remote URL or "pasted"
     pub source: String,
@@ -153,6 +172,7 @@ impl Subscription {
         };
         Subscription {
             id: new_sub_id(),
+            uid: new_sub_uid(),
             name,
             source,
             proxies,
@@ -167,6 +187,14 @@ impl Subscription {
 
     pub fn node_count(&self) -> usize {
         self.proxies.len()
+    }
+
+    /// Backfill the backup identity for subscriptions persisted before `uid`
+    /// existed.
+    pub fn ensure_uid(&mut self) {
+        if self.uid.trim().is_empty() {
+            self.uid = new_sub_uid();
+        }
     }
 }
 
@@ -200,6 +228,27 @@ pub struct Proxy {
     pub obfs: Option<String>,
     #[serde(default)]
     pub obfs_password: Option<String>,
+
+    // TLS ALPN and QUIC/protocol tuning. Field names follow the model's
+    // canonical (mostly sing-box) form; exporters translate to each client:
+    //   TUIC: congestion_control / udp_relay_mode / udp_over_stream /
+    //         zero_rtt_handshake (mihomo: congestion-controller /
+    //         udp-relay-mode / udp-over-stream / reduce-rtt)
+    //   Hysteria2: up_mbps / down_mbps (mihomo: up / down strings)
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
+    #[serde(default)]
+    pub congestion_control: Option<String>,
+    #[serde(default)]
+    pub udp_relay_mode: Option<String>,
+    #[serde(default)]
+    pub udp_over_stream: Option<bool>,
+    #[serde(default)]
+    pub zero_rtt_handshake: Option<bool>,
+    #[serde(default)]
+    pub up_mbps: Option<u64>,
+    #[serde(default)]
+    pub down_mbps: Option<u64>,
 
     // transport / tls
     pub network: Option<String>, // tcp / ws / grpc / h2
@@ -365,6 +414,13 @@ impl Proxy {
             plugin_opts: None,
             obfs: None,
             obfs_password: None,
+            alpn: None,
+            congestion_control: None,
+            udp_relay_mode: None,
+            udp_over_stream: None,
+            zero_rtt_handshake: None,
+            up_mbps: None,
+            down_mbps: None,
             network: None,
             tls: None,
             sni: None,
@@ -912,18 +968,10 @@ impl Proxy {
             }
             if self.reality {
                 extra.push("reality".to_string());
-                if let Some(pk) = self
-                    .reality_public_key
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                {
+                if let Some(pk) = self.reality_public_key.as_deref().filter(|s| !s.is_empty()) {
                     extra.push(format!("pk={}", pk.replace('|', "#")));
                 }
-                if let Some(sid) = self
-                    .reality_short_id
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                {
+                if let Some(sid) = self.reality_short_id.as_deref().filter(|s| !s.is_empty()) {
                     extra.push(format!("sid={}", sid.replace('|', "#")));
                 }
             }
@@ -942,6 +990,31 @@ impl Proxy {
             }
             if let Some(pw) = self.obfs_password.as_deref().filter(|s| !s.is_empty()) {
                 extra.push(format!("opw={}", pw.replace('|', "#")));
+            }
+            if let Some(up) = self.up_mbps {
+                extra.push(format!("up={up}"));
+            }
+            if let Some(down) = self.down_mbps {
+                extra.push(format!("down={down}"));
+            }
+        }
+        if let Some(alpn) = &self.alpn {
+            if !alpn.is_empty() {
+                extra.push(format!("alpn={}", alpn.join(",").replace('|', "#")));
+            }
+        }
+        if self.type_ == ProxyType::Tuic {
+            if let Some(cc) = &self.congestion_control {
+                extra.push(format!("cc={}", cc.replace('|', "#")));
+            }
+            if let Some(mode) = &self.udp_relay_mode {
+                extra.push(format!("urm={}", mode.replace('|', "#")));
+            }
+            if let Some(v) = self.udp_over_stream {
+                extra.push(format!("uos={}", if v { "1" } else { "0" }));
+            }
+            if let Some(v) = self.zero_rtt_handshake {
+                extra.push(format!("zrtt={}", if v { "1" } else { "0" }));
             }
         }
         if !extra.is_empty() {
@@ -1026,6 +1099,22 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_uid_is_stable_and_backfilled() {
+        let a = Subscription::new("A".into(), "pasted".into(), vec![]);
+        let b = Subscription::new("B".into(), "pasted".into(), vec![]);
+        assert!(!a.uid.is_empty(), "新订阅必须有 uid");
+        assert_ne!(a.uid, b.uid, "uid 必须唯一");
+
+        let mut old = Subscription::new("old".into(), "pasted".into(), vec![]);
+        old.uid.clear();
+        old.ensure_uid();
+        assert!(!old.uid.is_empty(), "旧订阅应回填 uid");
+        let before = old.uid.clone();
+        old.ensure_uid();
+        assert_eq!(old.uid, before, "ensure_uid 不得覆盖已有值");
+    }
 
     #[test]
     fn new_proxy_bandwidth_measured_defaults_false() {
@@ -1156,7 +1245,11 @@ mod tests {
         c.service_name = Some("svc-a".into());
         let mut d = c.clone();
         d.service_name = Some("svc-b".into());
-        assert_ne!(c.fingerprint(), d.fingerprint(), "不同 gRPC service 不得合并");
+        assert_ne!(
+            c.fingerprint(),
+            d.fingerprint(),
+            "不同 gRPC service 不得合并"
+        );
 
         // 没有这些字段的节点保持原有指纹格式（不受本次改动影响）。
         let mut e = Proxy::new("N".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
@@ -1174,7 +1267,11 @@ mod tests {
         a.reality_short_id = Some("01".into());
         let mut b = a.clone();
         b.reality_public_key = Some("pk-b".into());
-        assert_ne!(a.fingerprint(), b.fingerprint(), "不同 REALITY 公钥不得合并");
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "不同 REALITY 公钥不得合并"
+        );
     }
 
     #[test]
@@ -1192,6 +1289,18 @@ mod tests {
         let mut h2 = h1.clone();
         h2.obfs = Some("salamander".into());
         assert_ne!(h1.fingerprint(), h2.fingerprint(), "HY2 obfs 必须影响指纹");
+
+        let mut t1 = Proxy::new("T".into(), ProxyType::Tuic, "9.9.9.9".into(), 443);
+        t1.uuid = Some("u".into());
+        t1.password = Some("pw".into());
+        let mut t2 = t1.clone();
+        t2.congestion_control = Some("bbr".into());
+        t2.alpn = Some(vec!["h3".into()]);
+        assert_ne!(
+            t1.fingerprint(),
+            t2.fingerprint(),
+            "TUIC 高级参数必须影响指纹"
+        );
     }
 
     #[test]

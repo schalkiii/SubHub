@@ -134,6 +134,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "sni", &p.sni);
             insert_opt(&mut m, "flow", &p.flow);
             insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
+            insert_string_list(&mut m, "alpn", &p.alpn);
             m.insert(Value::from("tls"), Value::from(true));
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
         }
@@ -144,6 +145,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "network", &p.network);
             insert_opt(&mut m, "sni", &p.sni);
             insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
+            insert_string_list(&mut m, "alpn", &p.alpn);
             insert_transport_opts(&mut m, p);
             m.insert(Value::from("tls"), Value::from(p.tls.unwrap_or(false)));
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
@@ -165,6 +167,7 @@ fn to_clash_value(p: &Proxy) -> Value {
                 p.fingerprint.clone()
             };
             insert_opt(&mut m, "client-fingerprint", &fp);
+            insert_string_list(&mut m, "alpn", &p.alpn);
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
             insert_transport_opts(&mut m, p);
             m.insert(Value::from("tls"), Value::from(p.tls.unwrap_or(false)));
@@ -180,12 +183,24 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "sni", &p.sni);
             insert_opt(&mut m, "obfs", &p.obfs);
             insert_opt(&mut m, "obfs-password", &p.obfs_password);
+            insert_string_list(&mut m, "alpn", &p.alpn);
+            if let Some(up) = p.up_mbps {
+                m.insert(Value::from("up"), Value::from(format!("{up} Mbps")));
+            }
+            if let Some(down) = p.down_mbps {
+                m.insert(Value::from("down"), Value::from(format!("{down} Mbps")));
+            }
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
         }
         ProxyType::Tuic => {
             insert_opt(&mut m, "uuid", &p.uuid);
             insert_opt(&mut m, "password", &p.password);
             insert_opt(&mut m, "sni", &p.sni);
+            insert_string_list(&mut m, "alpn", &p.alpn);
+            insert_opt(&mut m, "congestion-controller", &p.congestion_control);
+            insert_opt(&mut m, "udp-relay-mode", &p.udp_relay_mode);
+            insert_opt_bool(&mut m, "udp-over-stream", p.udp_over_stream);
+            insert_opt_bool(&mut m, "reduce-rtt", p.zero_rtt_handshake);
         }
         ProxyType::AnyTls => {
             // AnyTLS authenticates with a password (not a uuid). It is always
@@ -211,9 +226,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             // tls 字段（解析侧也无从得知），此时按端口推断 —— 明文 HTTP 代理
             // 跑在 443 上极为罕见，而实测 24 个 443 端口 http 节点明文通过 0
             // 个、强制 tls 后通过 3 个，故 443 一律按 TLS 处理。
-            let tls = p
-                .tls
-                .or(if p.port == 443 { Some(true) } else { None });
+            let tls = p.tls.or(if p.port == 443 { Some(true) } else { None });
             insert_opt_bool(&mut m, "tls", tls);
         }
         _ => {}
@@ -277,6 +290,15 @@ fn insert_transport_opts(m: &mut Mapping, p: &Proxy) {
 fn insert_opt_bool(m: &mut Mapping, key: &str, val: Option<bool>) {
     if let Some(v) = val {
         let _ = m.insert(Value::from(key), Value::from(v));
+    }
+}
+
+fn insert_string_list(m: &mut Mapping, key: &str, val: &Option<Vec<String>>) {
+    if let Some(list) = val {
+        if !list.is_empty() {
+            let seq: Vec<Value> = list.iter().map(|s| Value::from(s.clone())).collect();
+            let _ = m.insert(Value::from(key), Value::Sequence(seq));
+        }
     }
 }
 
@@ -433,6 +455,9 @@ fn v2ray_stream(p: &Proxy) -> serde_json::Value {
         if let Some(sni) = &p.sni {
             tls["serverName"] = json!(sni);
         }
+        if let Some(alpn) = &p.alpn {
+            tls["alpn"] = json!(alpn);
+        }
         s["tlsSettings"] = tls;
     } else {
         s["security"] = json!("none");
@@ -502,10 +527,7 @@ fn v2ray_outbound(p: &Proxy) -> Option<serde_json::Value> {
             // v2ray-core 的 shadowsocks outbound 不支持 obfs/v2ray-plugin；
             // 静默丢掉插件会得到一段看似正常但必然连不上的配置，直接跳过并提示。
             if p.plugin.as_deref().is_some_and(|s| !s.is_empty()) {
-                eprintln!(
-                    "[export] v2ray 不支持 SS 插件节点「{}」，已跳过",
-                    p.name
-                );
+                eprintln!("[export] v2ray 不支持 SS 插件节点「{}」，已跳过", p.name);
                 return None;
             }
             json!({
@@ -593,6 +615,11 @@ fn singbox_tls_impl(p: &Proxy, enabled: bool) -> Option<serde_json::Value> {
     let mut t = json!({ "enabled": true, "insecure": p.skip_cert_verify.unwrap_or(false) });
     if let Some(sni) = &p.sni {
         t["server_name"] = json!(sni);
+    }
+    if let Some(alpn) = &p.alpn {
+        if !alpn.is_empty() {
+            t["alpn"] = json!(alpn);
+        }
     }
     if p.reality {
         let mut reality = json!({ "enabled": true });
@@ -697,6 +724,12 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
                     "password": p.obfs_password.clone().unwrap_or_default(),
                 });
             }
+            if let Some(up) = p.up_mbps {
+                o["up_mbps"] = json!(up);
+            }
+            if let Some(down) = p.down_mbps {
+                o["down_mbps"] = json!(down);
+            }
             o["tls"] = singbox_tls_forced(p);
             Some(o)
         }
@@ -706,6 +739,18 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server_port"] = json!(p.port);
             o["uuid"] = json!(p.uuid.clone().unwrap_or_default());
             o["password"] = json!(p.password.clone().unwrap_or_default());
+            if let Some(cc) = &p.congestion_control {
+                o["congestion_control"] = json!(cc);
+            }
+            if let Some(mode) = &p.udp_relay_mode {
+                o["udp_relay_mode"] = json!(mode);
+            }
+            if let Some(v) = p.udp_over_stream {
+                o["udp_over_stream"] = json!(v);
+            }
+            if let Some(v) = p.zero_rtt_handshake {
+                o["zero_rtt_handshake"] = json!(v);
+            }
             o["tls"] = singbox_tls_forced(p);
             Some(o)
         }
@@ -784,23 +829,18 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
                 if let Some((plugin_name, opts)) = ss_plugin(p) {
                     let lower = plugin_name.to_ascii_lowercase();
                     if lower.contains("obfs") {
-                        if let Some((_, mode)) = opts
-                            .iter()
-                            .find(|(k, _)| k == "obfs" || k == "mode")
+                        if let Some((_, mode)) =
+                            opts.iter().find(|(k, _)| k == "obfs" || k == "mode")
                         {
                             s.push_str(&format!(", obfs={}", surge_safe(mode)));
                         }
-                        if let Some((_, host)) = opts
-                            .iter()
-                            .find(|(k, _)| k == "obfs-host" || k == "host")
+                        if let Some((_, host)) =
+                            opts.iter().find(|(k, _)| k == "obfs-host" || k == "host")
                         {
                             s.push_str(&format!(", obfs-host={}", surge_safe(host)));
                         }
                     } else {
-                        eprintln!(
-                            "[export] surge 不支持 SS 插件节点「{}」，已跳过",
-                            p.name
-                        );
+                        eprintln!("[export] surge 不支持 SS 插件节点「{}」，已跳过", p.name);
                         continue;
                     }
                 }
@@ -950,7 +990,10 @@ mod tests {
         p.tls = Some(true);
         let yaml = super::to_clash_meta(&[p]);
         assert!(yaml.contains("type: http"), "type must be http");
-        assert!(yaml.contains("tls: true"), "https proxy must emit tls: true");
+        assert!(
+            yaml.contains("tls: true"),
+            "https proxy must emit tls: true"
+        );
     }
 
     #[test]
@@ -1003,9 +1046,15 @@ mod tests {
         p.cipher = Some("chacha20-ietf-poly1305".into());
 
         let v2 = super::to_v2ray_json(std::slice::from_ref(&p));
-        assert!(v2.contains("chacha20-ietf-poly1305"), "v2ray 丢失 cipher: {v2}");
+        assert!(
+            v2.contains("chacha20-ietf-poly1305"),
+            "v2ray 丢失 cipher: {v2}"
+        );
         let sb = super::to_singbox_json(std::slice::from_ref(&p));
-        assert!(sb.contains("chacha20-ietf-poly1305"), "sing-box 丢失 cipher: {sb}");
+        assert!(
+            sb.contains("chacha20-ietf-poly1305"),
+            "sing-box 丢失 cipher: {sb}"
+        );
         let sg = super::to_surge(std::slice::from_ref(&p));
         assert!(
             sg.contains("encrypt-method=chacha20-ietf-poly1305"),
@@ -1065,7 +1114,10 @@ mod tests {
         p.reality_short_id = Some("ab12".into());
 
         let clash = super::to_clash_meta(std::slice::from_ref(&p));
-        assert!(clash.contains("reality-opts"), "clash 缺 reality-opts: {clash}");
+        assert!(
+            clash.contains("reality-opts"),
+            "clash 缺 reality-opts: {clash}"
+        );
         assert!(clash.contains("public-key: PK"));
         assert!(clash.contains("short-id: ab12"));
         assert!(clash.contains("client-fingerprint: chrome"));
@@ -1111,10 +1163,7 @@ mod tests {
         let sb = super::to_singbox_json(std::slice::from_ref(&p));
         let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
         assert_eq!(sv["outbounds"][0]["transport"]["type"], "http");
-        assert_eq!(
-            sv["outbounds"][0]["transport"]["host"][0],
-            "h2.example.com"
-        );
+        assert_eq!(sv["outbounds"][0]["transport"]["host"][0], "h2.example.com");
     }
 
     #[test]
@@ -1209,6 +1258,77 @@ mod tests {
         let out = super::to_surge(std::slice::from_ref(&p));
         assert_eq!(out.lines().count(), 1, "节点名中的换行不得拆出新行: {out}");
         assert!(out.starts_with("evil_new _ x_ y = ss,"), "{out}");
+    }
+
+    #[test]
+    fn tuic_advanced_fields_exported() {
+        let mut p = mk(ProxyType::Tuic, "tu.example.com", 443);
+        p.uuid = Some("u".into());
+        p.password = Some("pw".into());
+        p.alpn = Some(vec!["h3".into()]);
+        p.congestion_control = Some("bbr".into());
+        p.udp_relay_mode = Some("quic".into());
+        p.udp_over_stream = Some(true);
+        p.zero_rtt_handshake = Some(true);
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("congestion-controller: bbr"), "{clash}");
+        assert!(clash.contains("udp-relay-mode: quic"));
+        assert!(clash.contains("udp-over-stream: true"));
+        assert!(clash.contains("reduce-rtt: true"));
+        assert!(clash.contains("alpn:"));
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        let o = &sv["outbounds"][0];
+        assert_eq!(o["congestion_control"], "bbr");
+        assert_eq!(o["udp_relay_mode"], "quic");
+        assert_eq!(o["udp_over_stream"], true);
+        assert_eq!(o["zero_rtt_handshake"], true);
+        assert_eq!(o["tls"]["alpn"][0], "h3");
+    }
+
+    #[test]
+    fn hysteria2_up_down_and_alpn_exported() {
+        let mut p = mk(ProxyType::Hysteria2, "hy.example.com", 443);
+        p.password = Some("pw".into());
+        p.up_mbps = Some(100);
+        p.down_mbps = Some(200);
+        p.alpn = Some(vec!["h3".into()]);
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("up: 100 Mbps"), "{clash}");
+        assert!(clash.contains("down: 200 Mbps"));
+        assert!(clash.contains("alpn:"));
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        let o = &sv["outbounds"][0];
+        assert_eq!(o["up_mbps"], 100);
+        assert_eq!(o["down_mbps"], 200);
+        assert_eq!(o["tls"]["alpn"][0], "h3");
+    }
+
+    #[test]
+    fn vless_alpn_exported_to_clash_v2ray_and_singbox() {
+        let mut p = mk(ProxyType::Vless, "v.example.com", 443);
+        p.uuid = Some("u".into());
+        p.tls = Some(true);
+        p.alpn = Some(vec!["h2".into(), "http/1.1".into()]);
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(
+            clash.contains("- h2") && clash.contains("http/1.1"),
+            "{clash}"
+        );
+
+        let v2 = super::to_v2ray_json(std::slice::from_ref(&p));
+        let vv: serde_json::Value = serde_json::from_str(&v2).unwrap();
+        assert_eq!(vv[0]["streamSettings"]["tlsSettings"]["alpn"][0], "h2");
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        assert_eq!(sv["outbounds"][0]["tls"]["alpn"][1], "http/1.1");
     }
 
     #[test]

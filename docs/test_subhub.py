@@ -417,6 +417,31 @@ proxies:
     assert len(same_src) == 1, f"same source URL must merge into one sub, got {len(same_src)}"
     print(f"  ✅ re-adding same URL kept a single subscription (subs {len(before_ids)} -> {len(after)})")
 
+    print("== local backup restore is idempotent via uid ==")
+    doc = call("/api/subscriptions/export")
+    assert doc["version"] == 3, doc
+    local = next(
+        s for s in doc["subscriptions"] if s["source"] == "pasted" and s["proxies"]
+    )
+    local = dict(local)
+    local["name"] = "LOCAL-RESTORE"
+    local["uid"] = "u_test_fixed"
+    before = len(call("/api/subscriptions"))
+    call("/api/subscriptions/import", {"subscriptions": [local]})
+    after_first = len(call("/api/subscriptions"))
+    call("/api/subscriptions/import", {"subscriptions": [local]})
+    after_second = len(call("/api/subscriptions"))
+    assert after_first == before + 1, (before, after_first)
+    assert after_second == after_first, f"second restore duplicated: {after_first} -> {after_second}"
+    restored = [
+        s for s in call("/api/subscriptions") if s["name"] == "LOCAL-RESTORE"
+    ]
+    assert len(restored) == 1, restored
+    doc2 = call("/api/subscriptions/export")
+    kept = next(s for s in doc2["subscriptions"] if s["name"] == "LOCAL-RESTORE")
+    assert kept["uid"] == "u_test_fixed", kept
+    print("  ✅ repeated local restore updates in place and keeps uid")
+
     print("== unlock-detect (no engine -> list, must not error) ==")
     r = call("/api/unlock-detect", {"timeout_ms": 3000})
     print("  unlock-detect returned", len(r), "entries")

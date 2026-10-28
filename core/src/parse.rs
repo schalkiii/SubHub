@@ -234,13 +234,11 @@ pub fn extract_subscription_usage(raw: &str) -> SubscriptionUsage {
     if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
         // 用量字段可能在顶层，也可能嵌套在 `info:` 块里（两种写法都常见）。
         let pick = |key: &str| {
-            v.get(key)
-                .and_then(|x| x.as_u64())
-                .or_else(|| {
-                    v.get("info")
-                        .and_then(|i| i.get(key))
-                        .and_then(|x| x.as_u64())
-                })
+            v.get(key).and_then(|x| x.as_u64()).or_else(|| {
+                v.get("info")
+                    .and_then(|i| i.get(key))
+                    .and_then(|x| x.as_u64())
+            })
         };
         u.download = pick("download");
         u.upload = pick("upload");
@@ -265,6 +263,58 @@ pub fn normalize_epoch(v: u64) -> u64 {
 
 fn as_str<'a>(v: &'a serde_yaml::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
+}
+
+fn parse_bool(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// ALPN in URIs is a comma-separated list (`h2,http/1.1`).
+fn parse_alpn(v: Option<&String>) -> Option<Vec<String>> {
+    let list: Vec<String> = v?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// YAML ALPN may be a sequence or a single string.
+fn yaml_string_list(v: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
+    let v = v?;
+    if let Some(s) = v.as_str() {
+        let list: Vec<String> = s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        return (!list.is_empty()).then_some(list);
+    }
+    let list: Vec<String> = v
+        .as_sequence()?
+        .iter()
+        .filter_map(|x| x.as_str())
+        .map(str::to_string)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Parse `"30 Mbps"` / `"30"` / `"30Mbps"` into Mbps.
+fn parse_mbps(s: &str) -> Option<u64> {
+    let numeric: String = s
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    numeric
+        .parse::<f64>()
+        .ok()
+        .map(|n| n.max(0.0).round() as u64)
 }
 
 fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
@@ -318,6 +368,27 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
         .filter(|s| !s.is_empty());
     p.obfs = as_str(v, "obfs").map(str::to_string);
     p.obfs_password = as_str(v, "obfs-password").map(str::to_string);
+    p.alpn = yaml_string_list(v.get("alpn"));
+    p.congestion_control = as_str(v, "congestion-controller")
+        .or_else(|| as_str(v, "congestion_control"))
+        .map(str::to_string);
+    p.udp_relay_mode = as_str(v, "udp-relay-mode")
+        .or_else(|| as_str(v, "udp_relay_mode"))
+        .map(str::to_string);
+    p.udp_over_stream = v
+        .get("udp-over-stream")
+        .or_else(|| v.get("udp_over_stream"))
+        .and_then(|x| x.as_bool());
+    p.zero_rtt_handshake = v
+        .get("reduce-rtt")
+        .or_else(|| v.get("zero_rtt_handshake"))
+        .and_then(|x| x.as_bool());
+    let mbps = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str().and_then(parse_mbps).or_else(|| x.as_u64()))
+    };
+    p.up_mbps = mbps("up");
+    p.down_mbps = mbps("down");
     p.network = as_str(v, "network").map(str::to_string);
     p.tls = v.get("tls").and_then(|x| x.as_bool());
     p.sni = as_str(v, "sni")
@@ -439,6 +510,20 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                         .and_then(|x| x.as_str())
                         .map(str::to_string);
                 }
+                p.up_mbps = ob.get("up_mbps").and_then(|x| x.as_u64());
+                p.down_mbps = ob.get("down_mbps").and_then(|x| x.as_u64());
+            }
+            if type_ == ProxyType::Tuic {
+                p.congestion_control = ob
+                    .get("congestion_control")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                p.udp_relay_mode = ob
+                    .get("udp_relay_mode")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                p.udp_over_stream = ob.get("udp_over_stream").and_then(|x| x.as_bool());
+                p.zero_rtt_handshake = ob.get("zero_rtt_handshake").and_then(|x| x.as_bool());
             }
             // sing-box uses `tls: {}` to enable and `tls: false` to disable; a
             // bare `tls: true`/object means enabled. Don't treat a present key
@@ -454,6 +539,16 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                     .and_then(|x| x.as_str())
                     .map(str::to_string);
                 p.skip_cert_verify = tls.get("insecure").and_then(|x| x.as_bool());
+                p.alpn = tls
+                    .get("alpn")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v| !v.is_empty());
             }
             // Transport (ws / grpc / h2) — sing-box nests this under
             // `transport: { type, path, headers, host, service_name }`.
@@ -650,6 +745,18 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
         .map(str::to_string);
     p.path = v.get("path").and_then(|x| x.as_str()).map(str::to_string);
     p.host = v.get("host").and_then(|x| x.as_str()).map(str::to_string);
+    p.alpn = match v.get("alpn") {
+        Some(serde_json::Value::String(s)) => parse_alpn(Some(s)),
+        Some(serde_json::Value::Array(a)) => {
+            let list: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect();
+            (!list.is_empty()).then_some(list)
+        }
+        _ => None,
+    };
     p.skip_cert_verify = v
         .get("allowInsecure")
         .or_else(|| v.get("insecure"))
@@ -685,6 +792,7 @@ fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
     }
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
+    p.alpn = parse_alpn(a.query.get("alpn"));
     p.skip_cert_verify = a
         .query
         .get("allowInsecure")
@@ -706,16 +814,13 @@ fn parse_trojan(body: &str, name: Option<String>) -> Option<Proxy> {
     );
     p.password = Some(a.userinfo);
     p.tls = Some(true);
-    p.sni = a
-        .query
-        .get("sni")
-        .or_else(|| a.query.get("peer"))
-        .cloned();
+    p.sni = a.query.get("sni").or_else(|| a.query.get("peer")).cloned();
     p.flow = a.query.get("flow").cloned();
     p.network = a.query.get("type").cloned();
     p.path = a.query.get("path").cloned();
     p.host = a.query.get("host").cloned();
     p.fingerprint = a.query.get("fp").cloned();
+    p.alpn = parse_alpn(a.query.get("alpn"));
     p.skip_cert_verify = a
         .query
         .get("allowInsecure")
@@ -828,6 +933,9 @@ fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
         .get("obfs-password")
         .or_else(|| a.query.get("obfs_password"))
         .cloned();
+    p.alpn = parse_alpn(a.query.get("alpn"));
+    p.up_mbps = a.query.get("up").and_then(|v| parse_mbps(v));
+    p.down_mbps = a.query.get("down").and_then(|v| parse_mbps(v));
     p.skip_cert_verify = a
         .query
         .get("insecure")
@@ -854,6 +962,28 @@ fn parse_tuic(body: &str, name: Option<String>) -> Option<Proxy> {
     p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
+    p.alpn = parse_alpn(a.query.get("alpn"));
+    p.congestion_control = a
+        .query
+        .get("congestion_control")
+        .or_else(|| a.query.get("congestion-controller"))
+        .cloned();
+    p.udp_relay_mode = a
+        .query
+        .get("udp_relay_mode")
+        .or_else(|| a.query.get("udp-relay-mode"))
+        .cloned();
+    let bool_query = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| a.query.get(*k).map(|v| parse_bool(v)))
+    };
+    p.udp_over_stream = bool_query(&["udp_over_stream", "udp-over-stream"]);
+    p.zero_rtt_handshake = bool_query(&[
+        "zero_rtt_handshake",
+        "zero-rtt-handshake",
+        "reduce_rtt",
+        "reduce-rtt",
+    ]);
     p.skip_cert_verify = a
         .query
         .get("insecure")
@@ -1227,9 +1357,8 @@ mod tests {
         );
 
         // aid 为数字时也要保留（旧代码只读字符串）。
-        let numeric_aid = base64::engine::general_purpose::STANDARD.encode(
-            r#"{"add":"1.2.3.4","port":443,"id":"uuid","aid":2}"#,
-        );
+        let numeric_aid = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"add":"1.2.3.4","port":443,"id":"uuid","aid":2}"#);
         let out = parse_subscription(&format!("vmess://{numeric_aid}"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].alter_id, Some(2));
@@ -1282,8 +1411,7 @@ mod tests {
 
     #[test]
     fn hysteria2_obfs_parsed_from_uri_and_singbox() {
-        let uri =
-            "hysteria2://pw@hy.example.com:443?obfs=salamander&obfs-password=secret#HY-OBFS";
+        let uri = "hysteria2://pw@hy.example.com:443?obfs=salamander&obfs-password=secret#HY-OBFS";
         let out = parse_subscription(uri);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].obfs.as_deref(), Some("salamander"));
@@ -1299,6 +1427,73 @@ mod tests {
         let out = parse_singbox_json(json).unwrap();
         assert_eq!(out[0].obfs.as_deref(), Some("salamander"));
         assert_eq!(out[0].obfs_password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn tuic_advanced_fields_parsed_from_uri_clash_and_singbox() {
+        let uri = "tuic://11111111-2222-3333-4444-555555555555:pw@tu.example.com:443?alpn=h3,spdy%2F3.1&congestion_control=bbr&udp_relay_mode=quic&udp_over_stream=1&zero_rtt_handshake=1&sni=tu.example.com#TU";
+        let out = parse_subscription(uri);
+        assert_eq!(out.len(), 1);
+        let p = &out[0];
+        assert_eq!(
+            p.alpn.as_deref(),
+            Some(&["h3".to_string(), "spdy/3.1".to_string()][..])
+        );
+        assert_eq!(p.congestion_control.as_deref(), Some("bbr"));
+        assert_eq!(p.udp_relay_mode.as_deref(), Some("quic"));
+        assert_eq!(p.udp_over_stream, Some(true));
+        assert_eq!(p.zero_rtt_handshake, Some(true));
+
+        let yaml = "proxies:\n  - name: T\n    type: tuic\n    server: tu.example.com\n    port: 443\n    uuid: u\n    password: pw\n    alpn:\n      - h3\n    congestion-controller: bbr\n    udp-relay-mode: native\n    udp-over-stream: true\n    reduce-rtt: true\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out[0].congestion_control.as_deref(), Some("bbr"));
+        assert_eq!(out[0].udp_relay_mode.as_deref(), Some("native"));
+        assert_eq!(out[0].udp_over_stream, Some(true));
+        assert_eq!(out[0].zero_rtt_handshake, Some(true));
+        assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
+
+        let json = r#"{
+            "outbounds": [
+                { "type": "tuic", "tag": "T", "server": "tu.example.com", "server_port": 443,
+                  "uuid": "u", "password": "pw", "congestion_control": "cubic",
+                  "udp_relay_mode": "quic", "udp_over_stream": true,
+                  "zero_rtt_handshake": false, "tls": { "enabled": true, "alpn": ["h3"] } }
+            ]
+        }"#;
+        let out = parse_singbox_json(json).unwrap();
+        assert_eq!(out[0].congestion_control.as_deref(), Some("cubic"));
+        assert_eq!(out[0].udp_relay_mode.as_deref(), Some("quic"));
+        assert_eq!(out[0].udp_over_stream, Some(true));
+        assert_eq!(out[0].zero_rtt_handshake, Some(false));
+        assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
+    }
+
+    #[test]
+    fn hysteria2_up_down_alpn_parsed() {
+        let uri = "hysteria2://pw@hy.example.com:443?up=100&down=200&alpn=h3#HY";
+        let out = parse_subscription(uri);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].up_mbps, Some(100));
+        assert_eq!(out[0].down_mbps, Some(200));
+        assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
+
+        let yaml = "proxies:\n  - name: H\n    type: hysteria2\n    server: hy.example.com\n    port: 443\n    password: pw\n    up: \"30 Mbps\"\n    down: \"200 Mbps\"\n    alpn:\n      - h3\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out[0].up_mbps, Some(30));
+        assert_eq!(out[0].down_mbps, Some(200));
+        assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
+
+        let json = r#"{
+            "outbounds": [
+                { "type": "hysteria2", "tag": "H", "server": "hy.example.com", "server_port": 443,
+                  "password": "pw", "up_mbps": 50, "down_mbps": 300,
+                  "tls": { "enabled": true, "alpn": ["h3"] } }
+            ]
+        }"#;
+        let out = parse_singbox_json(json).unwrap();
+        assert_eq!(out[0].up_mbps, Some(50));
+        assert_eq!(out[0].down_mbps, Some(300));
+        assert_eq!(out[0].alpn.as_deref(), Some(&["h3".to_string()][..]));
     }
 
     #[test]
