@@ -122,6 +122,12 @@ fn to_clash_value(p: &Proxy) -> Value {
             let ss_cipher = p.cipher.clone().or_else(|| p.method.clone());
             insert_opt(&mut m, "cipher", &ss_cipher);
             insert_opt(&mut m, "password", &p.password);
+            if let Some((name, opts)) = clash_plugin(p) {
+                m.insert(Value::from("plugin"), Value::from(name));
+                if !opts.is_empty() {
+                    m.insert(Value::from("plugin-opts"), Value::Mapping(opts));
+                }
+            }
         }
         ProxyType::Trojan => {
             insert_opt(&mut m, "password", &p.password);
@@ -172,6 +178,8 @@ fn to_clash_value(p: &Proxy) -> Value {
         ProxyType::Hysteria2 => {
             insert_opt(&mut m, "password", &p.password);
             insert_opt(&mut m, "sni", &p.sni);
+            insert_opt(&mut m, "obfs", &p.obfs);
+            insert_opt(&mut m, "obfs-password", &p.obfs_password);
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
         }
         ProxyType::Tuic => {
@@ -283,6 +291,106 @@ fn ss_method(p: &Proxy) -> String {
         .unwrap_or_else(|| "aes-256-gcm".to_string())
 }
 
+/// Split SIP002-style `k=v;k2=v2` plugin options. A bare flag (`tls`) means
+/// `true`, matching v2ray-plugin / obfs option syntax.
+fn parse_plugin_opts(opts: Option<&str>) -> Vec<(String, String)> {
+    opts.unwrap_or("")
+        .split(';')
+        .filter_map(|kv| {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                return None;
+            }
+            Some(match kv.split_once('=') {
+                Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+                None => (kv.to_string(), "true".to_string()),
+            })
+        })
+        .collect()
+}
+
+fn ss_plugin(p: &Proxy) -> Option<(String, Vec<(String, String)>)> {
+    let name = p.plugin.as_deref().filter(|s| !s.is_empty())?.to_string();
+    Some((name, parse_plugin_opts(p.plugin_opts.as_deref())))
+}
+
+/// Clash plugin name (`obfs` / `v2ray-plugin`) plus its option map. SIP002
+/// option names (`obfs`, `obfs-host`) are translated to clash's (`mode`,
+/// `host`); boolean-looking values stay YAML booleans.
+fn clash_plugin(p: &Proxy) -> Option<(String, Mapping)> {
+    let (name, opts) = ss_plugin(p)?;
+    let lower = name.to_ascii_lowercase();
+    let mut map = Mapping::new();
+    if lower.contains("obfs") {
+        for (k, v) in opts {
+            let key = match k.as_str() {
+                "obfs" => "mode",
+                "obfs-host" => "host",
+                other => other,
+            };
+            map.insert(Value::from(key), Value::from(v));
+        }
+        Some(("obfs".to_string(), map))
+    } else if lower.contains("v2ray-plugin") {
+        for (k, v) in opts {
+            if k == "tls" || k == "mux" {
+                let b = v == "1" || v.eq_ignore_ascii_case("true");
+                map.insert(Value::from(k), Value::from(b));
+            } else {
+                map.insert(Value::from(k), Value::from(v));
+            }
+        }
+        Some(("v2ray-plugin".to_string(), map))
+    } else {
+        for (k, v) in opts {
+            map.insert(Value::from(k), Value::from(v));
+        }
+        Some((name, map))
+    }
+}
+
+/// sing-box plugin name + options. sing-box uses `obfs-local` and the original
+/// SIP002 `obfs`/`obfs-host` option names.
+fn singbox_plugin(p: &Proxy) -> Option<(String, Option<String>)> {
+    let (name, opts) = ss_plugin(p)?;
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("obfs") {
+        let joined = opts
+            .into_iter()
+            .map(|(k, v)| {
+                let key = match k.as_str() {
+                    "mode" => "obfs",
+                    "host" => "obfs-host",
+                    other => other,
+                };
+                format!("{key}={v}")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        Some((
+            "obfs-local".to_string(),
+            (!joined.is_empty()).then_some(joined),
+        ))
+    } else if lower.contains("v2ray-plugin") {
+        let joined = opts
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        Some((
+            "v2ray-plugin".to_string(),
+            (!joined.is_empty()).then_some(joined),
+        ))
+    } else {
+        let joined = opts
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        Some((name, (!joined.is_empty()).then_some(joined)))
+    }
+}
+
 // ===================== v2ray (v2rayN outbounds array) =====================
 
 pub fn to_v2ray_json(proxies: &[Proxy]) -> String {
@@ -390,15 +498,26 @@ fn v2ray_outbound(p: &Proxy) -> Option<serde_json::Value> {
             } ] },
             "streamSettings": v2ray_stream(p)
         }),
-        ProxyType::Ss => json!({
-            "tag": p.name,
-            "protocol": "shadowsocks",
-            "settings": { "servers": [ {
-                "address": p.server, "port": p.port,
-                "method": ss_method(p),
-                "password": p.password.clone().unwrap_or_default()
-            } ] }
-        }),
+        ProxyType::Ss => {
+            // v2ray-core 的 shadowsocks outbound 不支持 obfs/v2ray-plugin；
+            // 静默丢掉插件会得到一段看似正常但必然连不上的配置，直接跳过并提示。
+            if p.plugin.as_deref().is_some_and(|s| !s.is_empty()) {
+                eprintln!(
+                    "[export] v2ray 不支持 SS 插件节点「{}」，已跳过",
+                    p.name
+                );
+                return None;
+            }
+            json!({
+                "tag": p.name,
+                "protocol": "shadowsocks",
+                "settings": { "servers": [ {
+                    "address": p.server, "port": p.port,
+                    "method": ss_method(p),
+                    "password": p.password.clone().unwrap_or_default()
+                } ] }
+            })
+        }
         // V2Ray core cannot represent these protocols as outbounds — skip
         // rather than emit a `freedom` (direct) outbound that would break the
         // node's connectivity. This includes AnyTLS, which v2ray-core does not
@@ -559,6 +678,12 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server_port"] = json!(p.port);
             o["method"] = json!(ss_method(p));
             o["password"] = json!(p.password.clone().unwrap_or_default());
+            if let Some((name, opts)) = singbox_plugin(p) {
+                o["plugin"] = json!(name);
+                if let Some(opts) = opts {
+                    o["plugin_opts"] = json!(opts);
+                }
+            }
             Some(o)
         }
         ProxyType::Hysteria2 => {
@@ -566,6 +691,12 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
             o["password"] = json!(p.password.clone().unwrap_or_default());
+            if let Some(obfs) = &p.obfs {
+                o["obfs"] = json!({
+                    "type": obfs,
+                    "password": p.obfs_password.clone().unwrap_or_default(),
+                });
+            }
             o["tls"] = singbox_tls_forced(p);
             Some(o)
         }
@@ -624,22 +755,61 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
 
 // ===================== surge =====================
 
+/// Surge config is line/comma based: a node name containing a newline, comma
+/// or `=` could break the line or inject another proxy entry. Replace those
+/// characters before writing.
+fn surge_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\r' | '\n' | ',' | '=' => '_',
+            c => c,
+        })
+        .collect()
+}
+
 pub fn to_surge(proxies: &[Proxy]) -> String {
     let mut lines = Vec::new();
     for p in proxies {
+        let name = surge_safe(&p.name);
         let line = match p.type_ {
-            ProxyType::Ss => format!(
-                "{} = ss, {}, {}, encrypt-method={}, password={}",
-                p.name,
-                p.server,
-                p.port,
-                ss_method(p),
-                p.password.clone().unwrap_or_default()
-            ),
+            ProxyType::Ss => {
+                let mut s = format!(
+                    "{} = ss, {}, {}, encrypt-method={}, password={}",
+                    name,
+                    p.server,
+                    p.port,
+                    ss_method(p),
+                    p.password.clone().unwrap_or_default()
+                );
+                if let Some((plugin_name, opts)) = ss_plugin(p) {
+                    let lower = plugin_name.to_ascii_lowercase();
+                    if lower.contains("obfs") {
+                        if let Some((_, mode)) = opts
+                            .iter()
+                            .find(|(k, _)| k == "obfs" || k == "mode")
+                        {
+                            s.push_str(&format!(", obfs={}", surge_safe(mode)));
+                        }
+                        if let Some((_, host)) = opts
+                            .iter()
+                            .find(|(k, _)| k == "obfs-host" || k == "host")
+                        {
+                            s.push_str(&format!(", obfs-host={}", surge_safe(host)));
+                        }
+                    } else {
+                        eprintln!(
+                            "[export] surge 不支持 SS 插件节点「{}」，已跳过",
+                            p.name
+                        );
+                        continue;
+                    }
+                }
+                s
+            }
             ProxyType::Trojan => {
                 let mut s = format!(
                     "{} = trojan, {}, {}, password={}",
-                    p.name,
+                    name,
                     p.server,
                     p.port,
                     p.password.clone().unwrap_or_default()
@@ -658,7 +828,7 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
             ProxyType::Vmess => {
                 let mut s = format!(
                     "{} = vmess, {}, {}, username={}, network={}",
-                    p.name,
+                    name,
                     p.server,
                     p.port,
                     p.uuid.clone().unwrap_or_default(),
@@ -684,7 +854,7 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
             ProxyType::Vless => {
                 let mut s = format!(
                     "{} = vless, {}, {}, username={}",
-                    p.name,
+                    name,
                     p.server,
                     p.port,
                     p.uuid.clone().unwrap_or_default()
@@ -972,6 +1142,73 @@ mod tests {
         // 两个节点的服务器地址都应出现在产物中（都保留了，只是名字不同）。
         assert!(yaml.contains("1.1.1.1"), "原节点 A 必须保留");
         assert!(yaml.contains("2.2.2.2"), "原节点 B 必须保留");
+    }
+
+    #[test]
+    fn ss_plugin_exported_to_clash_singbox_and_surge_obfs() {
+        let mut p = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        p.method = Some("aes-256-gcm".into());
+        p.password = Some("pw".into());
+        p.plugin = Some("obfs-local".into());
+        p.plugin_opts = Some("obfs=http;obfs-host=example.com".into());
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("plugin: obfs"), "clash 插件名错误: {clash}");
+        assert!(clash.contains("mode: http"));
+        assert!(clash.contains("host: example.com"));
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        assert_eq!(sv["outbounds"][0]["plugin"], "obfs-local");
+        assert_eq!(
+            sv["outbounds"][0]["plugin_opts"],
+            "obfs=http;obfs-host=example.com"
+        );
+
+        // v2ray-core 无法表示 SS 插件：必须跳过而不是输出丢失插件的错误节点。
+        assert_eq!(super::to_v2ray_json(std::slice::from_ref(&p)), "[]");
+
+        let surge = super::to_surge(std::slice::from_ref(&p));
+        assert!(surge.contains("obfs=http"));
+        assert!(surge.contains("obfs-host=example.com"));
+    }
+
+    #[test]
+    fn ss_v2ray_plugin_is_skipped_in_surge() {
+        let mut p = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        p.method = Some("aes-256-gcm".into());
+        p.password = Some("pw".into());
+        p.plugin = Some("v2ray-plugin".into());
+        p.plugin_opts = Some("mode=websocket;tls".into());
+        assert!(super::to_surge(std::slice::from_ref(&p)).is_empty());
+    }
+
+    #[test]
+    fn hysteria2_obfs_exported_to_clash_and_singbox() {
+        let mut p = mk(ProxyType::Hysteria2, "hy.example.com", 443);
+        p.password = Some("pw".into());
+        p.obfs = Some("salamander".into());
+        p.obfs_password = Some("secret".into());
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("obfs: salamander"));
+        assert!(clash.contains("obfs-password: secret"));
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        assert_eq!(sv["outbounds"][0]["obfs"]["type"], "salamander");
+        assert_eq!(sv["outbounds"][0]["obfs"]["password"], "secret");
+    }
+
+    #[test]
+    fn surge_names_are_sanitized() {
+        let mut p = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        p.name = "evil\nnew = x, y".into();
+        p.method = Some("aes-256-gcm".into());
+        p.password = Some("pw".into());
+        let out = super::to_surge(std::slice::from_ref(&p));
+        assert_eq!(out.lines().count(), 1, "节点名中的换行不得拆出新行: {out}");
+        assert!(out.starts_with("evil_new _ x_ y = ss,"), "{out}");
     }
 
     #[test]

@@ -232,10 +232,20 @@ pub fn extract_subscription_usage(raw: &str) -> SubscriptionUsage {
     };
     let mut u = SubscriptionUsage::default();
     if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
-        u.download = v.get("download").and_then(|x| x.as_u64());
-        u.upload = v.get("upload").and_then(|x| x.as_u64());
-        u.total = v.get("total").and_then(|x| x.as_u64());
-        if let Some(exp) = v.get("expire").and_then(|x| x.as_u64()) {
+        // 用量字段可能在顶层，也可能嵌套在 `info:` 块里（两种写法都常见）。
+        let pick = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_u64())
+                .or_else(|| {
+                    v.get("info")
+                        .and_then(|i| i.get(key))
+                        .and_then(|x| x.as_u64())
+                })
+        };
+        u.download = pick("download");
+        u.upload = pick("upload");
+        u.total = pick("total");
+        if let Some(exp) = pick("expire") {
             u.expire = Some(normalize_epoch(exp));
         }
     }
@@ -287,6 +297,27 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
     p.flow = as_str(v, "flow").map(str::to_string);
     p.password = as_str(v, "password").map(str::to_string);
     p.method = as_str(v, "method").map(str::to_string);
+    p.plugin = as_str(v, "plugin").map(str::to_string);
+    p.plugin_opts = v
+        .get("plugin-opts")
+        .and_then(|po| po.as_mapping())
+        .map(|map| {
+            let mut parts: Vec<String> = Vec::new();
+            for (k, val) in map {
+                let Some(key) = k.as_str() else { continue };
+                let value = match val {
+                    serde_yaml::Value::Bool(b) => b.to_string(),
+                    serde_yaml::Value::String(s) => s.clone(),
+                    serde_yaml::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                parts.push(format!("{key}={value}"));
+            }
+            parts.join(";")
+        })
+        .filter(|s| !s.is_empty());
+    p.obfs = as_str(v, "obfs").map(str::to_string);
+    p.obfs_password = as_str(v, "obfs-password").map(str::to_string);
     p.network = as_str(v, "network").map(str::to_string);
     p.tls = v.get("tls").and_then(|x| x.as_bool());
     p.sni = as_str(v, "sni")
@@ -387,6 +418,28 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                 .and_then(|x| x.as_str())
                 .map(str::to_string);
             p.uuid = ob.get("uuid").and_then(|x| x.as_str()).map(str::to_string);
+            if type_ == ProxyType::Ss {
+                p.plugin = ob
+                    .get("plugin")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                p.plugin_opts = ob
+                    .get("plugin_opts")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+            }
+            if type_ == ProxyType::Hysteria2 {
+                if let Some(obfs) = ob.get("obfs") {
+                    p.obfs = obfs
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    p.obfs_password = obfs
+                        .get("password")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                }
+            }
             // sing-box uses `tls: {}` to enable and `tls: false` to disable; a
             // bare `tls: true`/object means enabled. Don't treat a present key
             // as unconditionally enabled (that forced TLS onto plaintext nodes).
@@ -691,6 +744,7 @@ fn parse_ss(body: &str, name: Option<String>) -> Option<Proxy> {
                 );
                 p.method = Some(method);
                 p.password = Some(password);
+                apply_ss_plugin(&mut p, a.query.get("plugin").map(String::as_str));
                 return Some(p);
             }
         }
@@ -708,10 +762,24 @@ fn parse_ss(body: &str, name: Option<String>) -> Option<Proxy> {
             );
             p.method = Some(method);
             p.password = Some(password);
+            apply_ss_plugin(&mut p, a.query.get("plugin").map(String::as_str));
             return Some(p);
         }
     }
     None
+}
+
+/// SIP002 `plugin=obfs-local;obfs=http;obfs-host=x`：第一个分号前是插件名，
+/// 其余是 `k=v` 选项。SS 节点的插件会改变握手行为，必须参与指纹与导出。
+fn apply_ss_plugin(p: &mut Proxy, raw: Option<&str>) {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let (name, opts) = raw.split_once(';').unwrap_or((raw, ""));
+    p.plugin = Some(name.to_string());
+    if !opts.is_empty() {
+        p.plugin_opts = Some(opts.to_string());
+    }
 }
 
 fn decode_ss_userinfo(u: &str) -> (String, String) {
@@ -754,6 +822,12 @@ fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
     p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
+    p.obfs = a.query.get("obfs").cloned();
+    p.obfs_password = a
+        .query
+        .get("obfs-password")
+        .or_else(|| a.query.get("obfs_password"))
+        .cloned();
     p.skip_cert_verify = a
         .query
         .get("insecure")
@@ -851,6 +925,23 @@ mod tests {
         assert_eq!(u.total, Some(1000));
         // expire given in seconds -> normalized to ms
         assert_eq!(u.expire, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn usage_from_nested_info_block() {
+        // 部分订阅把用量放在顶层 `info:` 下，且可能与顶层字段混用。
+        let raw = "info:\n  download: 200\n  upload: 100\n  total: 2000\n  expire: 1700000000\nproxies:\n  - name: a\n";
+        let u = extract_subscription_usage(raw);
+        assert_eq!(u.download, Some(200));
+        assert_eq!(u.upload, Some(100));
+        assert_eq!(u.total, Some(2000));
+        assert_eq!(u.expire, Some(1_700_000_000_000));
+
+        // 顶层字段优先于 info 块。
+        let mixed = "download: 1\ninfo:\n  download: 2\n  total: 9\n";
+        let u = extract_subscription_usage(mixed);
+        assert_eq!(u.download, Some(1));
+        assert_eq!(u.total, Some(9));
     }
 
     #[test]
@@ -1153,6 +1244,61 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sni.as_deref(), Some("cdn.example.com"));
         assert_eq!(out[0].tls, Some(true));
+    }
+
+    #[test]
+    fn ss_plugin_parsed_from_uri_clash_and_singbox() {
+        // SIP002: plugin 参数是 URL 编码的 `name;k=v;...`。
+        let uri = "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#OBFS";
+        let out = parse_subscription(uri);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].plugin.as_deref(), Some("obfs-local"));
+        assert_eq!(
+            out[0].plugin_opts.as_deref(),
+            Some("obfs=http;obfs-host=example.com")
+        );
+
+        let yaml = "proxies:\n  - name: O\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-128-gcm\n    password: pw\n    plugin: obfs\n    plugin-opts:\n      mode: http\n      host: example.com\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].plugin.as_deref(), Some("obfs"));
+        let opts = out[0].plugin_opts.clone().unwrap_or_default();
+        assert!(opts.contains("mode=http") && opts.contains("host=example.com"));
+
+        let json = r#"{
+            "outbounds": [
+                { "type": "shadowsocks", "tag": "S", "server": "1.2.3.4", "server_port": 8388,
+                  "method": "aes-128-gcm", "password": "pw",
+                  "plugin": "obfs-local", "plugin_opts": "obfs=http;obfs-host=example.com" }
+            ]
+        }"#;
+        let out = parse_singbox_json(json).unwrap();
+        assert_eq!(out[0].plugin.as_deref(), Some("obfs-local"));
+        assert_eq!(
+            out[0].plugin_opts.as_deref(),
+            Some("obfs=http;obfs-host=example.com")
+        );
+    }
+
+    #[test]
+    fn hysteria2_obfs_parsed_from_uri_and_singbox() {
+        let uri =
+            "hysteria2://pw@hy.example.com:443?obfs=salamander&obfs-password=secret#HY-OBFS";
+        let out = parse_subscription(uri);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].obfs.as_deref(), Some("salamander"));
+        assert_eq!(out[0].obfs_password.as_deref(), Some("secret"));
+
+        let json = r#"{
+            "outbounds": [
+                { "type": "hysteria2", "tag": "H", "server": "hy.example.com", "server_port": 443,
+                  "password": "pw", "tls": { "enabled": true },
+                  "obfs": { "type": "salamander", "password": "secret" } }
+            ]
+        }"#;
+        let out = parse_singbox_json(json).unwrap();
+        assert_eq!(out[0].obfs.as_deref(), Some("salamander"));
+        assert_eq!(out[0].obfs_password.as_deref(), Some("secret"));
     }
 
     #[test]

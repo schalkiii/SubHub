@@ -190,6 +190,17 @@ pub struct Proxy {
     pub password: Option<String>,
     pub method: Option<String>,
 
+    // SS 插件（obfs / v2ray-plugin）与 Hysteria2 obfs。`plugin_opts` 保持
+    // SIP002 的 `k=v;k2=v2` 原始形态，导出时再按目标格式转换。
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default)]
+    pub plugin_opts: Option<String>,
+    #[serde(default)]
+    pub obfs: Option<String>,
+    #[serde(default)]
+    pub obfs_password: Option<String>,
+
     // transport / tls
     pub network: Option<String>, // tcp / ws / grpc / h2
     pub tls: Option<bool>,
@@ -350,6 +361,10 @@ impl Proxy {
             flow: None,
             password: None,
             method: None,
+            plugin: None,
+            plugin_opts: None,
+            obfs: None,
+            obfs_password: None,
             network: None,
             tls: None,
             sni: None,
@@ -879,16 +894,16 @@ impl Proxy {
             ),
         };
 
-        // WS `Host` / gRPC `service_name` / REALITY keys distinguish genuinely
-        // different nodes that share server+port+uuid (common for providers
-        // multiplexing one host). Append them only when present so nodes
+        // WS `Host` / gRPC `service_name` / REALITY keys / SS plugin /
+        // Hysteria2 obfs distinguish genuinely different nodes that share
+        // server+port+credential. Append them only when present so nodes
         // without these fields keep their existing fingerprint (and their
         // measured health survives the upgrade).
+        let mut extra: Vec<String> = Vec::new();
         if matches!(
             self.type_,
             ProxyType::Vmess | ProxyType::Vless | ProxyType::Tuic
         ) {
-            let mut extra: Vec<String> = Vec::new();
             if let Some(h) = self.host.as_deref().filter(|s| !s.is_empty()) {
                 extra.push(format!("h={}", h.replace('|', "#")));
             }
@@ -912,10 +927,26 @@ impl Proxy {
                     extra.push(format!("sid={}", sid.replace('|', "#")));
                 }
             }
-            if !extra.is_empty() {
-                cred.push('|');
-                cred.push_str(&extra.join("|"));
+        }
+        if self.type_ == ProxyType::Ss {
+            if let Some(plugin) = self.plugin.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("plugin={}", plugin.replace('|', "#")));
             }
+            if let Some(opts) = self.plugin_opts.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("opts={}", opts.replace('|', "#")));
+            }
+        }
+        if self.type_ == ProxyType::Hysteria2 {
+            if let Some(obfs) = self.obfs.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("obfs={}", obfs.replace('|', "#")));
+            }
+            if let Some(pw) = self.obfs_password.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("opw={}", pw.replace('|', "#")));
+            }
+        }
+        if !extra.is_empty() {
+            cred.push('|');
+            cred.push_str(&extra.join("|"));
         }
 
         format!(
@@ -1144,6 +1175,23 @@ mod tests {
         let mut b = a.clone();
         b.reality_public_key = Some("pk-b".into());
         assert_ne!(a.fingerprint(), b.fingerprint(), "不同 REALITY 公钥不得合并");
+    }
+
+    #[test]
+    fn fingerprint_includes_ss_plugin_and_hysteria2_obfs() {
+        let mut a = Proxy::new("S".into(), ProxyType::Ss, "1.2.3.4".into(), 8388);
+        a.password = Some("pw".into());
+        a.method = Some("aes-256-gcm".into());
+        let mut b = a.clone();
+        b.plugin = Some("obfs-local".into());
+        b.plugin_opts = Some("obfs=http".into());
+        assert_ne!(a.fingerprint(), b.fingerprint(), "SS 插件必须影响指纹");
+
+        let mut h1 = Proxy::new("H".into(), ProxyType::Hysteria2, "5.6.7.8".into(), 443);
+        h1.password = Some("pw".into());
+        let mut h2 = h1.clone();
+        h2.obfs = Some("salamander".into());
+        assert_ne!(h1.fingerprint(), h2.fingerprint(), "HY2 obfs 必须影响指纹");
     }
 
     #[test]
