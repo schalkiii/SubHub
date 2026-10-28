@@ -129,6 +129,15 @@ def main():
     assert broken[0]["last_error"], "expected last_error on broken sub"
     print("  ✅ broken sub correctly flagged error with last_error")
 
+    print("== error messages must not leak subscription tokens ==")
+    secret_url = "http://127.0.0.1:9/subs?token=SUPERSECRET"
+    call("/api/subscriptions", {"urls": [secret_url]})
+    secret_sub = next(
+        s for s in call("/api/subscriptions") if s["source"] == secret_url
+    )
+    assert "SUPERSECRET" not in (secret_sub["last_error"] or ""), secret_sub
+    print("  ✅ last_error is URL-redacted")
+
     print("== add subscription via unreachable proxy -> error ==")
     # 拉取代理只在总开关打开时生效；这里显式打开，避免受 SUBHUB_USE_PROXY=0 影响。
     call("/api/settings", {"use_proxy": True})
@@ -214,6 +223,30 @@ def main():
     v2_all = call("/api/export", {"format": "v2ray"})["content"]
     assert '"realitySettings"' in v2_all and '"publicKey": "PUBKEY"' in v2_all
     print("  ✅ REALITY fields survive clash / sing-box / v2ray export")
+
+    print("== SS plugin / Hysteria2 obfs export fidelity ==")
+    call(
+        "/api/import",
+        {
+            "content": "ss://YWVzLTI1Ni1nY206cGFzcw==@127.0.0.1:3005?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#SS-PLUGIN"
+        },
+    )
+    call(
+        "/api/import",
+        {
+            "content": "hysteria2://pw@127.0.0.1:3005?obfs=salamander&obfs-password=secret#HY-OBFS"
+        },
+    )
+    clash_all = call("/api/export", {"format": "clash-meta"})["content"]
+    assert "plugin: obfs" in clash_all, "clash 缺少 SS 插件"
+    assert "obfs: salamander" in clash_all, "clash 缺少 HY2 obfs"
+    sb_all = call("/api/export", {"format": "sing-box"})["content"]
+    assert '"plugin_opts"' in sb_all and "obfs-local" in sb_all
+    assert '"salamander"' in sb_all
+    v2_all = call("/api/export", {"format": "v2ray"})["content"]
+    assert "SS-PLUGIN" not in v2_all, "v2ray 不应导出 SS 插件节点"
+    assert "HY-OBFS" not in v2_all, "v2ray 不应导出 hysteria2 节点"
+    print("  ✅ SS plugin / HY2 obfs survive clash/sing-box and are skipped by v2ray")
 
     print("== export filters out invalid (other-type) nodes (Round E/F regression) ==")
     # An unrecognized proxy type is parsed as ProxyType::Other and MUST NOT be exported,
@@ -322,14 +355,58 @@ proxies:
     assert call("/api/settings")["top_n"] == 0
     print("  ✅ top_n saved and restored via /api/settings")
 
-    print("== delete non-existent subscription -> 404 ==")
+    print("== scheduler intervals clamp to >= 60s ==")
+    call("/api/settings", {"auto_refresh_sec": 1, "node_health_check_sec": 1})
+    s = call("/api/settings")
+    assert s["auto_refresh_sec"] >= 60, s
+    assert s["node_health_check_sec"] >= 60, s
+    call("/api/settings", {"auto_refresh_sec": 0, "node_health_check_sec": 0})
+    print("  ✅ 1s intervals are clamped (0 still disables)")
+
+    print("== gist upload goes through the pull proxy ==")
+    import urllib.error
+    call(
+        "/api/settings",
+        {
+            "use_proxy": True,
+            "default_fetch_proxy": "http://127.0.0.1:1",
+            "github_user": "fake-user",
+            "github_token": "fake-token",
+        },
+    )
+    try:
+        call("/api/gist/upload", {})
+        raise AssertionError("gist upload through an unreachable proxy must fail")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        assert e.code == 502, (e.code, body)
+        assert "GitHub 请求失败" in body, body
+        assert "fake-token" not in body, body
+    finally:
+        call(
+            "/api/settings",
+            {
+                "use_proxy": False,
+                "default_fetch_proxy": "",
+                "github_user": "",
+                "github_token": "",
+            },
+        )
+    print("  ✅ gist upload routed through proxy and failed cleanly")
+
+    print("== delete / refresh non-existent subscription -> 404 ==")
     import urllib.error
     try:
         call("/api/subscriptions/does-not-exist", method="DELETE")
         raise AssertionError("deleting a bogus id must return HTTP 404")
     except urllib.error.HTTPError as e:
         assert e.code == 404, f"expected 404, got {e.code}"
-    print("  ✅ bogus delete correctly rejected with 404")
+    try:
+        call("/api/subscriptions/does-not-exist/refresh", {})
+        raise AssertionError("refreshing a bogus id must return HTTP 404")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404, f"expected 404, got {e.code}"
+    print("  ✅ bogus delete / refresh correctly rejected with 404")
 
     print("== import idempotency (same URL merges, no duplicate sub) ==")
     # importing the same remote source twice must not create two subscriptions

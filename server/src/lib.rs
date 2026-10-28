@@ -708,6 +708,18 @@ pub struct SubSummary {
     pub expire: Option<u64>,
 }
 
+/// 自动刷新 / 健康检查的最小非零间隔（秒）。API 或环境变量误设 1 秒会让
+/// 后台循环持续打满网络与 CPU；0 仍表示关闭。
+pub(crate) const MIN_SCHEDULER_SEC: u64 = 60;
+
+pub(crate) fn clamp_schedule(sec: u64) -> u64 {
+    if sec == 0 {
+        0
+    } else {
+        sec.max(MIN_SCHEDULER_SEC)
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -747,7 +759,10 @@ fn client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client, String> {
             if p.is_empty() {
                 b = b.no_proxy();
             } else {
-                b = b.proxy(reqwest::Proxy::all(p).map_err(|e| format!("代理地址无效 {p}: {e}"))?);
+                b = b.proxy(
+                    reqwest::Proxy::all(p)
+                        .map_err(|e| format!("代理地址无效 {}: {e}", redact_url(p)))?,
+                );
             }
         }
 
@@ -789,7 +804,10 @@ async fn fetch_subscription_text(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
+        // reqwest's Display includes the full request URL (with subscription
+        // token/query). Strip it before the error is stored in `last_error` and
+        // rendered in the UI.
+        .map_err(|e| format!("fetch failed: {}", e.without_url()))?;
     let userinfo = resp
         .headers()
         .get("subscription-userinfo")
@@ -807,7 +825,7 @@ async fn fetch_subscription_text(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("read body failed: {e}"))?;
+        .map_err(|e| format!("read body failed: {}", e.without_url()))?;
     if bytes.len() as u64 > MAX_SUB_RESPONSE_BYTES {
         return Err(format!("订阅响应过大 (超过 {}B)", MAX_SUB_RESPONSE_BYTES));
     }
@@ -1728,12 +1746,14 @@ pub async fn run_server() {
     let auto_refresh_default = std::env::var("SUBHUB_AUTO_REFRESH_SEC")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .map(clamp_schedule)
         .unwrap_or(0);
 
     let auto_refresh_sec = db
         .as_ref()
         .and_then(|d| d.meta_get("auto_refresh_sec"))
         .and_then(|v| v.parse::<u64>().ok())
+        .map(clamp_schedule)
         .unwrap_or(auto_refresh_default);
 
     // Node-health re-test interval: env `SUBHUB_HEALTH_CHECK_SEC` sets the
@@ -1742,12 +1762,14 @@ pub async fn run_server() {
     let node_health_check_default = std::env::var("SUBHUB_HEALTH_CHECK_SEC")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .map(clamp_schedule)
         .unwrap_or(0);
 
     let node_health_check_sec = db
         .as_ref()
         .and_then(|d| d.meta_get("node_health_check_sec"))
         .and_then(|v| v.parse::<u64>().ok())
+        .map(clamp_schedule)
         .unwrap_or(node_health_check_default);
 
     // Default pull-proxy: server-side source of truth (replaces the old
@@ -2344,6 +2366,15 @@ mod tests {
         assert_eq!(super::resolve_top_n(Some(0), 0), None);
         assert_eq!(super::resolve_top_n(Some(10), 50), Some(10));
         assert_eq!(super::resolve_top_n(Some(10), 0), Some(10));
+    }
+
+    #[test]
+    fn clamp_schedule_keeps_zero_and_enforces_minimum() {
+        assert_eq!(super::clamp_schedule(0), 0, "0 仍表示关闭");
+        assert_eq!(super::clamp_schedule(1), super::MIN_SCHEDULER_SEC);
+        assert_eq!(super::clamp_schedule(59), super::MIN_SCHEDULER_SEC);
+        assert_eq!(super::clamp_schedule(60), 60);
+        assert_eq!(super::clamp_schedule(3600), 3600);
     }
 
     #[test]

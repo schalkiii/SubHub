@@ -685,7 +685,8 @@ async function loadSubs(targetId, withManage, compact) {
         try {
           await postJson("/api/subscriptions/" + b.dataset.id + "/refresh", {});
         } catch (e) {
-          console.error(e);
+          // 刷新失败（含 404 已被删除）需要在界面上可见，不能只写控制台。
+          alert("刷新失败：" + e.message);
         }
         loadSubs(targetId, true);
         loadDashboard();
@@ -1749,6 +1750,14 @@ document.getElementById("btn-gist-upload").addEventListener("click", async () =>
   // URLSearchParams → 服务端 GistUploadReq 期望的单值对象（每 key 取首值）。
   const body = {};
   for (const key of new Set(params.keys())) body[key] = params.get(key);
+  // Gist 是公开可读的：上传内容包含节点凭据，必须让用户明确确认。
+  if (
+    !confirm(
+      "将把所有订阅（含节点服务器与密码/密钥）上传到公开 Gist，任何拿到地址的人都能读取。确定继续？"
+    )
+  ) {
+    return;
+  }
   btn.disabled = true;
   resEl.style.color = "";
   resEl.textContent = "上传中…";

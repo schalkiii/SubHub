@@ -3,7 +3,7 @@
 use crate::*;
 use crate::{
     apply_mode, client_with_proxy, engine_bin_of, flatten_dedup, is_loopback_server, persist_all,
-    persist_results, run_engine_passes, LockExt,
+    persist_results, redact_url, run_engine_passes, LockExt,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -72,7 +72,26 @@ pub(crate) async fn gist_upload(
         ))?;
 
     // 3) 创建 / 更新 Gist（沿用 state.gist_id；若 PATCH 返回 404 说明 Gist 已被删，自动重建）。
-    let client = reqwest::Client::builder().build().map_err(|e| {
+    // GitHub 在部分网络不可直连：开启全局拉取代理时顺带走该代理；
+    // 未配置代理时保持系统默认行为（尊重 HTTP(S)_PROXY）。
+    let proxy = if *state.use_proxy.lock_ok() {
+        state.default_fetch_proxy.lock_ok().clone()
+    } else {
+        None
+    };
+    let mut client_builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent("subhub");
+    if let Some(p) = proxy.as_deref().filter(|s| !s.trim().is_empty()) {
+        let parsed = reqwest::Proxy::all(p).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("拉取代理无效 {}: {e}", redact_url(p)),
+            )
+        })?;
+        client_builder = client_builder.proxy(parsed);
+    }
+    let client = client_builder.build().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("创建 HTTP 客户端失败：{e}"),

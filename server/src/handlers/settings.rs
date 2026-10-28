@@ -48,6 +48,7 @@ pub(crate) fn apply_settings(state: &AppState, req: SettingsReq) -> SettingsResp
     }
 
     if let Some(sec) = req.auto_refresh_sec {
+        let sec = clamp_schedule(sec);
         *state.auto_refresh_sec.lock_ok() = sec;
 
         if let Some(db) = &state.db {
@@ -56,6 +57,7 @@ pub(crate) fn apply_settings(state: &AppState, req: SettingsReq) -> SettingsResp
     }
 
     if let Some(sec) = req.node_health_check_sec {
+        let sec = clamp_schedule(sec);
         *state.node_health_check_sec.lock_ok() = sec;
 
         if let Some(db) = &state.db {

@@ -699,14 +699,14 @@ pub(crate) async fn refresh_subscription(
     State(state): State<AppState>,
 
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match do_refresh_one(&state, &id).await {
         Some(v) => {
             persist_all(&state);
-
-            Json(v)
+            Ok(Json(v))
         }
-
-        None => Json(serde_json::json!({ "status": "error", "error": "not found" })),
+        // 与删除 / 单订阅测速保持一致：不存在的 id 返回 404，而不是
+        // 200 + status:error 让调用方误以为请求成功。
+        None => Err((StatusCode::NOT_FOUND, "subscription not found".into())),
     }
 }
