@@ -116,6 +116,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "password", &p.password);
             insert_opt(&mut m, "sni", &p.sni);
             insert_opt(&mut m, "flow", &p.flow);
+            insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
             m.insert(Value::from("tls"), Value::from(true));
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
         }
@@ -125,6 +126,7 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "cipher", &p.cipher);
             insert_opt(&mut m, "network", &p.network);
             insert_opt(&mut m, "sni", &p.sni);
+            insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
             insert_transport_opts(&mut m, p);
             m.insert(Value::from("tls"), Value::from(p.tls.unwrap_or(false)));
             insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
@@ -134,9 +136,27 @@ fn to_clash_value(p: &Proxy) -> Value {
             insert_opt(&mut m, "flow", &p.flow);
             insert_opt(&mut m, "network", &p.network);
             insert_opt(&mut m, "sni", &p.sni);
-            insert_opt(&mut m, "client-fingerprint", &p.fingerprint);
+            // REALITY 必须带 client-fingerprint；链接未给 fp 时补 chrome，
+            // 否则部分 mihomo 版本会拒绝该 outbound 或握手失败。
+            let fp = if p.reality {
+                Some(
+                    p.fingerprint
+                        .clone()
+                        .unwrap_or_else(|| "chrome".to_string()),
+                )
+            } else {
+                p.fingerprint.clone()
+            };
+            insert_opt(&mut m, "client-fingerprint", &fp);
+            insert_opt_bool(&mut m, "skip-cert-verify", p.skip_cert_verify);
             insert_transport_opts(&mut m, p);
             m.insert(Value::from("tls"), Value::from(p.tls.unwrap_or(false)));
+            if p.reality {
+                let mut ro = Mapping::new();
+                insert_opt(&mut ro, "public-key", &p.reality_public_key);
+                insert_opt(&mut ro, "short-id", &p.reality_short_id);
+                m.insert(Value::from("reality-opts"), Value::Mapping(ro));
+            }
         }
         ProxyType::Hysteria2 => {
             insert_opt(&mut m, "password", &p.password);
@@ -230,6 +250,17 @@ fn insert_opt_bool(m: &mut Mapping, key: &str, val: Option<bool>) {
     }
 }
 
+/// SS 的加密方法可能存于 `method`（SIP002 URI）或 `cipher`（clash-meta YAML）
+/// 任一字段。所有导出格式都必须走这里取同一个值，否则 YAML 导入的 SS 节点会被
+/// 导出成默认的 `aes-256-gcm`，客户端握手必然失败。
+fn ss_method(p: &Proxy) -> String {
+    p.method
+        .clone()
+        .or_else(|| p.cipher.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "aes-256-gcm".to_string())
+}
+
 // ===================== v2ray (v2rayN outbounds array) =====================
 
 pub fn to_v2ray_json(proxies: &[Proxy]) -> String {
@@ -249,7 +280,24 @@ pub fn to_v2ray_json(proxies: &[Proxy]) -> String {
 fn v2ray_stream(p: &Proxy) -> serde_json::Value {
     let net = p.network.clone().unwrap_or_else(|| "tcp".to_string());
     let mut s = json!({ "network": net });
-    if p.tls.unwrap_or(false) {
+    if p.reality {
+        // xray（v2rayN 内核）用 `security: reality` + `realitySettings`。
+        s["security"] = json!("reality");
+        let mut reality = json!({
+            "fingerprint": p.fingerprint.clone().unwrap_or_else(|| "chrome".to_string()),
+            "allowInsecure": p.skip_cert_verify.unwrap_or(false),
+        });
+        if let Some(sni) = &p.sni {
+            reality["serverName"] = json!(sni);
+        }
+        if let Some(pk) = &p.reality_public_key {
+            reality["publicKey"] = json!(pk);
+        }
+        if let Some(sid) = &p.reality_short_id {
+            reality["shortId"] = json!(sid);
+        }
+        s["realitySettings"] = reality;
+    } else if p.tls.unwrap_or(false) {
         s["security"] = json!("tls");
         let mut tls = json!({ "allowInsecure": p.skip_cert_verify.unwrap_or(false) });
         if let Some(sni) = &p.sni {
@@ -315,7 +363,7 @@ fn v2ray_outbound(p: &Proxy) -> Option<serde_json::Value> {
             "protocol": "shadowsocks",
             "settings": { "servers": [ {
                 "address": p.server, "port": p.port,
-                "method": p.method.clone().unwrap_or_else(|| "aes-256-gcm".into()),
+                "method": ss_method(p),
                 "password": p.password.clone().unwrap_or_default()
             } ] }
         }),
@@ -364,17 +412,53 @@ fn singbox_transport(p: &Proxy) -> Option<serde_json::Value> {
 }
 
 fn singbox_tls(p: &Proxy) -> Option<serde_json::Value> {
-    if p.tls.unwrap_or(false) {
-        let mut t = json!({ "enabled": true, "insecure": p.skip_cert_verify.unwrap_or(false) });
-        if let Some(sni) = &p.sni {
-            t["server_name"] = json!(sni);
+    singbox_tls_impl(p, p.tls.unwrap_or(false))
+}
+
+/// Hysteria2 / TUIC 固定使用 QUIC-over-TLS，即使节点没有显式 `tls` 标记也
+/// 必须输出 TLS 块，否则 sing-box 配置校验失败、整份订阅不可用。
+fn singbox_tls_forced(p: &Proxy) -> serde_json::Value {
+    singbox_tls_impl(p, true).unwrap_or_else(|| json!({ "enabled": true }))
+}
+
+fn singbox_tls_impl(p: &Proxy, enabled: bool) -> Option<serde_json::Value> {
+    if !enabled {
+        return None;
+    }
+    let mut t = json!({ "enabled": true, "insecure": p.skip_cert_verify.unwrap_or(false) });
+    if let Some(sni) = &p.sni {
+        t["server_name"] = json!(sni);
+    }
+    if p.reality {
+        let mut reality = json!({ "enabled": true });
+        if let Some(pk) = &p.reality_public_key {
+            reality["public_key"] = json!(pk);
         }
-        if let Some(f) = &p.fingerprint {
-            t["utls_fingerprint"] = json!(f);
+        if let Some(sid) = &p.reality_short_id {
+            reality["short_id"] = json!(sid);
         }
-        Some(t)
-    } else {
-        None
+        t["reality"] = reality;
+        // REALITY 依赖 uTLS，缺省用 chrome（与 mihomo 侧保持一致）。
+        t["utls"] = json!({
+            "enabled": true,
+            "fingerprint": p.fingerprint.clone().unwrap_or_else(|| "chrome".to_string()),
+        });
+    } else if let Some(f) = &p.fingerprint {
+        // sing-box 期望的是 `utls: { enabled, fingerprint }` 对象，
+        // 不是平铺的 `utls_fingerprint` 字段。
+        t["utls"] = json!({ "enabled": true, "fingerprint": f });
+    }
+    Some(t)
+}
+
+fn insert_singbox_user(o: &mut serde_json::Value, p: &Proxy) {
+    if let Some(user) = p
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("user"))
+        .and_then(|x| x.as_str())
+    {
+        o["username"] = json!(user);
     }
 }
 
@@ -427,7 +511,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["type"] = json!("shadowsocks");
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
-            o["method"] = json!(p.method.clone().unwrap_or_else(|| "aes-256-gcm".into()));
+            o["method"] = json!(ss_method(p));
             o["password"] = json!(p.password.clone().unwrap_or_default());
             Some(o)
         }
@@ -436,9 +520,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
             o["password"] = json!(p.password.clone().unwrap_or_default());
-            if let Some(tls) = singbox_tls(p) {
-                o["tls"] = tls;
-            }
+            o["tls"] = singbox_tls_forced(p);
             Some(o)
         }
         ProxyType::Tuic => {
@@ -447,9 +529,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server_port"] = json!(p.port);
             o["uuid"] = json!(p.uuid.clone().unwrap_or_default());
             o["password"] = json!(p.password.clone().unwrap_or_default());
-            if let Some(tls) = singbox_tls(p) {
-                o["tls"] = tls;
-            }
+            o["tls"] = singbox_tls_forced(p);
             Some(o)
         }
         ProxyType::Socks5 => {
@@ -457,6 +537,7 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
             o["version"] = json!("5");
+            insert_singbox_user(&mut o, p);
             if let Some(pw) = &p.password {
                 o["password"] = json!(pw);
             }
@@ -466,8 +547,14 @@ fn singbox_outbound(p: &Proxy) -> Option<serde_json::Value> {
             o["type"] = json!("http");
             o["server"] = json!(p.server);
             o["server_port"] = json!(p.port);
+            insert_singbox_user(&mut o, p);
             if let Some(pw) = &p.password {
                 o["password"] = json!(pw);
+            }
+            // 与 clash 导出一致：https:// 链接或 443 端口按 TLS 处理，
+            // 否则 sing-box 会用明文去连 443，握手必失败。
+            if p.tls.unwrap_or(false) || p.port == 443 {
+                o["tls"] = singbox_tls_forced(p);
             }
             Some(o)
         }
@@ -500,7 +587,7 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
                 p.name,
                 p.server,
                 p.port,
-                p.method.clone().unwrap_or_else(|| "aes-256-gcm".into()),
+                ss_method(p),
                 p.password.clone().unwrap_or_default()
             ),
             ProxyType::Trojan => {
@@ -536,6 +623,9 @@ pub fn to_surge(proxies: &[Proxy]) -> String {
                 }
                 if let Some(sni) = &p.sni {
                     s.push_str(&format!(", sni={sni}"));
+                }
+                if p.network.as_deref() == Some("ws") {
+                    s.push_str(", ws=true");
                 }
                 if let Some(path) = &p.path {
                     s.push_str(&format!(", ws-path={path}"));
@@ -685,6 +775,99 @@ mod tests {
             !sb.contains("\"aws.host.xyz\""),
             "sing-box must skip anytls node"
         );
+    }
+
+    #[test]
+    fn ss_cipher_fallback_used_across_all_formats() {
+        // YAML 导入的 SS 节点把加密方法存进 `cipher`，`method` 为 None。
+        // v2ray / sing-box / surge 都必须读同一个值，不能回退成默认
+        // aes-256-gcm（否则导出的节点握手必失败）。
+        let mut p = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        p.password = Some("pw".into());
+        p.cipher = Some("chacha20-ietf-poly1305".into());
+
+        let v2 = super::to_v2ray_json(std::slice::from_ref(&p));
+        assert!(v2.contains("chacha20-ietf-poly1305"), "v2ray 丢失 cipher: {v2}");
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        assert!(sb.contains("chacha20-ietf-poly1305"), "sing-box 丢失 cipher: {sb}");
+        let sg = super::to_surge(std::slice::from_ref(&p));
+        assert!(
+            sg.contains("encrypt-method=chacha20-ietf-poly1305"),
+            "surge 丢失 cipher: {sg}"
+        );
+    }
+
+    #[test]
+    fn singbox_hysteria2_and_tuic_always_emit_tls() {
+        let mut h2 = mk(ProxyType::Hysteria2, "1.1.1.1", 443);
+        h2.password = Some("pw".into());
+        let mut tuic = mk(ProxyType::Tuic, "2.2.2.2", 443);
+        tuic.uuid = Some("u".into());
+        tuic.password = Some("pw".into());
+        let out = super::to_singbox_json(&[h2, tuic]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        for o in v["outbounds"].as_array().unwrap() {
+            assert_eq!(o["tls"]["enabled"], true, "hysteria2/tuic 必须带 TLS: {o}");
+        }
+    }
+
+    #[test]
+    fn singbox_utls_is_object_and_http_exports_auth_and_tls() {
+        let mut vless = mk(ProxyType::Vless, "1.1.1.1", 443);
+        vless.uuid = Some("u".into());
+        vless.tls = Some(true);
+        vless.fingerprint = Some("chrome".into());
+
+        let mut http = mk(ProxyType::Http, "2.2.2.2", 443);
+        http.password = Some("pw".into());
+        http.extra = Some(serde_json::json!({ "user": "alice" }));
+        http.tls = Some(true);
+
+        let out = super::to_singbox_json(&[vless, http]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["outbounds"].as_array().unwrap();
+        assert_eq!(arr[0]["tls"]["utls"]["fingerprint"], "chrome");
+        assert!(
+            arr[0]["tls"].get("utls_fingerprint").is_none(),
+            "utls 必须是对象，不是平铺字段"
+        );
+        assert_eq!(arr[1]["username"], "alice");
+        assert_eq!(arr[1]["password"], "pw");
+        assert_eq!(arr[1]["tls"]["enabled"], true);
+    }
+
+    #[test]
+    fn reality_exported_to_clash_singbox_v2ray() {
+        let mut p = mk(ProxyType::Vless, "reality.example.com", 443);
+        p.uuid = Some("u".into());
+        p.network = Some("tcp".into());
+        p.tls = Some(true);
+        p.sni = Some("www.example.com".into());
+        p.fingerprint = Some("chrome".into());
+        p.reality = true;
+        p.reality_public_key = Some("PK".into());
+        p.reality_short_id = Some("ab12".into());
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("reality-opts"), "clash 缺 reality-opts: {clash}");
+        assert!(clash.contains("public-key: PK"));
+        assert!(clash.contains("short-id: ab12"));
+        assert!(clash.contains("client-fingerprint: chrome"));
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        let tls = &sv["outbounds"][0]["tls"];
+        assert_eq!(tls["reality"]["enabled"], true);
+        assert_eq!(tls["reality"]["public_key"], "PK");
+        assert_eq!(tls["reality"]["short_id"], "ab12");
+        assert_eq!(tls["utls"]["fingerprint"], "chrome");
+
+        let v2 = super::to_v2ray_json(std::slice::from_ref(&p));
+        let vv: serde_json::Value = serde_json::from_str(&v2).unwrap();
+        let stream = &vv[0]["streamSettings"];
+        assert_eq!(stream["security"], "reality");
+        assert_eq!(stream["realitySettings"]["publicKey"], "PK");
+        assert_eq!(stream["realitySettings"]["shortId"], "ab12");
     }
 
     #[test]

@@ -200,6 +200,17 @@ pub struct Proxy {
     pub service_name: Option<String>, // grpc
     pub fingerprint: Option<String>,
 
+    // VLESS REALITY (mihomo / xray): `security=reality` + `pbk` / `sid`.
+    // Kept as explicit fields (not buried in `extra`) because every exporter
+    // has to emit them in a protocol-specific shape; without them a REALITY
+    // node degrades to plain TLS and can never complete a handshake.
+    #[serde(default)]
+    pub reality: bool,
+    #[serde(default)]
+    pub reality_public_key: Option<String>,
+    #[serde(default)]
+    pub reality_short_id: Option<String>,
+
     // speed-test results (populated by the speedtest engine)
     pub latency_ms: Option<u64>,
     /// 裸 TCP 建连到节点服务器的耗时（未走代理隧道，仅反映到节点的网络距离）。
@@ -347,6 +358,9 @@ impl Proxy {
             host: None,
             service_name: None,
             fingerprint: None,
+            reality: false,
+            reality_public_key: None,
+            reality_short_id: None,
             latency_ms: None,
             tcp_latency_ms: None,
             http_latency_ms: None,
@@ -399,7 +413,6 @@ impl Proxy {
         const NAME_TABLE: &[(&str, &str)] = &[
             ("hongkong", "HK"),
             ("hong kong", "HK"),
-            ("hong", "HK"),
             ("香港", "HK"),
             ("taiwan", "TW"),
             ("台湾", "TW"),
@@ -828,7 +841,7 @@ impl Proxy {
         };
         let n = |o: &Option<u32>| o.unwrap_or_default().to_string();
 
-        let cred = match self.type_ {
+        let mut cred = match self.type_ {
             ProxyType::Vmess | ProxyType::Vless | ProxyType::Tuic => format!(
                 "{}|{}|{}|{}|{}|{}|{}|{}",
                 s(&self.uuid),
@@ -865,6 +878,46 @@ impl Proxy {
                 s(&self.path)
             ),
         };
+
+        // WS `Host` / gRPC `service_name` / REALITY keys distinguish genuinely
+        // different nodes that share server+port+uuid (common for providers
+        // multiplexing one host). Append them only when present so nodes
+        // without these fields keep their existing fingerprint (and their
+        // measured health survives the upgrade).
+        if matches!(
+            self.type_,
+            ProxyType::Vmess | ProxyType::Vless | ProxyType::Tuic
+        ) {
+            let mut extra: Vec<String> = Vec::new();
+            if let Some(h) = self.host.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("h={}", h.replace('|', "#")));
+            }
+            if let Some(svc) = self.service_name.as_deref().filter(|s| !s.is_empty()) {
+                extra.push(format!("svc={}", svc.replace('|', "#")));
+            }
+            if self.reality {
+                extra.push("reality".to_string());
+                if let Some(pk) = self
+                    .reality_public_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    extra.push(format!("pk={}", pk.replace('|', "#")));
+                }
+                if let Some(sid) = self
+                    .reality_short_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    extra.push(format!("sid={}", sid.replace('|', "#")));
+                }
+            }
+            if !extra.is_empty() {
+                cred.push('|');
+                cred.push_str(&extra.join("|"));
+            }
+        }
+
         format!(
             "{}|{}|{}|{}|{}",
             self.type_.as_str(),
@@ -889,7 +942,10 @@ impl Proxy {
             ProxyType::Ss => has(&self.password) && (has(&self.cipher) || has(&self.method)),
             ProxyType::Trojan | ProxyType::AnyTls => has(&self.password),
             ProxyType::Vmess => has(&self.uuid),
-            ProxyType::Vless => has(&self.uuid),
+            // REALITY without a public key can only be exported as plain TLS,
+            // which can never complete the handshake — treat it as incomplete
+            // (and let the engine skip it) instead of emitting a dead node.
+            ProxyType::Vless => has(&self.uuid) && (!self.reality || has(&self.reality_public_key)),
             ProxyType::Hysteria2 => has(&self.password),
             ProxyType::Tuic => has(&self.uuid) && has(&self.password),
             // Socks5 / Http / Wireguard: no strict required fields.
@@ -1049,6 +1105,80 @@ mod tests {
             a.fingerprint(),
             c.fingerprint(),
             "identical Trojan must dedupe"
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_ws_host_and_grpc_service() {
+        // 同一 server:port:uuid 的多节点机场常用不同 WS Host / gRPC service
+        // 区分线路；这些字段必须在指纹里，否则合并去重会丢节点。
+        let mut a = Proxy::new("N".into(), ProxyType::Vless, "1.2.3.4".into(), 443);
+        a.uuid = Some("u".into());
+        a.network = Some("ws".into());
+        a.host = Some("a.example.com".into());
+        let mut b = a.clone();
+        b.host = Some("b.example.com".into());
+        assert_ne!(a.fingerprint(), b.fingerprint(), "不同 WS Host 不得合并");
+
+        let mut c = a.clone();
+        c.network = Some("grpc".into());
+        c.service_name = Some("svc-a".into());
+        let mut d = c.clone();
+        d.service_name = Some("svc-b".into());
+        assert_ne!(c.fingerprint(), d.fingerprint(), "不同 gRPC service 不得合并");
+
+        // 没有这些字段的节点保持原有指纹格式（不受本次改动影响）。
+        let mut e = Proxy::new("N".into(), ProxyType::Vmess, "1.2.3.4".into(), 443);
+        e.uuid = Some("u".into());
+        let f = e.clone();
+        assert_eq!(e.fingerprint(), f.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_includes_reality_keys() {
+        let mut a = Proxy::new("R".into(), ProxyType::Vless, "1.2.3.4".into(), 443);
+        a.uuid = Some("u".into());
+        a.reality = true;
+        a.reality_public_key = Some("pk-a".into());
+        a.reality_short_id = Some("01".into());
+        let mut b = a.clone();
+        b.reality_public_key = Some("pk-b".into());
+        assert_ne!(a.fingerprint(), b.fingerprint(), "不同 REALITY 公钥不得合并");
+    }
+
+    #[test]
+    fn is_exportable_vless_reality_requires_public_key() {
+        let mut p = Proxy::new("R".into(), ProxyType::Vless, "1.2.3.4".into(), 443);
+        p.uuid = Some("u".into());
+        p.reality = true;
+        assert!(!p.is_exportable(), "REALITY 缺公钥无法握手，应判不完整");
+        p.reality_public_key = Some("pk".into());
+        assert!(p.is_exportable());
+    }
+
+    #[test]
+    fn region_no_false_positive_from_hong_substring() {
+        // 旧 NAME_TABLE 含短子串 "hong"，会把 chongqing 误判成 HK。
+        assert_eq!(
+            Proxy::new(
+                "chongqing-01".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
+            "OTHER"
+        );
+        // 正常的 hong kong 写法仍识别为 HK。
+        assert_eq!(
+            Proxy::new(
+                "Hong Kong 01".into(),
+                ProxyType::Vmess,
+                "1.2.3.4".into(),
+                443
+            )
+            .region(),
+            "HK"
         );
     }
 

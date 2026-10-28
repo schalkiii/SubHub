@@ -313,6 +313,22 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
         .and_then(|g| g.get("grpc-service-name"))
         .and_then(|x| x.as_str())
         .map(str::to_string);
+    p.fingerprint = as_str(v, "client-fingerprint").map(str::to_string);
+    if let Some(ro) = v.get("reality-opts") {
+        p.reality = true;
+        p.reality_public_key = ro
+            .get("public-key")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        p.reality_short_id = ro
+            .get("short-id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        // REALITY is always carried over TLS; some providers omit `tls: true`.
+        if p.tls.is_none() {
+            p.tls = Some(true);
+        }
+    }
     Some(p)
 }
 
@@ -552,9 +568,24 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
             })
             .unwrap_or(false),
     );
-    p.sni = v.get("sni").and_then(|x| x.as_str()).map(str::to_string);
+    // vmess links often carry the TLS SNI as `peer` (or reuse `host` for the
+    // WS Host header); falling back keeps TLS/WS nodes verifiable after export.
+    p.sni = v
+        .get("sni")
+        .or_else(|| v.get("peer"))
+        .or_else(|| v.get("host"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     p.path = v.get("path").and_then(|x| x.as_str()).map(str::to_string);
     p.host = v.get("host").and_then(|x| x.as_str()).map(str::to_string);
+    p.skip_cert_verify = v
+        .get("allowInsecure")
+        .or_else(|| v.get("insecure"))
+        .and_then(|x| match x {
+            serde_json::Value::Bool(b) => Some(*b),
+            serde_json::Value::String(s) => Some(s == "1" || s == "true"),
+            _ => None,
+        });
     Some(p)
 }
 
@@ -573,14 +604,20 @@ fn parse_vless(body: &str, name: Option<String>) -> Option<Proxy> {
         .get("type")
         .or_else(|| a.query.get("network"))
         .cloned();
-    p.tls = Some(
-        a.query
-            .get("security")
-            .map(|s| s != "none")
-            .unwrap_or(false),
-    );
+    let security = a.query.get("security").map(String::as_str).unwrap_or("");
+    p.tls = Some(security != "none");
+    if security.eq_ignore_ascii_case("reality") {
+        p.reality = true;
+        p.reality_public_key = a.query.get("pbk").cloned().filter(|s| !s.is_empty());
+        p.reality_short_id = a.query.get("sid").cloned();
+    }
     p.sni = a.query.get("sni").cloned();
     p.fingerprint = a.query.get("fp").cloned();
+    p.skip_cert_verify = a
+        .query
+        .get("allowInsecure")
+        .or_else(|| a.query.get("insecure"))
+        .map(|v| v == "1" || v == "true");
     p.path = a.query.get("path").cloned();
     p.host = a.query.get("host").cloned();
     p.service_name = a.query.get("serviceName").cloned();
@@ -597,14 +634,20 @@ fn parse_trojan(body: &str, name: Option<String>) -> Option<Proxy> {
     );
     p.password = Some(a.userinfo);
     p.tls = Some(true);
-    p.sni = a.query.get("sni").cloned();
+    p.sni = a
+        .query
+        .get("sni")
+        .or_else(|| a.query.get("peer"))
+        .cloned();
     p.flow = a.query.get("flow").cloned();
     p.network = a.query.get("type").cloned();
     p.path = a.query.get("path").cloned();
     p.host = a.query.get("host").cloned();
+    p.fingerprint = a.query.get("fp").cloned();
     p.skip_cert_verify = a
         .query
         .get("allowInsecure")
+        .or_else(|| a.query.get("skip-cert-verify"))
         .map(|v| v == "1" || v == "true");
     Some(p)
 }
@@ -688,8 +731,15 @@ fn parse_hy2(body: &str, name: Option<String>) -> Option<Proxy> {
     } else {
         p.password = Some(a.userinfo);
     }
+    // Hysteria2 is always QUIC-over-TLS; the URI has no `security` param.
+    p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
-    p.skip_cert_verify = a.query.get("insecure").map(|v| v == "1" || v == "true");
+    p.fingerprint = a.query.get("fp").cloned();
+    p.skip_cert_verify = a
+        .query
+        .get("insecure")
+        .or_else(|| a.query.get("allowInsecure"))
+        .map(|v| v == "1" || v == "true");
     Some(p)
 }
 
@@ -707,7 +757,15 @@ fn parse_tuic(body: &str, name: Option<String>) -> Option<Proxy> {
     } else {
         p.password = Some(a.userinfo);
     }
+    // TUIC is QUIC-over-TLS as well.
+    p.tls = Some(true);
     p.sni = a.query.get("sni").cloned();
+    p.fingerprint = a.query.get("fp").cloned();
+    p.skip_cert_verify = a
+        .query
+        .get("insecure")
+        .or_else(|| a.query.get("allowInsecure"))
+        .map(|v| v == "1" || v == "true");
     Some(p)
 }
 
@@ -994,6 +1052,58 @@ mod tests {
             "base64-wrapped anytls URI list must yield its nodes"
         );
         assert!(out.iter().all(|p| p.type_ == ProxyType::AnyTls));
+    }
+
+    #[test]
+    fn vless_reality_uri_is_parsed() {
+        let line = "vless://11111111-2222-3333-4444-555555555555@reality.example.com:443?security=reality&pbk=PUBKEY123&sid=ab12&fp=chrome&sni=www.example.com&type=tcp&flow=xtls-rprx-vision#Reality-JP";
+        let out = parse_subscription(line);
+        assert_eq!(out.len(), 1);
+        let p = &out[0];
+        assert_eq!(p.type_, ProxyType::Vless);
+        assert!(p.reality, "security=reality 必须标记 reality");
+        assert_eq!(p.reality_public_key.as_deref(), Some("PUBKEY123"));
+        assert_eq!(p.reality_short_id.as_deref(), Some("ab12"));
+        assert_eq!(p.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(p.tls, Some(true));
+        assert!(p.is_exportable(), "带公钥的 REALITY 节点应可导出");
+    }
+
+    #[test]
+    fn clash_reality_and_fingerprint_are_parsed() {
+        let yaml = "proxies:\n  - name: R\n    type: vless\n    server: 1.2.3.4\n    port: 443\n    uuid: u\n    network: tcp\n    tls: true\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: PK\n      short-id: ab12\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out.len(), 1);
+        let p = &out[0];
+        assert!(p.reality);
+        assert_eq!(p.reality_public_key.as_deref(), Some("PK"));
+        assert_eq!(p.reality_short_id.as_deref(), Some("ab12"));
+        assert_eq!(p.fingerprint.as_deref(), Some("chrome"));
+    }
+
+    #[test]
+    fn vmess_peer_is_used_as_sni() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"add":"1.2.3.4","port":"443","id":"uuid","aid":"0","net":"ws","tls":"tls","peer":"cdn.example.com","host":"cdn.example.com","path":"/ws"}"#,
+        );
+        let out = parse_subscription(&format!("vmess://{b64}"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sni.as_deref(), Some("cdn.example.com"));
+        assert_eq!(out[0].tls, Some(true));
+    }
+
+    #[test]
+    fn hysteria2_and_tuic_mark_tls_true() {
+        let hy2 = parse_subscription("hysteria2://pass@hy.example.com:443?sni=hy.example.com#HY");
+        assert_eq!(hy2.len(), 1);
+        assert_eq!(hy2[0].tls, Some(true), "hysteria2 始终 TLS");
+
+        let tuic = parse_subscription(
+            "tuic://11111111-2222-3333-4444-555555555555:pass@tu.example.com:443?sni=tu.example.com#TU",
+        );
+        assert_eq!(tuic.len(), 1);
+        assert_eq!(tuic[0].tls, Some(true), "tuic 始终 TLS");
+        assert_eq!(tuic[0].sni.as_deref(), Some("tu.example.com"));
     }
 
     #[test]
