@@ -155,6 +155,8 @@ cargo tauri build
 Windows 上 `cargo tauri build` 会生成 `target/release/bundle/nsis/*.exe` 安装包；
 macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与 WebUI。
 
+对外发布走 GitHub Releases：<https://github.com/schalkiii/SubHub/releases>。`v0.2.0` 起附带 Windows x64 单文件产物 `subhub-app.exe` 与 SHA-256 校验值；版本锚点与阶段对应关系见 `CHANGELOG.md` 的「版本锚点」表。
+
 ### WebUI 静态资源与分发
 
 - **开发 / 源码运行**：静态资源优先从磁盘读取（`SUBHUB_WEBUI_DIR` → 源码 `webui/` → exe 同级 `webui/`），改前端后重启进程即可生效，无需重新构建。
