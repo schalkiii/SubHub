@@ -34,6 +34,7 @@
 | **P24** | **第三轮增强：SS obfs/v2ray-plugin · Hysteria2 obfs · 用量 info 块 · 错误 URL 脱敏 · Gist 走拉取代理 + 公开确认 · 刷新 404 · 调度最小 60s · Surge 名清洗** | ✅ |
 | **P25** | **第四轮增强：ALPN / TUIC 拥塞与中继参数 / Hysteria2 上下行 · 本地备份 uid 幂等 · 协议参考索引 · CI/fmt/LICENSE/历史归档** | ✅ |
 | **P26** | **第五轮增强：Surge 协议/传输边界（vless 整节点跳过、grpc/h2 跳过、去非官方键）· Surge 补 Hysteria2/TUIC/AnyTLS/SOCKS/HTTP · Trojan 传输全格式 · 带宽单位换算 · TUIC UDP 承载互斥 · 导入同批重复 URL 幂等** | ✅ |
+| **P27** | **第六轮增强：逻辑正确性（SS 指纹归一 cipher/method、降序对 name/type 生效、地区改名去重、死节点不进延迟、NaN 带宽不误删、schema 变化容错恢复、停用的订阅不进后台任务）+ 大节点库性能（端点级测速缓存 6.3×、列表接口先排序后序列化 3.0×、按行摘要落库、去掉整库深拷贝、SSE 断开即取消）** | ✅ |
 
 ## 架构
 
@@ -71,10 +72,34 @@
 
 **如何持久化？**
 - 核心用 `rusqlite` 的 **`bundled`** 特性在编译期把 SQLite 引擎一起打进二进制，**零外部依赖**（不需要系统装 SQLite）。
-- 每个「订阅来源」以**整段 JSON 快照**的形式存进 `subscriptions` 表（`id` 主键 + `data` 文本 + `updated_at` 时间戳），节点、健康度、测速结果、出口地区、解锁矩阵全部跟着订阅一起落盘。
+- 每个「订阅来源」以**整段 JSON 快照**的形式存进 `subscriptions` 表（`id` 主键 + `data` 文本 + `updated_at` 时间戳 + `len`/`hash` 内容摘要），节点、健康度、测速结果、出口地区、解锁矩阵全部跟着订阅一起落盘。
 - 服务启动时调用 `Db::load_all()` 把库里所有订阅读回内存；之后**任何写操作**（添加 / 导入 / 删除 / 刷新 / 测速 / 出口探测 / 解锁探测 / 坏节点清理）执行完都会调用一次 `persist_all()` 把当前内存快照写回库。
-- 设计上 `Db` 只持有**文件路径**，不持有 `Connection`（因为 `Connection` 不是 `Send`，而 axum 的 `AppState` 需要 `Send+Sync`）。每次读写都开一个短连接，避免跨 `.await` 持有连接导致生命周期 / 死锁问题。
+- 快照是**按行**写的：`len`+`hash` 摘要没变的订阅整行不动，只重写变化的行、删除已消失的 id。测速逐批落库时这很关键——否则每个批次都要把整库（几千节点、数 MB JSON）删光重插一遍。
+- 设计上 `Db` 只持有**文件路径**，不持有 `Connection`（因为 `Connection` 不是 `Send`，而 axum 的 `AppState` 需要 `Send+Sync`）。每次读写都开一个短连接，避免跨 `.await` 持有连接导致生命周期 / 死锁问题。每个连接统一带 `busy_timeout=5000`（否则后台快照提交时并发写 `meta` 会立刻 SQLITE_BUSY、设置静默丢失）与 `synchronous=NORMAL`（配合 WAL，提交不再逐次 fsync）。
 - 如果 `SUBHUB_DB` 指向的文件打不开，会**自动退回纯内存模式**（重启即清空），应用照常运行，不会崩。
+- 读回的订阅若因版本升级导致**顶层字段变化**而解析失败，只要节点还能读出来就会兜底重建一条订阅（沿用原 `id`），不会整条静默丢失。
+
+## 大节点库的性能特征（P27 实测）
+
+真实机场常有 3000–5000 个节点，且**大量节点挂在同一个 `host:port` 上**（只有密码/路径不同）。本轮据此做了针对性优化，同机同 fixture 的新旧对照（debug 构建、1000 节点、取 15 次最小值）：
+
+| 路径 | 优化前 | 优化后 |
+|---|---|---|
+| 导入 1000 节点（含自动测速，100 个端点） | 64.3 s | **10.2 s** |
+| `GET /api/proxies?sort=score&desc=1` | 36.5 ms | **12.1 ms** |
+| `GET /api/proxies?q=HK` | 33.1 ms | 12.7 ms |
+| `GET /api/proxies?page_size=500` | 101.2 ms | 44.7 ms |
+| `GET /api/dashboard` | 20.9 ms | 19.7 ms |
+| `GET /sub` | 12.2 ms | 9.8 ms |
+| 3 次 `POST /api/settings`（落库） | 57.9 ms | 47.1 ms |
+
+关键手段（细节见 `CHANGELOG.md` 的 P27）：
+
+- **端点级测速缓存**：一轮测速里同一 `(host, port)` 只拨号一次。不可达端点每个都要烧满 `timeout_ms`，这是大库导入慢的主因。
+- **DNS 侧**：IP 字面量完全不进解析器；同一主机一轮只解析一次（成功与失败都缓存）；worker 数不超过节点数。
+- **列表接口先排序后序列化**：不再把每个节点渲染成 JSON 再按字符串键排序，`region`/`score` 每节点只算一次，并且只序列化返回的那一页——同时大幅缩短了 store 锁的持有时间。
+- **持久化零多余拷贝**：`persist_all` 在锁内直接序列化产出 `(id, json)`，不再 `clone()` 整个 store；按行摘要跳写。
+- **前端断开即取消测速**：SSE 进度通道关闭后，`tcp_ping_all` 不再继续探测剩下的几千个节点。
 
 **重置 / 迁移数据**
 - 想清空一切：直接**删除 `data/subhub.db`** 即可（重启后从空状态开始）。
@@ -222,7 +247,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 - `filters[].match_`：`contains` | `regex` | `exact`
 - `sort.key`：`name` | `latency` | `tcplat` | `httplat` | `type` | `speed` | `score`；`sort.desc`：是否降序（`speed` 按下行带宽，仅对历史实测数据有效；`score` 按综合评分。所有键均可用性主导——`available==false` 沉底）
 - `rename`：`pattern` 为 Rust 正则，`replacement` 支持 `$1` `$2` 捕获组
-- `min_bandwidth_bps`（可选）：带宽下限（**bps**）。导出时排除 `download_speed_bps` 低于该值的节点；**未测速（无带宽数据）的节点保留**，避免误删还没测的节点。注意：当前版本引擎测速不再采集新带宽，该字段只对历史实测数据生效，WebUI 已不再暴露此输入。
+- `min_bandwidth_bps`（可选）：带宽下限，单位与 `download_speed_bps` 一致 = **字节/秒**（字段名的 `_bps` 是历史遗留，1 MB/s = 1048576）。导出时排除低于该值的节点；**未测速（无带宽数据）与非有限值（NaN/Inf）的节点保留**，避免把坏数据当成「不达标」静默删掉。注意：当前版本引擎测速不再采集新带宽，该字段只对历史实测数据生效，WebUI 已不再暴露此输入。
 - `max_latency_ms`（可选）：延迟上限（**ms**）。导出时排除 `latency_ms` 高于该值的节点；**未测速（无延迟数据）的节点保留**。
 
 ## 本地订阅地址（直接拉取）
@@ -237,7 +262,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 - 默认端口 `3005`，可用 `SUBHUB_PORT` 覆盖（网址里的端口要跟着改）。
 - 只合并部分订阅：加 `&sub=id1,id2`（订阅 id 见 `GET /api/subscriptions`）。
-- 支持的算子参数：`sort`（`name`/`latency`/`tcplat`/`httplat`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（从可导出且未判死的节点中保留评分最高的前 N 个；`top_n=0` = 全部并覆盖全局设置，缺省才回落全局）、`min_bw`（带宽下限，**bps**，仅对历史实测带宽生效）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
+- 支持的算子参数：`sort`（`name`/`latency`/`tcplat`/`httplat`/`type`/`speed`/`score`）、`desc`（`1` 降序）、`rename_pat` / `rename_rep`、`q`（按名称包含筛选）、`region`（按地区包含）、`type`（按类型精确）、`top_n`（从可导出且未判死的节点中保留评分最高的前 N 个；`top_n=0` = 全部并覆盖全局设置，缺省才回落全局）、`min_bw`（带宽下限，**字节/秒**，与 `download_speed_bps` 同单位，仅对历史实测带宽生效）、`max_lat`（延迟上限，**ms**，排除更慢的节点；未测速节点保留）。
 - 注意：分享网址只编码**包含类**筛选（名称/地区用 `contains`、类型用 `exact`）；**排除 / 正则类**筛选无法编码进网址，遇到时会提示，需要那种效果请改用「合并并导出」手动导出。
 
 ### 导出格式

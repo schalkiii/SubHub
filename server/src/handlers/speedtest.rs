@@ -271,7 +271,7 @@ pub(crate) async fn run_speedtest_sse(
         let proxies_tcp = proxies.clone();
         let tx_tcp = tx.clone();
         let tcp_results = tokio::task::spawn_blocking(move || {
-            let cb = move |p: subhub_core::speedtest::TestProgress| {
+            let cb = move |p: subhub_core::speedtest::TestProgress| -> bool {
                 // 回环节点（127.*/localhost/::1 等）的「带宽」只是往本地 socket
                 // 灌数据的吞吐，是内存拷贝而非真实代理速度，实时进度里直接置空，
                 // 避免把 6000+ MB/s 的假值展示给用户。
@@ -280,19 +280,24 @@ pub(crate) async fn run_speedtest_sse(
                 } else {
                     p.bandwidth_bps
                 };
-                let _ = tx_tcp.send(SpeedEvent::Progress(ProgressView {
-                    done: p.done,
-                    total: unit_total,
-                    name: p.name,
-                    fingerprint: Some(p.fingerprint.clone()),
-                    available: p.available,
-                    latency_ms: p.latency_ms,
-                    tcp_latency_ms: p.latency_ms,
-                    http_latency_ms: None,
-                    bandwidth_bps,
-                    server: p.server,
-                    phase: "tcp".to_string(),
-                }));
+                // send 失败 == 前端已断开（rx 被 drop）。把这个结果回传给
+                // `tcp_ping_all` 作为取消信号：几千节点的测速不再在没人看的
+                // 页面上继续跑完。
+                tx_tcp
+                    .send(SpeedEvent::Progress(ProgressView {
+                        done: p.done,
+                        total: unit_total,
+                        name: p.name,
+                        fingerprint: Some(p.fingerprint.clone()),
+                        available: p.available,
+                        latency_ms: p.latency_ms,
+                        tcp_latency_ms: p.latency_ms,
+                        http_latency_ms: None,
+                        bandwidth_bps,
+                        server: p.server,
+                        phase: "tcp".to_string(),
+                    }))
+                    .is_ok()
             };
             subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, Some(&cb))
         })

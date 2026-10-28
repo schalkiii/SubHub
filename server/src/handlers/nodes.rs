@@ -2,8 +2,8 @@
 //! 以及节点出口地区（geo）探测。
 use crate::*;
 use crate::{
-    apply_mode, engine_bin_of, flatten_dedup, now_ms, parse_desc, persist_all, sub_to_summary,
-    LockExt,
+    apply_mode, engine_bin_of, flatten_dedup, flatten_dedup_refs, now_ms, parse_desc, persist_all,
+    sub_to_summary, LockExt,
 };
 use axum::{
     extract::{Query, State},
@@ -105,15 +105,30 @@ pub(crate) async fn list_proxies(
 
     Query(q): Query<ListQuery>,
 ) -> Json<ProxiesResp> {
+    // 关键字的小写形态只算一次：旧写法在每个节点上重新 `to_lowercase` 一遍
+    // 用户输入的关键词（几千节点即几千次多余分配）。
+    let needle = q.q.as_ref().map(|s| {
+        let truncated: String = s.chars().take(256).collect();
+        truncated.to_lowercase()
+    });
+
+    // 行数据用「引用 + 每节点算一次的派生字段」表示。旧实现把**每一个**节点先
+    // 序列化成 `serde_json::Value`（约 50 个键）再排序，最后只取一页 50 条，
+    // 其余全部丢弃；而且排序键要靠 `map.get("score")` 这类字符串查表反复解引用。
+    // 更要命的是整段过程持有 store 锁，前端轮询期间测速回写会被堵住。
+    struct Row<'a> {
+        sub_id: &'a str,
+        sub_name: &'a str,
+        p: &'a Proxy,
+        /// `effective_region()`：实测出口优先，回退名字推断。筛选、关键词搜索与
+        /// 输出列共用同一份，每个节点只算一次。
+        region: String,
+        score: f64,
+    }
+
     let guard = state.store.lock_ok();
 
-    // sub-store model: every node belongs to a subscription, so we surface the
-
-    // owning subscription's id + name alongside the node (used by the WebUI's
-
-    // "group by subscription" view).
-
-    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
 
     for sub in guard.iter() {
         for p in &sub.proxies {
@@ -123,65 +138,46 @@ pub(crate) async fn list_proxies(
                 }
             }
 
+            let region = p.effective_region();
+
             if let Some(r) = &q.region {
                 // 与节点列表「地区」列一致：优先实测出口地区，回退名字猜测
-                if !p.effective_region().eq_ignore_ascii_case(r) {
+                if !region.eq_ignore_ascii_case(r) {
                     continue;
                 }
             }
 
-            if let Some(s) = &q.q {
-                let s: String = s.chars().take(256).collect::<String>().to_lowercase();
+            if let Some(s) = &needle {
                 // Quick keyword search across the most useful node fields:
                 // name, server/host, region, and type. Case-insensitive.
-                let matched = p.name.to_lowercase().contains(&s)
-                    || p.server.to_lowercase().contains(&s)
-                    || p.effective_region().to_lowercase().contains(&s)
-                    || p.type_.as_str().to_lowercase().contains(&s);
+                let matched = p.name.to_lowercase().contains(s)
+                    || p.server.to_lowercase().contains(s)
+                    || region.to_lowercase().contains(s)
+                    || p.type_.as_str().contains(s);
 
                 if !matched {
                     continue;
                 }
             }
 
-            let mut v = serde_json::to_value(p).unwrap_or(serde_json::Value::Null);
+            rows.push(Row {
+                sub_id: &sub.id,
+                sub_name: &sub.name,
+                p,
+                score: score_proxy(p),
+                region,
+            });
+        }
+    }
 
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("sub_id".into(), serde_json::Value::String(sub.id.clone()));
-
-                obj.insert(
-                    "sub_name".into(),
-                    serde_json::Value::String(sub.name.clone()),
-                );
-
-                // Stable per-node identity (`Proxy::fingerprint`) so the WebUI
-                // can target a single node for deletion without relying on a
-                // name that the user might rename.
-                obj.insert(
-                    "fingerprint".into(),
-                    serde_json::Value::String(p.fingerprint()),
-                );
-
-                // `region` is a computed method on `Proxy`, not a serialized
-                // field. Surface the *effective* region (measured outbound
-                // country first, then name inference) so API consumers see the
-                // same value as the list column/filter and dashboard.
-
-                obj.insert(
-                    "region".into(),
-                    serde_json::Value::String(p.effective_region()),
-                );
-
-                // Composite score (0-100): lower latency + higher bandwidth +
-                // availability + unlock coverage. Attached so the WebUI can sort
-                // and filter, and the server can export the top-N.
-                obj.insert(
-                    "score".into(),
-                    serde_json::to_value(score_proxy(p)).unwrap_or(serde_json::Value::Null),
-                );
-            }
-
-            all.push(v);
+    /// 未测（None）在可用节点里排最后，与其它排序键保持一致。
+    fn untested_last(a: Option<u64>, b: Option<u64>) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (a, b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(x), Some(y)) => x.cmp(&y),
         }
     }
 
@@ -189,12 +185,13 @@ pub(crate) async fn list_proxies(
     // the chosen order across ALL nodes — not just the current page's 50.
     // Availability dominates: a dead node (available === false) always sinks to
     // the bottom regardless of the chosen column (mirrors the old client-side
-    // rule, now done server-side on the full dataset).
+    // rule, now done server-side on the full dataset). The `desc` reversal
+    // applies to the column only, never to this availability sink.
     let sort_key = q.sort.clone().unwrap_or_else(|| "name".to_string());
     let sort_desc = parse_desc(&q.desc);
-    all.sort_by(|a, b| {
-        let ad = a.get("available").and_then(|x| x.as_bool()) == Some(false);
-        let bd = b.get("available").and_then(|x| x.as_bool()) == Some(false);
+    rows.sort_by(|a, b| {
+        let ad = a.p.available == Some(false);
+        let bd = b.p.available == Some(false);
         if ad != bd {
             return if ad {
                 std::cmp::Ordering::Greater
@@ -203,58 +200,20 @@ pub(crate) async fn list_proxies(
             };
         }
         let ord = match sort_key.as_str() {
-            "score" => {
-                let av = a.get("score").and_then(|x| x.as_f64()).unwrap_or(f64::MIN);
-                let bv = b.get("score").and_then(|x| x.as_f64()).unwrap_or(f64::MIN);
-                av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            "score" => a
+                .score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal),
             "speed" => {
-                let av = a
-                    .get("download_speed_bps")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(f64::MIN);
-                let bv = b
-                    .get("download_speed_bps")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(f64::MIN);
-                av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                a.p.download_speed_bps
+                    .unwrap_or(f64::MIN)
+                    .partial_cmp(&b.p.download_speed_bps.unwrap_or(f64::MIN))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
-            "latency" => {
-                // untested (null latency) sorts last among available nodes
-                let ao = a.get("latency_ms").and_then(|x| x.as_f64());
-                let bo = b.get("latency_ms").and_then(|x| x.as_f64());
-                match (ao, bo) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                }
-            }
-            "tcplat" => {
-                let ao = a.get("tcp_latency_ms").and_then(|x| x.as_f64());
-                let bo = b.get("tcp_latency_ms").and_then(|x| x.as_f64());
-                match (ao, bo) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                }
-            }
-            "httplat" => {
-                let ao = a.get("http_latency_ms").and_then(|x| x.as_f64());
-                let bo = b.get("http_latency_ms").and_then(|x| x.as_f64());
-                match (ao, bo) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                }
-            }
-            _ => {
-                let an = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                let bn = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                an.cmp(bn)
-            }
+            "latency" => untested_last(a.p.latency_ms, b.p.latency_ms),
+            "tcplat" => untested_last(a.p.tcp_latency_ms, b.p.tcp_latency_ms),
+            "httplat" => untested_last(a.p.http_latency_ms, b.p.http_latency_ms),
+            _ => a.p.name.cmp(&b.p.name),
         };
         if sort_desc {
             ord.reverse()
@@ -263,7 +222,7 @@ pub(crate) async fn list_proxies(
         }
     });
 
-    let total = all.len();
+    let total = rows.len();
 
     let page = q.page.unwrap_or(1).max(1);
 
@@ -273,11 +232,46 @@ pub(crate) async fn list_proxies(
 
     let end = (start + page_size).min(total);
 
-    let items: Vec<serde_json::Value> = if start < total {
-        all[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
+    // 只序列化真正返回的那一页。
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if start < total {
+        for r in &rows[start..end] {
+            let mut v = serde_json::to_value(r.p).unwrap_or(serde_json::Value::Null);
+
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("sub_id".into(), serde_json::Value::String(r.sub_id.into()));
+
+                obj.insert(
+                    "sub_name".into(),
+                    serde_json::Value::String(r.sub_name.into()),
+                );
+
+                // Stable per-node identity (`Proxy::fingerprint`) so the WebUI
+                // can target a single node for deletion without relying on a
+                // name that the user might rename.
+                obj.insert(
+                    "fingerprint".into(),
+                    serde_json::Value::String(r.p.fingerprint()),
+                );
+
+                // `region` is a computed method on `Proxy`, not a serialized
+                // field. Surface the *effective* region (measured outbound
+                // country first, then name inference) so API consumers see the
+                // same value as the list column/filter and dashboard.
+                obj.insert("region".into(), serde_json::Value::String(r.region.clone()));
+
+                // Composite score (0-100): lower latency + higher bandwidth +
+                // availability + unlock coverage. Attached so the WebUI can sort
+                // and filter, and the server can export the top-N.
+                obj.insert(
+                    "score".into(),
+                    serde_json::to_value(r.score).unwrap_or(serde_json::Value::Null),
+                );
+            }
+
+            items.push(v);
+        }
+    }
 
     Json(ProxiesResp {
         total,
@@ -293,7 +287,8 @@ pub(crate) async fn list_proxies(
 pub(crate) async fn dashboard(State(state): State<AppState>) -> Json<DashboardResp> {
     let guard = state.store.lock_ok();
 
-    let all = flatten_dedup(&guard, None);
+    // 只读汇总走借用版，避免每次轮询深拷贝整库节点。
+    let all = flatten_dedup_refs(&guard, None);
 
     let mut by_type: HashMap<String, usize> = HashMap::new();
 

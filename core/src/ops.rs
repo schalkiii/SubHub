@@ -14,8 +14,10 @@ pub struct Transform {
     pub sort: Option<SortBy>,
     pub rename: Option<RenameRule>,
     /// 数值质量阈值（可选）：导出 / 订阅时排除「带宽低于下限」或「延迟高于上限」
-    /// 的节点。单位：带宽 bps、延迟 ms。未测速（无对应数据）的节点按「保留」处理，
-    /// 避免把还没测过的节点误删。
+    /// 的节点。单位：带宽**字节/秒**（与被比较的 `Proxy::download_speed_bps` 一致，
+    /// 该字段名的 `_bps` 是历史遗留）、延迟 ms。未测速（无对应数据）以及值为
+    /// 非有限数（NaN/Inf）的节点按「保留」处理，避免把还没测过、或引擎给了坏
+    /// 数据的节点静默删掉。
     #[serde(default)]
     pub min_bandwidth_bps: Option<u64>,
     #[serde(default)]
@@ -59,22 +61,18 @@ pub struct RenameRule {
     pub replacement: String,
 }
 
-fn field_val(p: &Proxy, field: &str) -> String {
+fn field_val<'a>(p: &'a Proxy, field: &str) -> std::borrow::Cow<'a, str> {
     match field {
-        "name" => p.name.clone(),
-        "type" => p.type_.as_str().to_string(),
+        "name" => std::borrow::Cow::Borrowed(&p.name),
+        "type" => std::borrow::Cow::Borrowed(p.type_.as_str()),
         // 与节点列表「地区」列一致：优先实测出口地区，回退名字猜测
-        "region" => p.effective_region(),
-        "server" => p.server.clone(),
-        _ => p.name.clone(),
+        "region" => std::borrow::Cow::Owned(p.effective_region()),
+        "server" => std::borrow::Cow::Borrowed(&p.server),
+        // 未知字段名退回按名字匹配（WebUI 的筛选下拉只有这四个）。
+        _ => std::borrow::Cow::Borrowed(&p.name),
     }
 }
 
-/// Run the full pipeline on a copy of the input list.
-///
-/// Returns `Err` (with a human-readable message) when a regex used in a filter
-/// or the rename rule fails to compile, so the caller can surface the mistake
-/// to the user instead of silently producing an empty (include-mode) or
 /// 导出前地区名修正（**仅作用于传入的节点副本，绝不改动落库数据**）。
 ///
 /// 对「名字未识别地区（`region()` 返回 `"OTHER"`）但实测出口地区
@@ -82,43 +80,42 @@ fn field_val(p: &Proxy, field: &str) -> String {
 /// 等按名字匹配地区的客户端不再把它们归为「其他」。例如名字叫「其他」、出口实测为
 /// HK 的节点会被重命名为「HK 其他」。
 ///
-/// 同一导出集合内若重名（含与原名撞名），追加 ` #2` / ` #3` 后缀去重，与
-/// `export::ensure_unique_names` 行为对齐（双重保险，最终输出必唯一）。
-/// `export_str` 内部的 `ensure_unique_names` 仍会兜底，这里提前去重只是让重命名
-/// 后的名字更干净、可读。
+/// 重名处理直接复用 `export::ensure_unique_names`（首个保留原名，后续撞名逐个
+/// 探测 ` #2` / ` #3` …直到真正未占用）。此处不能自己按计数追加后缀：输入
+/// `["A #2", "A", "A"]` 时第三项算出的 `A #2` 会与首项重名，客户端仍以
+/// `duplicate name` 拒绝整份配置。
+/// `export_str` 内部的同一次调用仍会兜底，这里提前去重只是让重命名后的名字更干净可读。
 pub fn region_fixup_for_export(proxies: &mut [Proxy]) {
-    use std::collections::HashMap;
-    let mut seen: HashMap<String, usize> = HashMap::new();
     for p in proxies.iter_mut() {
         // 需要重命名的节点：region 判定为 OTHER 且已有实测出口地区
-        let candidate = if p.region() == "OTHER" {
-            p.outbound_country
+        if p.region() == "OTHER" {
+            if let Some(code) = p
+                .outbound_country
                 .as_ref()
                 .filter(|c| !c.is_empty())
-                .map(|code| format!("{} {}", code, p.name))
-        } else {
-            None
-        };
-        let base = candidate.unwrap_or_else(|| p.name.clone());
-        let count = seen.entry(base.clone()).or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            let renamed = format!("{} #{}", base, *count);
-            // 后缀名本身也登记，避免后续再次撞名
-            seen.entry(renamed.clone()).or_insert(1);
-            p.name = renamed;
-        } else {
-            p.name = base;
+                .cloned()
+            {
+                p.name = format!("{} {}", code, p.name);
+            }
         }
     }
+    crate::export::ensure_unique_names(proxies);
 }
 
+/// Run the full pipeline on a copy of the input list.
+///
+/// Returns `Err` (with a human-readable message) when a regex used in a filter
+/// or the rename rule fails to compile, so the caller can surface the mistake
+/// to the user instead of silently producing an empty (include-mode) or
 /// all-kept (exclude-mode) export.
 pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
     // Precompile every regex filter once (not per-node) so a large list with
     // several regex rules doesn't pay a Regex::new cost for every node. A bad
     // regex is reported immediately rather than silently dropping the export.
-    let compiled: Vec<(FilterRule, Option<Regex>)> = t
+    // `needle` is the lower-cased `value` for the case-insensitive `contains`
+    // branch — pre-computing it keeps a thousands-node list from allocating a
+    // lowercase String per node per rule.
+    let compiled: Vec<(FilterRule, Option<Regex>, String)> = t
         .filters
         .iter()
         .map(|rule| {
@@ -130,24 +127,31 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
             } else {
                 None
             };
-            Ok((rule.clone(), re))
+            Ok((rule.clone(), re, rule.value.to_lowercase()))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
     // 1) filters (combined as AND)
     let mut out: Vec<Proxy> = proxies
         .iter()
-        .filter(|p| compiled.iter().all(|(rule, re)| keep(p, rule, re)))
+        .filter(|p| {
+            compiled
+                .iter()
+                .all(|(rule, re, needle)| keep(p, rule, re.as_ref(), needle))
+        })
         .cloned()
         .collect();
 
     // 1b) 数值质量阈值：按带宽下限 / 延迟上限过滤。未测速（无数据）的节点无法
     // 判断是否超标，按「保留」处理，避免把还没测过的节点误删。
+    // `download_speed_bps` 与阈值同为**字节/秒**（字段名的 `_bps` 是历史遗留，
+    // 见 model.rs 与 README）；非有限值（引擎返回的 NaN/Inf）按「无法判断」保留，
+    // 否则 `NaN >= min` 恒为 false，一个坏数据会把节点静默删掉。
     if let Some(min_bw) = t.min_bandwidth_bps {
         let min = min_bw as f64;
         out.retain(|p| match p.download_speed_bps {
-            Some(b) => b >= min,
-            None => true,
+            Some(b) if b.is_finite() => b >= min,
+            _ => true,
         });
     }
     if let Some(max_lat) = t.max_latency_ms {
@@ -235,31 +239,53 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
                 })
             }),
             "type" => out.sort_by(|a, b| {
-                avail_rank(a)
-                    .cmp(&avail_rank(b))
-                    .then_with(|| a.type_.as_str().cmp(b.type_.as_str()))
+                // `desc` 反转键序，但绝不反转「死节点沉底」——可用性优先是
+                // 所有排序键共用的前置条件。
+                let key = a.type_.as_str().cmp(b.type_.as_str());
+                avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
+                    if s.desc {
+                        key.reverse()
+                    } else {
+                        key
+                    }
+                })
             }),
-            "score" => out.sort_by(|a, b| {
+            "score" => {
                 // Composite score (see crate::score::score_proxy); higher is
                 // better, so the default/dense ordering is "best first" and
                 // `desc == false` flips to worst first — mirroring the `speed`
                 // key's convention. Availability still dominates (score_proxy
                 // already returns 0 for dead nodes, but avail_rank keeps the
                 // tie-break behaviour identical to every other key).
+                //
+                // 先做一次评分再排序：`score_proxy` 会遍历该节点的 unlock 服务
+                // 映射，放在比较器里等于对 n 个节点算 ~n·log n 次。
+                let mut keyed: Vec<(u8, f64, Proxy)> = out
+                    .drain(..)
+                    .map(|p| (avail_rank(&p), crate::score::score_proxy(&p), p))
+                    .collect();
+                keyed.sort_by(|a, b| {
+                    a.0.cmp(&b.0).then_with(|| {
+                        if s.desc {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                    })
+                });
+                out = keyed.into_iter().map(|(_, _, p)| p).collect();
+            }
+            _ => out.sort_by(|a, b| {
+                // 默认按键名排序，同样要尊重 `desc`（WebUI 的「降序」勾选框
+                // 对名称/类型键此前是静默失效的）。
+                let key = a.name.cmp(&b.name);
                 avail_rank(a).cmp(&avail_rank(b)).then_with(|| {
-                    let av = crate::score::score_proxy(a);
-                    let bv = crate::score::score_proxy(b);
                     if s.desc {
-                        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                        key.reverse()
                     } else {
-                        av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                        key
                     }
                 })
-            }),
-            _ => out.sort_by(|a, b| {
-                avail_rank(a)
-                    .cmp(&avail_rank(b))
-                    .then_with(|| a.name.cmp(&b.name))
             }),
         }
     }
@@ -274,21 +300,45 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
 /// full list would let dead/unsupported entries consume slots and yield fewer
 /// than N nodes in the final output.
 pub fn top_n_by_score(proxies: &[Proxy], n: usize) -> Vec<Proxy> {
-    let mut scored: Vec<(f64, Proxy)> = proxies
+    // Score the *indices* and clone only the selected N: sorting a
+    // `Vec<(f64, Proxy)>` deep-copied every candidate (each Proxy carries
+    // ~15 optional strings), which for a 5000-node set costs far more than
+    // the selection it is meant to avoid.
+    let mut keyed: Vec<(f64, usize)> = proxies
         .iter()
-        .filter(|p| p.is_usable())
-        .map(|p| (crate::score::score_proxy(p), p.clone()))
+        .enumerate()
+        .filter(|(_, p)| p.is_usable())
+        .map(|(i, p)| (crate::score::score_proxy(p), i))
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.into_iter().take(n).map(|(_, p)| p).collect()
+    // Best first; the index tie-break keeps the ordering identical to the
+    // previous stable sort (equal scores preserve input order).
+    keyed.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    keyed
+        .into_iter()
+        .take(n)
+        .map(|(_, i)| proxies[i].clone())
+        .collect()
 }
 
-fn keep(p: &Proxy, rule: &FilterRule, re: &Option<Regex>) -> bool {
+fn keep(p: &Proxy, rule: &FilterRule, re: Option<&Regex>, needle: &str) -> bool {
     let val = field_val(p, &rule.field);
     let matched = match rule.match_.as_str() {
-        "regex" => re.as_ref().map(|r| r.is_match(&val)).unwrap_or(false),
+        "regex" => re.map(|r| r.is_match(val.as_ref())).unwrap_or(false),
         "exact" => val == rule.value,
-        _ => val.to_lowercase().contains(&rule.value.to_lowercase()),
+        // 大小写不敏感的子串匹配（`exact` / `regex` 保持敏感，是既有语义）。
+        // 值本身没有大写字母时跳过 `to_lowercase` 的整串分配。
+        _ => {
+            let hay: std::borrow::Cow<str> = if val.chars().any(char::is_uppercase) {
+                std::borrow::Cow::Owned(val.to_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(val.as_ref())
+            };
+            hay.contains(needle)
+        }
     };
     match rule.mode.as_str() {
         "exclude" => !matched,
@@ -318,8 +368,9 @@ fn keep(p: &Proxy, rule: &FilterRule, re: &Option<Regex>) -> bool {
 /// de-duplicated (first occurrence wins) so a subscription never accumulates
 /// intra-subscription duplicates.
 pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Proxy>) {
-    let old_map: HashMap<String, Proxy> =
-        old.iter().map(|p| (p.fingerprint(), p.clone())).collect();
+    // 借用来建索引：这里只读旧节点的 10 个健康字段，克隆整个 old 列表
+    // （5000 节点即 5000 次全结构深拷贝）是纯浪费。
+    let old_map: HashMap<String, &Proxy> = old.iter().map(|p| (p.fingerprint(), p)).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut merged: Vec<Proxy> = Vec::with_capacity(new.len());
     let mut new_nodes: Vec<Proxy> = Vec::new();
@@ -357,8 +408,8 @@ pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Prox
 
 /// Merge incoming subscriptions into an existing store, keyed by `source`.
 ///
-/// This is the single source of truth for the "re-add == refresh" semantics
-/// shared by `POST /api/subscriptions` and `POST /api/subscriptions/import`:
+/// This is the single source of truth for `POST /api/subscriptions`（按 URL 添加
+/// / 重复添加）的 "re-add == refresh" 语义：
 ///
 /// * An incoming subscription whose `source` already exists is updated **in
 ///   place** (never duplicated) via [`incremental_update`], which preserves
@@ -367,6 +418,13 @@ pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Prox
 ///   only the health / error bookkeeping is refreshed — exactly like a normal
 ///   `refresh`, so a transient network blip can't wipe a working node set.
 /// * A subscription whose `source` is new is appended.
+///
+/// 另外两个入口**故意不走这里**，不要「顺手统一」：
+/// - `POST /api/import`（本地粘贴）每次都新增一条订阅，`Subscription::new` 把
+///   本地来源固定写成 `"pasted"`（model.rs），若按 `source` 合并，所有粘贴订阅
+///   会被并成同一条并互相覆盖。
+/// - `POST /api/subscriptions/import`（备份恢复）以备份内容为权威，按远程 URL
+///   或备份 `uid` 匹配后整体替换（含健康/用量元数据），语义是恢复而非刷新。
 ///
 /// Returns `(created, added_proxies, new_nodes)` where `created` is the number
 /// of *newly created* subscriptions (not merged ones), `added_proxies` is the
@@ -953,5 +1011,156 @@ mod tests {
         assert_eq!(by_name("2.2.2.2").name, "HK 其他 #2", "同名同出口需去重");
         assert_eq!(by_name("3.3.3.3").name, "香港节点", "名字已含地区不改");
         assert_eq!(by_name("4.4.4.4").name, "未实测节点", "无出口地区不改");
+    }
+
+    #[test]
+    fn region_fixup_does_not_emit_a_name_that_is_already_taken() {
+        // 计数式后缀会撞名：输入顺序 ["A #2", "A", "A"] 时第三项算出的 "A #2"
+        // 与首项重名，客户端以 `duplicate name` 拒绝整份配置。
+        let mut n1 = node("A #2", "1.1.1.1", 1);
+        n1.outbound_country = Some("HK".into());
+        let mut n2 = node("A", "2.2.2.2", 2);
+        n2.outbound_country = Some("HK".into());
+        let mut n3 = node("A", "3.3.3.3", 3);
+        n3.outbound_country = Some("HK".into());
+        let mut all = vec![n1, n2, n3];
+        region_fixup_for_export(&mut all);
+        let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+        let uniq: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            uniq.len(),
+            names.len(),
+            "重命名后名字必须互不重复: {names:?}"
+        );
+    }
+
+    #[test]
+    fn sort_desc_applies_to_name_and_type_keys() {
+        // 「降序」勾选框此前只对 latency/speed/score 生效，name/type 静默按升序。
+        let mk = |name: &str, ty: ProxyType| {
+            let mut p = node(name, "1.1.1.1", 1);
+            p.type_ = ty;
+            p
+        };
+        let list = vec![
+            mk("A-ss", ProxyType::Ss),
+            mk("B-vmess", ProxyType::Vmess),
+            mk("C-trojan", ProxyType::Trojan),
+        ];
+
+        let asc = apply(
+            &list,
+            &Transform {
+                sort: Some(SortBy {
+                    key: "name".into(),
+                    desc: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let desc = apply(
+            &list,
+            &Transform {
+                sort: Some(SortBy {
+                    key: "name".into(),
+                    desc: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let asc_names: Vec<&str> = asc.iter().map(|p| p.name.as_str()).collect();
+        let desc_names: Vec<&str> = desc.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(asc_names, vec!["A-ss", "B-vmess", "C-trojan"]);
+        assert_eq!(
+            desc_names,
+            vec!["C-trojan", "B-vmess", "A-ss"],
+            "名称降序未生效"
+        );
+
+        let tdesc = apply(
+            &list,
+            &Transform {
+                sort: Some(SortBy {
+                    key: "type".into(),
+                    desc: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let types: Vec<&str> = tdesc.iter().map(|p| p.type_.as_str()).collect();
+        assert_eq!(types, vec!["vmess", "trojan", "ss"], "类型降序未生效");
+    }
+
+    #[test]
+    fn sort_desc_still_sinks_unavailable_nodes() {
+        // 反转键序不得连带反转「死节点沉底」这一前置条件。
+        let mut dead = node("A-dead", "1.1.1.1", 1);
+        dead.available = Some(false);
+        let live = node("Z-live", "2.2.2.2", 2);
+        let out = apply(
+            &[live.clone(), dead.clone()],
+            &Transform {
+                sort: Some(SortBy {
+                    key: "name".into(),
+                    desc: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out[0].name, "Z-live", "降序时可用节点仍应在前");
+        assert_eq!(out[1].name, "A-dead", "判死节点仍应沉底");
+    }
+
+    #[test]
+    fn bandwidth_threshold_ignores_non_finite_measurement() {
+        // 引擎异常给出的 NaN 不应让 `NaN >= min` 恒 false 而静默删掉节点。
+        let mut nan = node("NAN-node", "1.1.1.1", 1);
+        nan.available = Some(true);
+        nan.download_speed_bps = Some(f64::NAN);
+        let mut slow = node("Slow-node", "2.2.2.2", 2);
+        slow.available = Some(true);
+        slow.download_speed_bps = Some(1.0);
+        let out = apply(
+            &[nan, slow],
+            &Transform {
+                min_bandwidth_bps: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["NAN-node"],
+            "坏数据应按「无法判断」保留: {names:?}"
+        );
+    }
+
+    #[test]
+    fn contains_filter_matches_case_insensitively_on_both_sides() {
+        // 预编译 needle 后，值大小写与字段大小写仍要双向不敏感。
+        let list = vec![
+            node("HK-Alpha", "1.1.1.1", 1),
+            node("JP-beta", "2.2.2.2", 2),
+        ];
+        let out = apply(
+            &list,
+            &Transform {
+                filters: vec![FilterRule {
+                    field: "name".into(),
+                    mode: "include".into(),
+                    match_: "contains".into(),
+                    value: "alpha".into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "HK-Alpha");
     }
 }

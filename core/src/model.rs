@@ -127,10 +127,16 @@ impl SubscriptionHealth {
                 Some(false) => {}
                 None => unk += 1,
             }
-            if let Some(ms) = p.latency_ms {
-                sum += ms;
-                n += 1;
-                best = Some(best.map_or(ms, |b| b.min(ms)));
+            // 平均/最佳延迟只统计「未被判死」的节点：测速流程会在判死时清空
+            // `latency_ms`，但增量刷新会把旧节点的两个字段一起带过来，历史数据
+            // 或第三方写入都可能让死节点带着上轮的 10ms。让死节点参与平均值会
+            // 出现「最佳延迟来自一个面板上显示为不可用的节点」。
+            if p.available != Some(false) {
+                if let Some(ms) = p.latency_ms {
+                    sum += ms;
+                    n += 1;
+                    best = Some(best.map_or(ms, |b| b.min(ms)));
+                }
             }
         }
         self.healthy_node_count = avail;
@@ -461,24 +467,27 @@ impl Proxy {
     ///      non-alphabetic char — so `russia`/`usa`/`ukraine` never match.
     pub fn region(&self) -> String {
         // 0) flag emoji → 2-letter code (authoritative, highest priority)
-        let name_chars: Vec<char> = self.name.chars().collect();
-        let mut i = 0;
-        while i + 1 < name_chars.len() {
-            let a = name_chars[i] as u32;
-            let b = name_chars[i + 1] as u32;
-            if (0x1F1E6..=0x1F1FF).contains(&a) && (0x1F1E6..=0x1F1FF).contains(&b) {
-                let c1 = (a - 0x1F1E6) as u8 + b'A';
-                let c2 = (b - 0x1F1E6) as u8 + b'A';
-                return format!("{}{}", c1 as char, c2 as char);
+        // 相邻两字符滑窗直接扫 `chars()`：旧实现先把名字物化成 `Vec<char>`，
+        // 每个节点的每一次地区判定都多一次堆分配（/sub 一轮要判几千次）。
+        let is_flag = |c: char| (0x1F1E6..=0x1F1FF).contains(&(c as u32));
+        let mut prev: Option<char> = None;
+        for b in self.name.chars() {
+            if let Some(a) = prev {
+                if is_flag(a) && is_flag(b) {
+                    let c1 = (a as u32 - 0x1F1E6) as u8 + b'A';
+                    let c2 = (b as u32 - 0x1F1E6) as u8 + b'A';
+                    return format!("{}{}", c1 as char, c2 as char);
+                }
             }
-            i += 1;
+            prev = Some(b);
         }
 
-        let hay = format!(
-            "{} {}",
-            self.name.to_lowercase(),
-            self.server.to_lowercase()
-        );
+        // 名字 + 服务器合并成一份小写文本，供子串表与码表匹配。逐字符
+        // `to_lowercase` 直接写进目标串，省掉两个临时 String 和一次 `format!`。
+        let mut hay = String::with_capacity(self.name.len() + self.server.len() + 1);
+        hay.extend(self.name.chars().flat_map(char::to_lowercase));
+        hay.push(' ');
+        hay.extend(self.server.chars().flat_map(char::to_lowercase));
 
         // 1) full names / Chinese / English country names (substring, safe)
         const NAME_TABLE: &[(&str, &str)] = &[
@@ -895,14 +904,17 @@ impl Proxy {
     /// (common for multi-node providers reusing one hostname):
     ///   - VMess/Vless/TUIC: uuid + network + sni + tls + path + alter_id +
     ///     cipher + flow  (ws vs grpc, different SNI/TLS/path are distinct)
-    ///   - SS: method|password
+    ///   - SS: 归一后的加密方法（`method` 或 `cipher`，见 [`Proxy::ss_method_value`]）
+    ///     + password
     ///   - Trojan/Hysteria2/Socks5/Http: password|sni|host|network|path
     ///   - Wireguard/Other: uuid|password|sni|host|network|path
     ///
-    /// A `|` inside any field is escaped to `#` so a value containing the
-    /// separator cannot be mistaken for a field boundary. `name` is part of the
-    /// fingerprint, so renaming a node intentionally changes its identity and
-    /// its previous test results are not carried over.
+    /// A `|` inside any field — including `name` and `server`, which real
+    /// subscriptions do contain (e.g. `🇺🇸美国-电信|5倍`) — is escaped to `#` so a
+    /// value containing the separator can never be mistaken for a field
+    /// boundary and make two different nodes look identical. `name` is part of
+    /// the fingerprint, so renaming a node intentionally changes its identity
+    /// and its previous test results are not carried over.
     pub fn fingerprint(&self) -> String {
         let s = |o: &Option<String>| o.clone().unwrap_or_default().replace('|', "#");
         let b = |o: &Option<bool>| {
@@ -911,6 +923,7 @@ impl Proxy {
                 .to_string()
         };
         let n = |o: &Option<u32>| o.unwrap_or_default().to_string();
+        let esc = |v: &str| v.replace('|', "#");
 
         let mut cred = match self.type_ {
             ProxyType::Vmess | ProxyType::Vless | ProxyType::Tuic => format!(
@@ -924,7 +937,11 @@ impl Proxy {
                 s(&self.cipher),
                 s(&self.flow)
             ),
-            ProxyType::Ss => format!("{}|{}", s(&self.method), s(&self.password)),
+            ProxyType::Ss => format!(
+                "{}|{}",
+                self.ss_method_value().unwrap_or_default().replace('|', "#"),
+                s(&self.password)
+            ),
             ProxyType::Trojan
             | ProxyType::Hysteria2
             | ProxyType::Socks5
@@ -1025,9 +1042,9 @@ impl Proxy {
         format!(
             "{}|{}|{}|{}|{}",
             self.type_.as_str(),
-            self.server,
+            esc(&self.server),
             self.port,
-            self.name,
+            esc(&self.name),
             cred
         )
     }
@@ -1072,17 +1089,41 @@ impl Proxy {
 
 /// Merge multiple proxy lists, dropping duplicates by fingerprint.
 pub fn merge(proxies: &[Proxy]) -> Vec<Proxy> {
+    merge_refs(&proxies.iter().collect::<Vec<_>>())
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// [`merge`] 的借用版：按指纹去重但**不克隆节点**，返回指向输入元素的引用。
+/// 仪表盘汇总、地区/类型分布这类只读遍历用它，可以省掉整库几千个 `Proxy`
+/// （每个含 ~15 个可选字符串）的深拷贝。
+pub fn merge_refs<'a>(proxies: &[&'a Proxy]) -> Vec<&'a Proxy> {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<Proxy> = Vec::new();
+    let mut out: Vec<&Proxy> = Vec::new();
     for p in proxies {
         if seen.insert(p.fingerprint()) {
-            out.push(p.clone());
+            out.push(*p);
         }
     }
     out
 }
 
 impl Proxy {
+    /// SS 加密方法的归一取值：clash-meta YAML 订阅把它写在 `cipher`，SIP002
+    /// URI 写在 `method`，同一物理节点只会填充其中一个。指纹与所有导出器都必须
+    /// 读这同一个归一值，否则
+    /// - 同一机场的 YAML / base64 两种订阅形态得到不同指纹，`merge` 不去重，
+    ///   导出里出现 `A` 与 `A #2` 两条指向同一节点的条目；
+    /// - 订阅在两种形态之间切换时 `incremental_update` 会把全部 SS 节点判为
+    ///   新节点，已测延迟与连续失败计数被清空。
+    pub fn ss_method_value(&self) -> Option<&str> {
+        self.method
+            .as_deref()
+            .or(self.cipher.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
     /// 与节点列表「地区」列一致的「有效地区」：优先用实测出口地区
     /// `outbound_country`（经测速引擎真连测出的真实出口国家），仅在未做出口
     /// 检测（或检测为空）时回退到从名字猜测的 `region()`。让地区筛选 / 地区分布
@@ -1491,5 +1532,57 @@ mod tests {
         // 即使名字有地区、出口地区不同，也以实测出口为准
         q.outbound_country = Some("JP".into());
         assert_eq!(q.effective_region(), "JP");
+    }
+
+    #[test]
+    fn ss_fingerprint_is_the_same_for_uri_and_yaml_forms() {
+        // 同一物理节点：SIP002 URI 把加密方法写进 `method`，clash YAML 写进
+        // `cipher`。两者必须得到同一指纹，否则 merge 不去重（导出同名两条）、
+        // 订阅在 YAML/base64 形态间切换时增量刷新会把全部 SS 节点判为新节点。
+        let mut from_uri = Proxy::new("SS-1".into(), ProxyType::Ss, "1.2.3.4".into(), 8388);
+        from_uri.password = Some("pw".into());
+        from_uri.method = Some("aes-256-gcm".into());
+        let mut from_yaml = from_uri.clone();
+        from_yaml.method = None;
+        from_yaml.cipher = Some("aes-256-gcm".into());
+        assert_eq!(
+            from_uri.fingerprint(),
+            from_yaml.fingerprint(),
+            "SS 指纹必须读归一后的加密方法"
+        );
+        // 归一值仍然区分不同加密方法
+        let mut other = from_yaml.clone();
+        other.cipher = Some("chacha20-ietf-poly1305".into());
+        assert_ne!(from_yaml.fingerprint(), other.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_escapes_separator_in_name_and_server() {
+        // 真实订阅名字常含 `|`（如「🇺🇸美国-电信|5倍」）。若 name / server 不转义，
+        // `|` 会伪装成字段分隔符，让两个不同节点拼出同一串指纹而被 merge 静默去重。
+        let a = Proxy::new("X|1|443|y".into(), ProxyType::Ss, "h".into(), 1);
+        let b = Proxy::new("X".into(), ProxyType::Ss, "h|1|443|y".into(), 1);
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "名字/地址里的 | 不得冒充字段边界"
+        );
+    }
+
+    #[test]
+    fn recompute_latency_excludes_dead_nodes() {
+        // 判死节点即使仍带着上一轮的延迟数据，也不能进入平均/最佳延迟，
+        // 否则「最佳延迟」会显示成一个面板上标红不可用的节点。
+        let mut dead = Proxy::new("dead".into(), ProxyType::Ss, "1.1.1.1".into(), 1);
+        dead.available = Some(false);
+        dead.latency_ms = Some(10);
+        let mut live = Proxy::new("live".into(), ProxyType::Ss, "2.2.2.2".into(), 2);
+        live.available = Some(true);
+        live.latency_ms = Some(120);
+        let mut h = SubscriptionHealth::default();
+        h.recompute(&[dead, live]);
+        assert_eq!(h.healthy_node_count, 1);
+        assert_eq!(h.best_latency_ms, Some(120), "死节点延迟不得参与统计");
+        assert_eq!(h.avg_latency_ms, Some(120));
     }
 }

@@ -438,3 +438,53 @@
 
 - Surge `wireguard`（需独立 `[WireGuard]` 段，与单行模型不同）、Hysteria2 上行带宽与端口跳跃、TUIC QUIC 调参、`alpn` 多值引号写法。
 - 第四轮遗留的 Hysteria2 `ports`/`hop-interval`、TUIC `heartbeat`/`fast-open`、SS 外部插件、VLESS ECH 维持不做。
+
+---
+
+## 十一、第六轮复核增强（2026-10-28 完成，P27）
+
+用户明确不再关注 Surge 格式，本轮改为按 **逻辑正确性 + 性能** 复核核心与服务端；所有性能结论来自同机、同 fixture 的新旧二进制实测对照（debug 构建，15 次取最小值），不用估算数字。
+
+### 11.1 逻辑正确性问题与处置
+
+| ID | 位置 | 问题 | 严重度 | 处置 |
+|---|---|---|---|---|
+| G1 | `core/src/model.rs::fingerprint` SS 分支 | 指纹只读 `method`，而 clash YAML 订阅把加密方法写进 `cipher`（`is_exportable` 两者取其一即通过）。同一物理节点从 YAML / base64 两种形态解析出的指纹不同 → `merge` 不去重（导出出现 `A` 与 `A #2` 两条同一节点），订阅在形态间切换时 `incremental_update` 把全部 SS 节点判为新节点、已测延迟与连续失败计数被清空 | 高 | 新增 `Proxy::ss_method_value()`（method→cipher 归一），指纹与 `export::ss_method()` 共用；测试 `ss_fingerprint_is_the_same_for_uri_and_yaml_forms` |
+| G2 | `core/src/model.rs::fingerprint` | `name` / `server` 未转义 `|`，而真实节点名常含 `|`（「🇺🇸美国-电信\|5倍」）。分隔符可被伪装成字段边界，让两个不同节点拼出同一指纹而被静默去重 | 中 | name/server 一并转义；测试 `fingerprint_escapes_separator_in_name_and_server` |
+| G3 | `core/src/ops.rs::apply` 排序 | `name` / `type` 两个键从不读 `s.desc`，WebUI 选「降序」静默按升序返回，且与 `/api/proxies`（对所有键都反转）行为不一致——同一份数据在列表和导出里顺序不同 | 中 | 只反转键序、保留「死节点沉底」前置条件；测试 `sort_desc_applies_to_name_and_type_keys` / `sort_desc_still_sinks_unavailable_nodes` |
+| G4 | `core/src/ops.rs::region_fixup_for_export` | 计数式后缀不检查生成的 ` #N` 是否已被占用：输入 `["A #2","A","A"]` 时第三项产出与首项重名的 `A #2`，与 doc 注释「行为对齐、最终输出必唯一」不符（幸有 `export::ensure_unique_names` 兜底） | 中 | 改名后统一交给 `ensure_unique_names`（改为 `pub(crate)`），删掉重复算法；测试 `region_fixup_does_not_emit_a_name_that_is_already_taken` |
+| G5 | `core/src/model.rs::recompute` | 平均/最佳延迟把所有 `latency_ms` 计入，判死节点带着上一轮的 10 ms 时会成为订阅的「最佳延迟」 | 中 | 仅统计 `available != Some(false)` 的节点；测试 `recompute_latency_excludes_dead_nodes` |
+| G6 | `core/src/ops.rs` 带宽阈值 | `min_bandwidth_bps` 与 `download_speed_bps`（**字节/秒**）比较，文档却写 bps，实际阈值偏严约 8 倍；且 `NaN >= min` 恒 false，一条脏数据会让节点静默消失 | 中 | 单位文档全部改为字节/秒（README / `lib.rs` / `Transform` 注释），非有限值按「无法判断」保留；测试 `bandwidth_threshold_ignores_non_finite_measurement` |
+| G7 | `server/src/db.rs::load_all` | 节点级容错只在 `dropped > 0` 时才重建订阅；节点全部合法、仅顶层 schema 变化（旧版本库 / 字段增减）时整条订阅被静默丢弃，与「重启不丢订阅」的承诺相反 | 高 | 无条件尝试重建；仍失败则用能读到的 `id`/`name`/`source` 兜底恢复节点；测试 `load_all_recovers_subscription_with_changed_top_level_schema` |
+| G8 | `server/src/db.rs::connect` | 每次操作新建连接却无 `busy_timeout`：`meta_set`（设置写入）撞上后台 `save_rows` 事务时 SQLite 立刻返回 SQLITE_BUSY，`let _ =` 吞掉错误 → **设置静默丢失** | 高 | 统一 `busy_timeout=5000`，并按 WAL 语义设 `synchronous=NORMAL` |
+| G9 | `server/src/lib.rs` 两个调度器 | 只看 `source_type == "remote"`，完全不读 `health.enabled`：备份恢复里标记停用的订阅仍被周期抓取 / 重测，并累计连续失败 | 中 | 两处都加 `health.enabled` 过滤（默认启用，存量行为不变） |
+| G10 | `core/src/ops.rs` 文档 | `apply` 的 doc 注释被 `region_fixup_for_export` 的注释拦腰截断（残句落在文件后半），且 sort 键清单漏了 `tcplat`/`httplat` | 低 | 重排两段注释、补全键清单，并写明「另外两个入口（`/api/import`、`/api/subscriptions/import`）故意不走 `merge_subscriptions_by_source`」的原因与陷阱（本地订阅 `source` 恒为 `"pasted"`，按 source 合并会把所有粘贴订阅并成一条） |
+
+### 11.2 性能问题与处置（含实测）
+
+| ID | 位置 | 问题 | 实测影响 | 处置 |
+|---|---|---|---|---|
+| P1 | `core/src/speedtest.rs` | 逐节点对同一 `host:port` 重复拨号。机场普遍把几十上百节点挂在一个端点上（只差密码/路径），而 `tcp_ping` 测的是端点连通性与往返，与凭据无关；不可达端点每个都要烧满 `timeout_ms` | 1000 节点 / 100 端点的导入含自动测速 **64.3 s → 10.2 s（6.3×）**；5000 节点导入从 >180 s 超时降到 97 s | 一轮 `tcp_ping_all` 内共享端点结果缓存（成功与失败都缓存）；测试 `tcp_ping_all_shares_the_endpoint_cache` / `endpoint_results_are_reused_within_one_run` |
+| P2 | `core/src/speedtest.rs::tcp_ping` | 每个节点都 `thread::spawn` 做 DNS（`connect_timeout` 不覆盖解析，才有的兜底线程）；IP 字面量也照样起线程；死主机每个节点重等满预算；worker 数固定为 `concurrency` 哪怕只有 3 个节点 | 大库测速的线程开销与 DNS 预算重复消耗 | IP 字面量快速路径（不进解析器）+ 本轮 DNS 结果缓存 + `concurrency.min(len)`；测试 `resolve_treats_ip_literals_without_touching_the_resolver` / `dns_cache_reuses_one_result_per_host` |
+| P3 | `server/src/handlers/nodes.rs::list_proxies` | 把**每个**节点 `serde_json::to_value`（约 50 键）后按字符串键查表排序，最后只取一页 50 条；`effective_region()` 每节点算 3 次；关键词 `to_lowercase` 在节点循环里重复计算；**全程持有 store 锁**（前端轮询期间阻塞测速回写） | 1000 节点：`sort=score&desc` **36.5 → 12.1 ms（3.0×）**、`q=HK` 33.1 → 12.7 ms、`page_size=500` 101.2 → 44.7 ms | 改为「引用 + 派生字段算一次 → 类型化排序 → 只序列化返回的那一页」，keyword 提到循环外 |
+| P4 | `server/src/db.rs::save_all` | `DELETE 全表 + 重插所有订阅`，而测速逐批 `persist_all` → 一次运行把整库数 MB JSON 重写几十遍 | 3 次设置落库 57.9 → 47.1 ms（订阅越多、批次越多差距越大） | 改为按行快照：`len`+`hash` 摘要跳写未变化行、只删消失 id；WAL + `synchronous=NORMAL`；测试 `save_rows_rewrites_only_changed_subscriptions` / `save_rows_deletes_vanished_subscriptions` |
+| P5 | `server/src/lib.rs::persist_all` | `store.lock().clone()` 深拷贝整个 store（几千节点 × 每个约 15 个可选字符串），只为序列化一遍 | 每次落库少一次全库深拷贝 | 在已持有的锁内直接产出 `(id, json)` 交给 `save_rows` |
+| P6 | `server/src/lib.rs` 健康检查调度器 | 快照 `Vec<Proxy>` 后 `run_health_check_core` 又 `to_vec()` 第二次全量深拷贝 | 每轮定时重测少一次全库深拷贝 | 传 `Arc<Vec<Proxy>>` |
+| P7 | `server/src/handlers/nodes.rs::dashboard` / `flatten_dedup` | 只读汇总也深拷贝整库节点 | 1000 节点 20.9 → 19.7 ms（节点越多收益越大） | 新增 `merge_refs` / `flatten_dedup_refs` 借用版 |
+| P8 | `server/src/handlers/speedtest.rs` SSE | 客户端断开后 `let _ = tx.send(...)` 吞掉失败，几千节点的测速继续跑完 | 关掉页面即停止后续探测 | 进度回调改为返回 `bool`，`false` 时置取消标志并停止调度；测试 `tcp_ping_all_stops_when_progress_callback_says_no` |
+| P9 | `core/src/ops.rs` / `score.rs` | `sort.key=score` 在比较器里重算评分（~n·log n 次，每次遍历该节点 unlock 映射）；`top_n_by_score` 深拷贝全部候选再全排序；`incremental_update` 为读 10 个健康字段克隆整个旧列表；筛选规则每节点每规则重算 `value.to_lowercase()`；`field_val` 每节点拷贝字符串；`region()` 每节点一次 `Vec<char>` + 两次 `to_lowercase` 临时串 | 大库导出/订阅（`/sub` 12.2 → 9.8 ms）与各算子路径的分配量下降 | 评分先算一次（Schwartzian）；Top-N 只克隆选中的 N；旧节点索引改借用；needle 预编译 + `field_val` 返回 `Cow`；`region()` 相邻字符滑窗 + 单串拼接 |
+
+### 11.3 验证
+
+- `cargo test -p subhub-core -p subhub-server`：**148 个测试全通过**（core 124 + server 24），本轮新增 15 个用例。
+- `cargo fmt --all -- --check` 通过；clippy `--all-targets -D warnings` 0 警告。
+- 隔离 DB 端到端 `docs/test_subhub.py` ALL CHECKS PASSED（含跨页全局排序回归，正好覆盖重写的 `list_proxies`）。
+- 浏览器实测节点列表页：15 列渲染正常，`q=HK` → 1 条、`type=ss` → 5 条全 ss、`region=US` → 1 条、`page=2&page_size=3&sort=score&desc=1` 切片正确，行数据 47 个字段齐备（含 `score`/`region`/`fingerprint`/`sub_name`/`tcp_latency_ms`/`http_latency_ms`/`bandwidth_measured`），控制台无报错。
+- `cargo build --release -p subhub-app` 通过。
+- 性能对照方法：同一台机器、同一份 1000 节点 fixture、debug 构建、15 次取最小值；基线二进制由 `git stash` 回到 `0620efc` 后单独构建。绝对值是 debug 数字（release 更快），倍数关系即结构性收益。
+
+### 11.4 本轮明确不做
+
+- 为 `region()` / `score_proxy()` 做跨请求记忆化：需要给 `Proxy` 加内部可变缓存字段，代价与风险大于收益；改为保证「每个请求每个节点只算一次」。
+- `/sub` 全链路零拷贝（导出仍需要 owned 节点副本）；SQLite 改为按节点建表存储（当前快照模型在此规模下足够，且没有 schema 漂移风险）。
+- 测速 `measure_send_throughput` 的 1 s 预算不动：它是无引擎时「速度」列的唯一数据来源，缩短会牺牲读数质量。

@@ -50,7 +50,7 @@ pub fn export_filter(proxies: &[Proxy]) -> Vec<Proxy> {
 /// `... is the duplicate name`, taking down the whole config. Rewrite names so
 /// each is unique: the first occurrence keeps its original name; later
 /// collisions get a ` #2`, ` #3` … suffix.
-fn ensure_unique_names(proxies: &mut [Proxy]) {
+pub(crate) fn ensure_unique_names(proxies: &mut [Proxy]) {
     use std::collections::HashSet;
     let mut used: HashSet<String> = HashSet::new();
     for p in proxies.iter_mut() {
@@ -313,10 +313,10 @@ fn insert_string_list(m: &mut Mapping, key: &str, val: &Option<Vec<String>>) {
 /// 任一字段。所有导出格式都必须走这里取同一个值，否则 YAML 导入的 SS 节点会被
 /// 导出成默认的 `aes-256-gcm`，客户端握手必然失败。
 fn ss_method(p: &Proxy) -> String {
-    p.method
-        .clone()
-        .or_else(|| p.cipher.clone())
-        .filter(|s| !s.is_empty())
+    // 与 `Proxy::fingerprint()` 读同一个归一值（method → cipher），保证
+    // 「导出用的方法」与「身份判定用的方法」永不背离。
+    p.ss_method_value()
+        .map(str::to_string)
         .unwrap_or_else(|| "aes-256-gcm".to_string())
 }
 

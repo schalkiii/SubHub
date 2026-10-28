@@ -382,8 +382,9 @@ pub struct SubQuery {
     /// manual export — handy for a small "best nodes" subscribe link.
     pub top_n: Option<String>,
 
-    /// 数值质量阈值（可选，单位 bps / ms）：导出时排除带宽低于 `min_bw` 或延迟
-    /// 高于 `max_lat` 的节点。与手动导出 `Transform.min_bandwidth_bps` /
+    /// 数值质量阈值（可选）：导出时排除带宽低于 `min_bw` 或延迟高于 `max_lat`
+    /// 的节点。单位与内存字段一致 —— 带宽是**字节/秒**（`download_speed_bps`
+    /// 的名字有历史误导），延迟是 ms。与手动导出 `Transform.min_bandwidth_bps` /
     /// `max_latency_ms` 对应，便于把「只要快节点」编码进常驻订阅网址。
     pub min_bw: Option<String>,
 
@@ -1229,12 +1230,30 @@ fn persist_results(
 /// user never loses subscriptions / speed-test results on restart.
 fn persist_all(state: &AppState) {
     if let Some(db) = &state.db {
-        let subs = state.store.lock_ok().clone();
+        // Serialize while the store lock is already held instead of
+        // deep-cloning the whole store first: `save_rows` needs
+        // `(id, json)` pairs, so the clone was a full copy of every node
+        // (thousands of `Proxy`, each with ~15 optional strings) purely to
+        // produce bytes that were about to be serialized anyway.
+        let rows: Vec<(String, String)> = {
+            let subs = state.store.lock_ok();
 
-        // Serialize DB writes so concurrent `save_all` transactions can't
-        // interleave (DELETE + full re-INSERT) and corrupt the store.
+            subs.iter()
+                .filter_map(|s| match serde_json::to_string(s) {
+                    Ok(d) => Some((s.id.clone(), d)),
+
+                    Err(e) => {
+                        eprintln!("DB 持久化跳过一个订阅(序列化失败): {}: {e}", s.id);
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Serialize DB writes so concurrent `save_rows` transactions can't
+        // interleave and leave the snapshot half-applied.
         let _g = state.persist_lock.lock_ok();
-        db.save_all(&subs);
+        db.save_rows(&rows);
     }
 }
 
@@ -1249,14 +1268,17 @@ fn persist_all(state: &AppState) {
 /// consecutive checks get pruned by this path too.
 async fn run_health_check_core(
     state: &AppState,
-    proxies: &[Proxy],
+    proxies: Arc<Vec<Proxy>>,
     timeout_ms: u64,
     concurrency: usize,
 ) -> usize {
     if proxies.is_empty() {
         return 0;
     }
-    let proxies_tcp = proxies.to_vec();
+    // 调用方交来的是已经克隆好的一份快照，这里只克隆 `Arc`；旧写法在
+    // `proxies.to_vec()` 上又深拷贝了一遍全部节点（几千个 Proxy、每个约
+    // 15 个可选字符串），而这份拷贝除了送进 `spawn_blocking` 没有别的用途。
+    let proxies_tcp = Arc::clone(&proxies);
     let tcp_results = tokio::task::spawn_blocking(move || {
         subhub_core::tcp_ping_all(&proxies_tcp, timeout_ms, concurrency, None)
     })
@@ -1265,7 +1287,7 @@ async fn run_health_check_core(
     // TCP-only: no engine HTTP latency / bandwidth to fold in.
     let none_u64: Vec<Option<Option<u64>>> = vec![None; proxies.len()];
     let none_f64: Vec<Option<Option<f64>>> = vec![None; proxies.len()];
-    persist_results(state, proxies, &tcp_results, &none_u64, &none_f64)
+    persist_results(state, &proxies, &tcp_results, &none_u64, &none_f64)
 }
 
 /// Build a subscription summary (recomputing derived health from proxies).
@@ -1365,7 +1387,16 @@ pub struct DashboardResp {
 // ----------------------- helpers -----------------------
 
 fn flatten_dedup(subs: &[Subscription], only: Option<&[String]>) -> Vec<Proxy> {
-    let mut collected: Vec<Proxy> = Vec::new();
+    flatten_dedup_refs(subs, only)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// [`flatten_dedup`] 的借用版：只读遍历（仪表盘汇总、地区分布）不必为每个节点
+/// 做一次深拷贝——一次轮询就是几千个 `Proxy`、每个约 15 个可选字符串。
+fn flatten_dedup_refs<'a>(subs: &'a [Subscription], only: Option<&[String]>) -> Vec<&'a Proxy> {
+    let mut collected: Vec<&Proxy> = Vec::new();
 
     for s in subs {
         if let Some(ids) = only {
@@ -1374,10 +1405,10 @@ fn flatten_dedup(subs: &[Subscription], only: Option<&[String]>) -> Vec<Proxy> {
             }
         }
 
-        collected.extend_from_slice(&s.proxies);
+        collected.extend(s.proxies.iter());
     }
 
-    subhub_core::merge(&collected)
+    subhub_core::merge_refs(&collected)
 }
 
 /// Apply the `mode` test-scope filter from the WebUI's "仅测未测 / 仅失败"
@@ -1940,7 +1971,8 @@ pub async fn run_server() {
                     let g = st.store.lock_ok();
 
                     g.iter()
-                        .filter(|s| s.health.source_type == "remote")
+                        // 停用的订阅不参与自动刷新（与定时健康检查同一口径）。
+                        .filter(|s| s.health.enabled && s.health.source_type == "remote")
                         .map(|s| s.id.clone())
                         .collect()
                 };
@@ -1987,9 +2019,17 @@ pub async fn run_server() {
                 }
                 // Snapshot every node under a short lock, then release before the
                 // (potentially long) test so we never hold the store across .await.
-                let all: Vec<Proxy> = {
+                // 已停用的订阅不参与定时重测：`health.enabled` 是用户意图
+                // （备份恢复里也会带回该状态），继续探测等于在测用户关掉的东西，
+                // 还会把结果写回并影响连续失败计数。
+                let all: Arc<Vec<Proxy>> = {
                     let g = st.store.lock_ok();
-                    g.iter().flat_map(|s| s.proxies.iter().cloned()).collect()
+                    Arc::new(
+                        g.iter()
+                            .filter(|s| s.health.enabled)
+                            .flat_map(|s| s.proxies.iter().cloned())
+                            .collect(),
+                    )
                 };
                 if all.is_empty() {
                     continue;
@@ -1998,7 +2038,7 @@ pub async fn run_server() {
                 // nodes exist, so we never open thousands of sockets simultaneously.
                 let concurrency = 20usize;
                 let timeout_ms = 4000u64;
-                run_health_check_core(&st, &all, timeout_ms, concurrency).await;
+                run_health_check_core(&st, Arc::clone(&all), timeout_ms, concurrency).await;
                 persist_all(&st);
                 // 定时清理「连续 N 天无可用节点」的订阅（阈值 > 0 时生效）。
                 prune_dead_subscriptions(&st, now_ms());

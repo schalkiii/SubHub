@@ -88,7 +88,8 @@ Surge 的类型关键字是**封闭集合**：`ss` / `snell` / `vmess` / `trojan
 
 ## 3. 解析/导出的特殊约定
 
-- **SS 加密方法**：URI 存 `method`，clash YAML 存 `cipher`；所有导出器统一走 `export.rs::ss_method()`。
+- **SS 加密方法归一**：URI 存 `method`，clash YAML 存 `cipher`；所有导出器与**节点指纹**统一走 `Proxy::ss_method_value()`（`method` → `cipher`）。若只有导出器归一、指纹仍读 `method`，同一节点的 YAML 形态与 base64 形态会得到两个指纹：`merge` 不去重（导出里出现 `A` / `A #2`），订阅换形态时增量刷新把全部 SS 节点判为新节点、丢掉已测延迟。
+- **指纹的字段边界**：`type|server|port|name|cred`，其中 `name` / `server` 与凭据字段一样把 `|` 转义成 `#`。真实节点名常含 `|`（「🇺🇸美国-电信|5倍」），不转义就能让两个不同节点拼出同一串指纹而被静默去重。
 - **SS 插件名归一**：clash 侧统一写 `obfs` / `v2ray-plugin`；sing-box 侧统一写 `obfs-local` / `v2ray-plugin`。未知插件名原样透传，选项按 `k=v` 保留。
 - **Hysteria2 / TUIC**：模型统一 `up_mbps/down_mbps` 数字；导入 mihomo 的带单位字符串时按单位换算（见下条），导出 mihomo 时补 ` Mbps` 单位。
 - **ALPN**：URI `alpn=h2,http/1.1` 按逗号拆分；clash 既接受序列也接受逗号字符串；sing-box/xray 均为数组。
