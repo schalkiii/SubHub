@@ -1,5 +1,11 @@
 import json
+import sys
+import urllib.parse
 import urllib.request
+
+# Windows 控制台默认 GBK，脚本输出含中文/符号会 UnicodeEncodeError。
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = "http://127.0.0.1:3005"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # bypass local proxy
@@ -19,10 +25,35 @@ def call(path, body=None, method=None):
         BASE + path, data=data, method=method,
         headers={"content-type": "application/json"} if data else {},
     )
-    with OPENER.open(req, timeout=10) as r:
+    # 60s：无效代理用例会让服务端等满 reqwest 的 20s 超时后才记录 last_error。
+    with OPENER.open(req, timeout=60) as r:
         ct = r.headers.get("content-type", "")
         text = r.read().decode()
         return json.loads(text) if "application/json" in ct else text
+
+
+def sse(path, params):
+    """GET an SSE endpoint and return (events, done_summary).
+
+    /api/speedtest is a text/event-stream GET endpoint; the old JSON contract
+    ({results, removed, threshold}) no longer exists.
+    """
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{BASE}{path}?{qs}", method="GET")
+    events, summary = [], None
+    with OPENER.open(req, timeout=180) as r:
+        for raw in r:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            ev = json.loads(payload)
+            events.append(ev)
+            if ev.get("type") == "Done":
+                summary = ev
+    return events, summary
 
 
 CLASH = """
@@ -68,15 +99,17 @@ def main():
     r = call("/api/import", {"content": URIS})
     print("import uris ->", r)
 
-    print("== auto speedtest + health on import ==")
+    print("== auto speedtest + health on import (loopback is left untested) ==")
+    # 127.0.0.1 这类回环节点会被 persist_results 刻意跳过：本地回环的延迟/吞吐是
+    # 内存拷贝，不代表真实网络质量。导入后应保持「未测」，而不是假的 available=True。
     call("/api/import", {"content": "ss://YWVzLTI1Ni1nY206cGFzcw==@127.0.0.1:3005#LG-AutoTest"})
     pl = call("/api/proxies")["items"]
     auto = [p for p in pl if p["name"] == "LG-AutoTest"]
     print("  LG-AutoTest after auto-test:", auto[0] if auto else "n/a")
     assert auto, "auto-test node missing"
-    assert auto[0]["available"] is True, "auto speedtest should mark local node available"
-    assert auto[0]["latency_ms"] is not None, "auto speedtest should set latency"
-    print("  auto health+speedtest on import: ✅")
+    assert auto[0]["available"] is None, "loopback must not be marked available"
+    assert auto[0]["last_tested_at"] is None, "loopback must not get a fake test timestamp"
+    print("  loopback correctly left untested on import: ✅")
 
     print("== add broken subscription (fast connection-refused) ==")
     call("/api/subscriptions", {"urls": ["http://127.0.0.1:9/subs"]})
@@ -96,14 +129,22 @@ def main():
     assert broken[0]["last_error"], "expected last_error on broken sub"
     print("  ✅ broken sub correctly flagged error with last_error")
 
-    print("== add subscription via invalid proxy -> error ==")
-    call("/api/subscriptions", {"urls": ["https://example.com/proxy-test"], "fetch_proxy": "not a valid proxy"})
+    print("== add subscription via unreachable proxy -> error ==")
+    # 拉取代理只在总开关打开时生效；这里显式打开，避免受 SUBHUB_USE_PROXY=0 影响。
+    call("/api/settings", {"use_proxy": True})
+    try:
+        call(
+            "/api/subscriptions",
+            {"urls": ["https://example.com/proxy-test"], "fetch_proxy": "http://127.0.0.1:1"},
+        )
+    finally:
+        call("/api/settings", {"use_proxy": False})
     subs = call("/api/subscriptions")
     proxied = [s for s in subs if s.get("source") == "https://example.com/proxy-test"]
     assert proxied, "proxied subscription not recorded"
     assert proxied[0]["status"] == "error", f"expected error, got {proxied[0]['status']}"
     assert proxied[0]["last_error"], "expected last_error with proxy failure"
-    print("  ✅ invalid proxy correctly flagged:", proxied[0]["last_error"])
+    print("  ✅ unreachable proxy correctly flagged:", proxied[0]["last_error"])
 
     print("== refresh a healthy subscription ==")
     healthy_sub = next(
@@ -158,6 +199,21 @@ def main():
     assert len(sub_json) >= 1, "/sub?format=v2ray produced no usable nodes"
     assert any(o.get("tag") == "LG-AutoTest" for o in sub_json), "/sub?format=v2ray missing usable ss node"
     print("  ✅ GET /sub returns merged subscription text for direct client pull")
+
+    print("== VLESS REALITY export fidelity ==")
+    # 回环地址保持未测 → 不会被 export_filter 剔除，专测序列化字段。
+    reality_uri = (
+        "vless://11111111-2222-3333-4444-555555555555@127.0.0.1:3005"
+        "?security=reality&pbk=PUBKEY&sid=ab12&fp=chrome&sni=www.example.com&type=tcp#REALITY-Test"
+    )
+    call("/api/import", {"content": reality_uri})
+    clash_all = call("/api/export", {"format": "clash-meta"})["content"]
+    assert "reality-opts" in clash_all and "public-key: PUBKEY" in clash_all
+    sb_all = call("/api/export", {"format": "sing-box"})["content"]
+    assert '"reality"' in sb_all and '"public_key": "PUBKEY"' in sb_all
+    v2_all = call("/api/export", {"format": "v2ray"})["content"]
+    assert '"realitySettings"' in v2_all and '"publicKey": "PUBKEY"' in v2_all
+    print("  ✅ REALITY fields survive clash / sing-box / v2ray export")
 
     print("== export filters out invalid (other-type) nodes (Round E/F regression) ==")
     # An unrecognized proxy type is parsed as ProxyType::Other and MUST NOT be exported,
@@ -222,23 +278,26 @@ proxies:
     assert "HK-VmessB" not in r["content"], "exclude HK (dead) failed"
     assert "HK-SsA" not in r["content"], "exclude HK (uri, dead) failed"
 
-    print("== speedtest (local test node) ==")
+    print("== speedtest (local test node, SSE) ==")
     call("/api/import", {"content": "ss://YWVzLTI1Ni1nY206cGFzcw==@127.0.0.1:3005#LG-LocalTest"})
-    # /api/speedtest returns an OBJECT: {results: [...], removed: n, threshold: n}
-    resp = call("/api/speedtest", {"timeout_ms": 3000, "concurrency": 10})
-    assert isinstance(resp, dict) and "results" in resp, f"speedtest must return an object with results, got {type(resp)}"
-    assert "removed" in resp and "threshold" in resp, "speedtest response must carry removed/threshold"
-    res = resp["results"]
-    local = [x for x in res if x["name"] == "LG-LocalTest"]
-    print("  LG-LocalTest:", local[0] if local else "n/a")
+    events, summary = sse("/api/speedtest", {"timeout_ms": 3000, "concurrency": 10})
+    assert summary is not None, "SSE stream must end with a Done event"
+    assert "tested" in summary and "removed" in summary and "threshold" in summary
+    progress = [e for e in events if e.get("type") == "Progress"]
+    assert progress, "speedtest must emit Progress events"
+    local = [e for e in progress if e.get("name") == "LG-LocalTest"]
+    print("  LG-LocalTest:", local[-1] if local else "n/a")
     if local:
-        assert local[0]["available"] is True, "local should be reachable"
-        assert local[0]["tcp_latency_ms"] is not None
+        assert local[-1]["available"] is True, "local should be reachable"
+        assert local[-1].get("tcp_latency_ms") is not None
 
-    print("== speedtest mode=untested (scoped run, object shape) ==")
-    r = call("/api/speedtest", {"timeout_ms": 2000, "concurrency": 10, "mode": "untested"})
-    assert isinstance(r, dict) and isinstance(r.get("results"), list)
-    print(f"  mode=untested tested {len(r['results'])} node(s) (all-tested -> 0 is fine)")
+    print("== speedtest mode=untested (scoped SSE run) ==")
+    events2, summary2 = sse(
+        "/api/speedtest", {"timeout_ms": 2000, "concurrency": 10, "mode": "untested"}
+    )
+    assert summary2 is not None, "scoped run must end with a Done event"
+    scoped = [e for e in events2 if e.get("type") == "Progress"]
+    print(f"  mode=untested tested {summary2.get('tested', 0)} node(s), {len(scoped)} progress ticks")
 
     print("== global sort is cross-page (not per-page) ==")
     # The full ordering (one big page) must equal the concatenation of small

@@ -2,7 +2,8 @@
 //! 以及节点出口地区（geo）探测。
 use crate::*;
 use crate::{
-    apply_mode, engine_bin_of, flatten_dedup, now_ms, persist_all, sub_to_summary, LockExt,
+    apply_mode, engine_bin_of, flatten_dedup, now_ms, parse_desc, persist_all, sub_to_summary,
+    LockExt,
 };
 use axum::{
     extract::{Query, State},
@@ -162,12 +163,14 @@ pub(crate) async fn list_proxies(
                 );
 
                 // `region` is a computed method on `Proxy`, not a serialized
+                // field. Surface the *effective* region (measured outbound
+                // country first, then name inference) so API consumers see the
+                // same value as the list column/filter and dashboard.
 
-                // field — surface it here so the WebUI can read `p.region`
-
-                // (otherwise it would always fall back to "OTHER").
-
-                obj.insert("region".into(), serde_json::Value::String(p.region()));
+                obj.insert(
+                    "region".into(),
+                    serde_json::Value::String(p.effective_region()),
+                );
 
                 // Composite score (0-100): lower latency + higher bandwidth +
                 // availability + unlock coverage. Attached so the WebUI can sort
@@ -188,7 +191,7 @@ pub(crate) async fn list_proxies(
     // the bottom regardless of the chosen column (mirrors the old client-side
     // rule, now done server-side on the full dataset).
     let sort_key = q.sort.clone().unwrap_or_else(|| "name".to_string());
-    let sort_desc = q.desc.unwrap_or(false);
+    let sort_desc = parse_desc(&q.desc);
     all.sort_by(|a, b| {
         let ad = a.get("available").and_then(|x| x.as_bool()) == Some(false);
         let bd = b.get("available").and_then(|x| x.as_bool()) == Some(false);

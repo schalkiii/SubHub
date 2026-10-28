@@ -1,7 +1,9 @@
 //! 维护类 handler：清理无效 / 连续失败的节点、淘汰长期无可用节点的订阅、
 //! Top-N 聚合导出，以及订阅内容的构建（过滤 / 排序 / 重命名 / 格式化）。
 use crate::*;
-use crate::{flatten_dedup, now_ms, persist_all, transform_from_sub_query, LockExt};
+use crate::{
+    flatten_dedup, now_ms, persist_all, resolve_top_n, transform_from_sub_query, LockExt,
+};
 use axum::{
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
@@ -98,7 +100,10 @@ pub(crate) async fn nodes_top(
                     "sub_name".into(),
                     serde_json::Value::String(sub.name.clone()),
                 );
-                obj.insert("region".into(), serde_json::Value::String(p.region()));
+                obj.insert(
+                    "region".into(),
+                    serde_json::Value::String(p.effective_region()),
+                );
                 obj.insert(
                     "score".into(),
                     serde_json::to_value(score_proxy(p)).unwrap_or(serde_json::Value::Null),
@@ -141,11 +146,7 @@ pub(crate) async fn merge_export(
     // configuration as the standing subscribe URL (/sub) — configured once in
     // the Settings page, applied everywhere.
     let global_top = *state.top_n.lock_ok();
-    let top_n = req.top_n.filter(|n| *n > 0).or(if global_top > 0 {
-        Some(global_top)
-    } else {
-        None
-    });
+    let top_n = resolve_top_n(req.top_n, global_top);
     let mut transformed = if let Some(n) = top_n {
         let mut scored: Vec<(f64, Proxy)> = transformed
             .into_iter()
@@ -230,14 +231,9 @@ pub(crate) fn build_sub_content(
     let url_top = q
         .top_n
         .as_ref()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n > 0);
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let global_top = *state.top_n.lock_ok();
-    let top_n = url_top.or(if global_top > 0 {
-        Some(global_top)
-    } else {
-        None
-    });
+    let top_n = resolve_top_n(url_top, global_top);
     let mut transformed = if let Some(n) = top_n {
         let mut scored: Vec<(f64, Proxy)> = transformed
             .into_iter()

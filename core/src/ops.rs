@@ -286,9 +286,11 @@ fn keep(p: &Proxy, rule: &FilterRule, re: &Option<Regex>) -> bool {
 /// health / speed-test data we already measured for nodes that are still
 /// present upstream. This function:
 ///   1. keeps every node that survives the refresh (matched by `fingerprint()`)
-///      and **carries over** its previously measured `latency_ms` / `available`
-///      / `download_speed_bps` / `last_tested_at` / `outbound_country` /
-///      `unlock` so we don't re-test nodes that didn't change;
+///      and **carries over** its previously measured latency columns
+///      (`latency_ms` / `tcp_latency_ms` / `http_latency_ms`), `available`,
+///      `download_speed_bps` / `bandwidth_measured`, `last_tested_at`,
+///      `consecutive_failures`, `outbound_country` and `unlock`, so a refresh
+///      neither blanks the latency columns nor resets the auto-remove counter;
 ///   2. appends **only the genuinely new** nodes (those whose fingerprint is
 ///      not in `old`) — these are the only ones that still need a speed test;
 ///   3. drops nodes that are no longer present in the freshly fetched `new`
@@ -317,10 +319,13 @@ pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Prox
             // (the freshly parsed node has none yet right after a fetch).
             let mut merged_p = n.clone();
             merged_p.latency_ms = o.latency_ms;
+            merged_p.tcp_latency_ms = o.tcp_latency_ms;
+            merged_p.http_latency_ms = o.http_latency_ms;
             merged_p.available = o.available;
             merged_p.download_speed_bps = o.download_speed_bps;
             merged_p.bandwidth_measured = o.bandwidth_measured;
             merged_p.last_tested_at = o.last_tested_at;
+            merged_p.consecutive_failures = o.consecutive_failures;
             merged_p.outbound_country = o.outbound_country.clone();
             merged_p.unlock = o.unlock.clone();
             merged.push(merged_p);
@@ -347,20 +352,23 @@ pub fn incremental_update(old: &[Proxy], new: &[Proxy]) -> (Vec<Proxy>, Vec<Prox
 ///   `refresh`, so a transient network blip can't wipe a working node set.
 /// * A subscription whose `source` is new is appended.
 ///
-/// Returns `(created, added_proxies)` where `created` is the number of
-/// *newly created* subscriptions (not merged ones) and `added_proxies` is the
-/// total node count of those newly created subscriptions. Callers use this to
-/// report an accurate "added" metric that does not conflate a refresh with a
-/// genuine addition.
+/// Returns `(created, added_proxies, new_nodes)` where `created` is the number
+/// of *newly created* subscriptions (not merged ones), `added_proxies` is the
+/// total node count of those newly created subscriptions, and `new_nodes` is
+/// the subset that genuinely has never been measured before (all nodes of a
+/// created subscription, plus only the fresh nodes of a merged one). Callers
+/// use `new_nodes` for the post-add speed test so re-adding an existing URL
+/// refreshes the subscription instead of re-testing every node it contains.
 pub fn merge_subscriptions_by_source(
     existing: &mut Vec<Subscription>,
     incoming: Vec<Subscription>,
-) -> (usize, usize) {
+) -> (usize, usize, Vec<Proxy>) {
     let mut created = 0usize;
     let mut added_proxies = 0usize;
+    let mut new_nodes: Vec<Proxy> = Vec::new();
     for sub in incoming {
         if let Some(e) = existing.iter_mut().find(|s| s.source == sub.source) {
-            let (merged, _new_nodes) = incremental_update(&e.proxies, &sub.proxies);
+            let (merged, fresh) = incremental_update(&e.proxies, &sub.proxies);
             // On a failed re-fetch keep the old node list (merged would be
             // empty / stale) — same as subscription refresh.
             if sub.health.last_error.is_none() {
@@ -370,6 +378,7 @@ pub fn merge_subscriptions_by_source(
                 e.health.download = sub.health.download;
                 e.health.total = sub.health.total;
                 e.health.expire = sub.health.expire;
+                new_nodes.extend(fresh);
             }
             e.health.last_checked_at = sub.health.last_checked_at;
             e.health.last_error = sub.health.last_error.clone();
@@ -378,11 +387,12 @@ pub fn merge_subscriptions_by_source(
             }
         } else {
             added_proxies += sub.proxies.len();
+            new_nodes.extend(sub.proxies.iter().cloned());
             existing.push(sub);
             created += 1;
         }
     }
-    (created, added_proxies)
+    (created, added_proxies, new_nodes)
 }
 
 #[cfg(test)]
@@ -459,6 +469,26 @@ mod tests {
             "bandwidth_measured must survive refresh"
         );
         assert_eq!(merged_a.download_speed_bps, Some(25_000_000.0));
+    }
+
+    #[test]
+    fn incremental_update_preserves_latency_columns_and_failure_streak() {
+        // 回归：tcp_latency_ms / http_latency_ms / consecutive_failures 是在
+        // 双延迟模型与自动移除上线后新增的字段；旧实现只复制 latency_ms，
+        // 每次刷新都会把 TCP/HTTP 两列清空、并把连续失败计数归零。
+        let mut old_node = node("A", "10.0.0.1", 1);
+        old_node.latency_ms = Some(120);
+        old_node.tcp_latency_ms = Some(30);
+        old_node.http_latency_ms = Some(120);
+        old_node.available = Some(true);
+        old_node.consecutive_failures = 2;
+
+        let (merged, _) = incremental_update(&[old_node], &[node("A", "10.0.0.1", 1)]);
+        let m = &merged[0];
+        assert_eq!(m.latency_ms, Some(120));
+        assert_eq!(m.tcp_latency_ms, Some(30), "TCP 延迟必须跨刷新保留");
+        assert_eq!(m.http_latency_ms, Some(120), "HTTP 延迟必须跨刷新保留");
+        assert_eq!(m.consecutive_failures, 2, "连续失败计数必须保留");
     }
 
     #[test]
@@ -731,9 +761,10 @@ mod tests {
             vec![node("n2", "2.2.2.2", 2), node("n3", "3.3.3.3", 3)],
         );
 
-        let (created, added) = merge_subscriptions_by_source(&mut store, vec![a, b]);
+        let (created, added, fresh) = merge_subscriptions_by_source(&mut store, vec![a, b]);
         assert_eq!(created, 2, "both subscriptions are new");
         assert_eq!(added, 3, "three nodes across the two new subs");
+        assert_eq!(fresh.len(), 3, "all nodes of new subs need a first test");
         assert_eq!(store.len(), 2);
     }
 
@@ -756,7 +787,7 @@ mod tests {
             "https://a.example/sub".into(),
             vec![node("n2", "2.2.2.2", 2)],
         );
-        let (created, added) = merge_subscriptions_by_source(&mut store, vec![again]);
+        let (created, added, fresh) = merge_subscriptions_by_source(&mut store, vec![again]);
         assert_eq!(created, 0, "no new subscription created on re-add");
         assert_eq!(added, 0, "re-add is a refresh, not an addition");
         assert_eq!(
@@ -769,6 +800,8 @@ mod tests {
             store[0].proxies[0].name, "n2",
             "node list replaced by refresh"
         );
+        assert_eq!(fresh.len(), 1, "only the genuinely new node is re-tested");
+        assert_eq!(fresh[0].name, "n2");
     }
 
     #[test]
@@ -787,10 +820,11 @@ mod tests {
         let mut failed = Subscription::new("A".into(), "https://a.example/sub".into(), vec![]);
         failed.health.last_error = Some("connection refused".to_string());
         failed.health.last_checked_at = Some(999);
-        let (created, added) = merge_subscriptions_by_source(&mut store, vec![failed]);
+        let (created, added, fresh) = merge_subscriptions_by_source(&mut store, vec![failed]);
 
         assert_eq!(created, 0);
         assert_eq!(added, 0);
+        assert!(fresh.is_empty(), "failed re-fetch has nothing to test");
         assert_eq!(store.len(), 1);
         assert_eq!(
             store[0].proxies.len(),
@@ -825,13 +859,15 @@ mod tests {
             "https://a.example/sub".into(),
             vec![node("keep", "1.1.1.1", 1), node("brandnew", "9.9.9.9", 9)],
         );
-        let (created, added) = merge_subscriptions_by_source(&mut store, vec![refresher]);
+        let (created, added, fresh) = merge_subscriptions_by_source(&mut store, vec![refresher]);
 
         assert_eq!(created, 0);
         assert_eq!(
             added, 0,
             "re-add is a refresh; the new node is not 'added' by count"
         );
+        assert_eq!(fresh.len(), 1, "only brandnew needs a test");
+        assert_eq!(fresh[0].name, "brandnew");
         assert_eq!(store.len(), 1);
         assert_eq!(store[0].proxies.len(), 2, "surviving + new node present");
         let kept = store[0].proxies.iter().find(|p| p.name == "keep").unwrap();

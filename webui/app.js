@@ -42,7 +42,7 @@ function hideProgress() {
   document.body.classList.remove("has-progress");
 }
 // 测速进度状态：记录已见过的“最大完成数”与首次确定的总数，保证进度条
-// 只增不减——后端三阶段（tcp/http/bw）并发回调时 done 可能乱序到达，
+// 只增不减——后端各阶段（tcp/http）回调时 done 可能乱序到达，
 // 直接按 done/total 算百分比会导致进度条来回跳。
 const _speedState = { maxDone: 0, total: 0, seenTotal: false };
 
@@ -69,8 +69,8 @@ function showSpeedProgress(text) {
 }
 // 根据单个 Progress 事件刷新进度条与“当前节点”行
 function updateSpeedProgress(ev) {
-  const { done, total, name, available, latency_ms, bandwidth_bps, phase, server } = ev;
-  // 总数只在首次确定（后端 unit_total = N*3，阶段间保持不变），
+  const { done, total, name, available, latency_ms, phase, server } = ev;
+  // 总数只在首次确定（后端按实际阶段计算 unit_total，阶段间保持不变），
   // 后续事件即使 total 偶发为 0 也以首个有效值为准，避免分母跳变。
   if (total > 0 && !_speedState.seenTotal) {
     _speedState.total = total;
@@ -84,13 +84,12 @@ function updateSpeedProgress(ev) {
   if (fill) fill.style.width = pct + "%";
   const cur = document.getElementById("progress-current");
   if (cur) {
-    // phase 标明当前进度来自哪一阶段：tcp / http / bw。非 tcp 阶段节点尚在
+    // phase 标明当前进度来自哪一阶段：tcp / http。非 tcp 阶段节点尚在
     // 测量中，不可用“超时 / —”误导用户以为节点已失败。
-    const stage = phase === "http" ? "测 HTTP 延迟" : phase === "bw" ? "测 HTTP 延迟" : "";
+    const stage = phase === "http" ? "测 HTTP 延迟" : "";
     const lat = latency_ms != null ? latency_ms + " ms" : (phase === "tcp" ? "超时" : "测量中");
-    // 带宽已不再展示：带宽探测已关闭（仅做 HTTP 连通校验），TCP 阶段的
-    // bandwidth_bps 只是往本地 socket 灌数据的吞吐估算、并非真实代理速度，
-    // 显示成「估算≈3.11 MB/s」会严重误导，故进度条只保留节点名+阶段+延迟。
+    // 带宽已不再展示：带宽探测已关闭（仅做 HTTP 连通校验），TCP 吞吐估算
+    // 并非真实代理速度。进度条只保留节点名 + 阶段 + 延迟。
     const loopback = isLoopback(server);
     const status = available ? "✓" : (phase === "tcp" ? "✗" : "…");
     const tail = loopback ? " · 回环不适用" : "";
@@ -1393,6 +1392,14 @@ async function runSpeedtest(params, url = "/api/speedtest") {
       }
     }
   }
+  // 后端 Done 表示整轮结束（引擎整体起不来时可能没有逐节点 tick），
+  // 强制把进度条收尾到 100%，避免停在中间百分比。
+  if (summary) {
+    const fill = document.getElementById("progress-fill");
+    if (fill) fill.style.width = "100%";
+    const cur = document.getElementById("progress-current");
+    if (cur) cur.textContent = "测速完成";
+  }
   return summary;
 }
 
@@ -1520,7 +1527,8 @@ document.getElementById("btn-geo").addEventListener("click", async (e) => {
     if (!countries || countries.length === 0) {
       alert(`当前范围（${modeText}）内没有可检测的节点。`);
     } else {
-      const detected = countries.filter((c) => c && c.country).length;
+      // 后端返回字段是 outbound_country（不是 country）。
+      const detected = countries.filter((c) => c && c.outbound_country).length;
       if (detected === 0) {
         alert("未检测到任何出口地区。\n出口地区检测需要先在「设置」中配置测速引擎（mihomo / sing-box 路径，即 SUBHUB_ENGINE_BIN）。未配置时该功能不生效。");
       } else {
@@ -1549,7 +1557,8 @@ document.getElementById("btn-unlock").addEventListener("click", async (e) => {
       alert(`当前范围（${modeText}）内没有可检测的节点。`);
     } else {
       const total = r.length;
-      const anyUnlock = r.some((u) => u && u.services && Object.keys(u.services).length > 0);
+      // 后端返回的是摘要字符串 `unlock`（ProxyUnlock::summary），不是 services 对象。
+      const anyUnlock = r.some((u) => u && u.unlock && u.unlock !== "—");
       if (!anyUnlock) {
         alert("未检测到任何解锁信息。\n解锁检测需要先在「设置」中配置测速引擎（mihomo / sing-box 路径，即 SUBHUB_ENGINE_BIN）。未配置时该功能不生效。");
       } else {
@@ -1670,10 +1679,9 @@ function buildSubParams() {
     params.set("rename_pat", pat);
     params.set("rename_rep", rep);
   }
-  // 数值质量阈值也编码进网址（与手动导出一致）：min_bw 为 bps、max_lat 为 ms。
-  const mb = parseFloat(document.getElementById("op-min-bw").value);
+  // 延迟上限（ms）编码进网址，与手动导出一致。带宽下限不再在 UI 暴露：
+  // 当前引擎测速不采集新带宽，阈值只能作用于历史数据，容易造成误导。
   const lat = parseInt(document.getElementById("op-max-lat").value, 10);
-  if (!isNaN(mb) && mb > 0) params.set("min_bw", String(Math.round(mb * 1048576)));
   if (!isNaN(lat) && lat > 0) params.set("max_lat", String(lat));
   return { params, unsupported };
 }
@@ -1804,17 +1812,14 @@ function buildTransform() {
   const rep = document.getElementById("op-rename-rep").value;
   const rename = pat ? { pattern: pat, replacement: rep } : null;
 
-  // 数值质量阈值：最小带宽（MB/s → bps）、最大延迟（ms）。仅在有值时加入，
-  // 与后端 Transform.min_bandwidth_bps / max_latency_ms 对应。
-  const mb = parseFloat(document.getElementById("op-min-bw").value);
+  // 最大延迟（ms）。带宽下限不在 UI 暴露（引擎已不采集新带宽，阈值只能
+  // 作用于历史数据）；后端仍保留 min_bandwidth_bps 字段以兼容旧分享链接。
   const lat = parseInt(document.getElementById("op-max-lat").value, 10);
-  const min_bandwidth_bps = !isNaN(mb) && mb > 0 ? Math.round(mb * 1048576) : null;
   const max_latency_ms = !isNaN(lat) && lat > 0 ? lat : null;
 
   const t = { filters, sort, rename };
-  if (min_bandwidth_bps != null) t.min_bandwidth_bps = min_bandwidth_bps;
   if (max_latency_ms != null) t.max_latency_ms = max_latency_ms;
-  if (!filters.length && !sort && !rename && min_bandwidth_bps == null && max_latency_ms == null) return null;
+  if (!filters.length && !sort && !rename && max_latency_ms == null) return null;
   return t;
 }
 

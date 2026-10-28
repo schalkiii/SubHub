@@ -103,8 +103,15 @@ pub(crate) async fn add_subscriptions(
                     sub.health.download = dl;
                     sub.health.total = tot;
                     sub.health.expire = exp;
-                    sub.health.last_updated_at = Some(now);
-                    sub.health.last_error = None;
+                    // 0 nodes is treated as a failed fetch: for a re-add it makes
+                    // `merge_subscriptions_by_source` keep the previous node list
+                    // instead of overwriting it with an empty one.
+                    sub.health.last_updated_at = if n == 0 { None } else { Some(now) };
+                    sub.health.last_error = if n == 0 {
+                        Some("订阅返回 0 个节点".to_string())
+                    } else {
+                        None
+                    };
                     eprintln!("fetched {}: {n} nodes", redact_url(&url));
                     if n == 0 {
                         // Diagnostics: a 200 response that parsed to zero nodes is
@@ -146,30 +153,26 @@ pub(crate) async fn add_subscriptions(
         }
     }
 
-    // only the freshly added nodes are tested (not the whole existing store)
-    let new_proxies: Vec<Proxy> = new_subs.iter().flat_map(|s| s.proxies.clone()).collect();
-
     // Merge into the durable store. `merge_subscriptions_by_source` is the
     // single source of truth for "re-add == refresh" (keyed by `source`, so a
     // duplicate URL updates in place instead of creating a second entry) and
-    // returns an accurate (created, added-node-count) tuple so the response
-    // doesn't conflate a refresh with a genuine addition.
-    let (total, subscriptions, added) = {
+    // returns `fresh_nodes` — the nodes that have never been measured. Only
+    // those are tested, so re-adding an existing URL doesn't re-test every
+    // node it contains.
+    let (total, subscriptions, added, fresh_nodes) = {
         let mut guard = state.store.lock_ok();
-        let (_created, added) =
+        let (_created, added, fresh) =
             subhub_core::ops::merge_subscriptions_by_source(&mut guard, new_subs);
         let total: usize = guard.iter().map(|s| s.proxies.len()).sum();
-        (total, guard.len(), added)
+        (total, guard.len(), added, fresh)
     };
 
     // Auto health + speedtest on first add. TCP latency always runs; HTTP
+    // latency (and any enabled engine probe) uses the engine if set.
+    if !fresh_nodes.is_empty() {
+        let (tcp, http, bw) = run_speedtest_core(&state, &fresh_nodes, 4000, 30).await;
 
-    // latency + bandwidth use the engine if set.
-
-    if !new_proxies.is_empty() {
-        let (tcp, http, bw) = run_speedtest_core(&state, &new_proxies, 4000, 30).await;
-
-        persist_results(&state, &new_proxies, &tcp, &http, &bw);
+        persist_results(&state, &fresh_nodes, &tcp, &http, &bw);
     }
 
     persist_all(&state);
@@ -583,11 +586,8 @@ pub(crate) async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_j
         match fetch_subscription_text(&client, &url).await {
             Ok((text, userinfo)) => {
                 let proxies = parse_subscription(&text);
-                let empty = proxies.is_empty();
-                let usage = usage_from_sources(&userinfo, &text);
-                fetched = Some(proxies);
-                usage_hint = Some(usage);
-                if empty {
+                usage_hint = Some(usage_from_sources(&userinfo, &text));
+                if proxies.is_empty() {
                     let snippet: String = text.chars().take(400).collect();
                     eprintln!(
                         "  [subhub] warning: refresh of {} parsed 0 nodes. body prefix ({}B): {:?}",
@@ -595,6 +595,13 @@ pub(crate) async fn do_refresh_one(state: &AppState, id: &str) -> Option<serde_j
                         snippet.len(),
                         snippet
                     );
+                    // A 200 response that parses to zero nodes is treated as a
+                    // failed refresh: replacing the node list with an empty one
+                    // would silently wipe a working subscription on a transient
+                    // upstream glitch / format change.
+                    fetch_err = Some("订阅返回 0 个节点（已保留原有节点）".to_string());
+                } else {
+                    fetched = Some(proxies);
                 }
             }
 

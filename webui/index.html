@@ -194,11 +194,9 @@
             <input id="op-rename-rep" placeholder="替换为，如 HK-$1" />
           </div>
           <div class="row">
-            <label class="lbl">最小带宽</label>
-            <input id="op-min-bw" type="number" min="0" step="0.1" placeholder="MB/s，如 5" style="width:120px" />
             <label class="lbl">最大延迟</label>
             <input id="op-max-lat" type="number" min="0" step="1" placeholder="ms，如 300" style="width:120px" />
-            <span class="hint" style="margin:0">导出 / 订阅时排除带宽低于下限、延迟高于上限的节点（未测速节点保留）</span>
+            <span class="hint" style="margin:0">导出 / 订阅时排除延迟高于上限的节点（未测速节点保留）。带宽下限仅对历史实测数据生效，当前测速不采集带宽。</span>
           </div>
         </div>
         <div class="panel">
@@ -286,7 +284,7 @@
             <input id="engine-bin" type="text" placeholder="留空 = 不启用（仅基础 TCP 测速）" style="flex:1; min-width:300px;" />
             <button class="btn" id="btn-save-engine" type="button">保存</button>
             <span id="engine-save-result" class="result"></span>
-            <span class="hint" style="margin:0">指向 mihomo / sing-box 可执行文件（如 verge-mihomo.exe），用于真实代理延迟与下载带宽；保存后下次测速即生效，并持久化。</span>
+            <span class="hint" style="margin:0">指向 mihomo / sing-box 可执行文件（如 verge-mihomo.exe），用于经代理访问 Google 204 的真实 HTTP 延迟、出口地区与解锁检测；当前版本不采集下载带宽。保存后下次测速即生效，并持久化。</span>
           </div>
         </div>
         <div class="panel">
@@ -311,7 +309,7 @@
             <input id="topn" type="number" min="1" step="1" value="50" style="width:80px" />
             <span class="unit">个节点</span>
             <span id="topn-save-result" class="result"></span>
-            <span class="hint" style="margin:0">按延迟 / 带宽 / 解锁综合打分，取前 N 个。在此统一设置后，「合并并导出」与「本地订阅地址（/sub）」都遵循此值（关闭 = 全部节点）。订阅 URL 上带 top_n 可临时覆盖。</span>
+            <span class="hint" style="margin:0">按延迟 / 可用性 / 解锁综合打分（历史实测带宽也计入），取前 N 个。在此统一设置后，「合并并导出」与「本地订阅地址（/sub）」都遵循此值（关闭 = 全部节点）。订阅 URL 上带 top_n 可临时覆盖（top_n=0 表示全部）。</span>
           </div>
         </div>
         <div class="panel">

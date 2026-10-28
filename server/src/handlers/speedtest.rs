@@ -199,6 +199,13 @@ pub(crate) async fn speedtest(
     run_speedtest_sse(state, proxies, timeout_ms, concurrency).await
 }
 
+/// Progress units for one SSE run: one per node for TCP, plus one per node for
+/// the engine HTTP-latency pass when an engine is configured. Bandwidth is not
+/// counted because it is disabled (see `run_engine_passes`).
+pub(crate) fn sse_unit_total(node_count: usize, has_engine: bool) -> usize {
+    node_count * if has_engine { 2 } else { 1 }
+}
+
 /// Shared SSE speedtest core: runs TCP ping (with live progress) then, when an
 /// engine binary is configured, engine HTTP latency + bandwidth, persists the
 /// results, and emits a final `Done` summary. Used by both the global
@@ -214,20 +221,15 @@ pub(crate) async fn run_speedtest_sse(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SpeedEvent>();
 
     tokio::spawn(async move {
-        // Total progress units span every stage: TCP latency, then (if an engine
-        // is configured) engine HTTP latency + bandwidth. Each node contributes 1
-        // unit for TCP and, with an engine, 2 more — so the bar only reaches 100%
-        // once the whole test (including bandwidth) is done, instead of stalling
-        // at "TCP done" while the silent bandwidth stage runs.
+        // Total progress units span the stages that actually run: TCP latency
+        // and, when an engine is configured, engine HTTP latency. Bandwidth
+        // probing is deliberately disabled (see run_engine_passes), so counting
+        // a third unit per node would leave the bar stuck at 2/3 forever.
         let node_count = proxies.len() as u64;
         let has_engine = engine_bin_of(&state)
             .map(|b| std::path::Path::new(&b).exists())
             .unwrap_or(false);
-        let unit_total = (if has_engine {
-            node_count * 3
-        } else {
-            node_count
-        }) as usize;
+        let unit_total = sse_unit_total(node_count as usize, has_engine);
 
         // TCP phase with a live-progress callback (runs in worker threads).
         let proxies_tcp = proxies.clone();
@@ -261,16 +263,12 @@ pub(crate) async fn run_speedtest_sse(
         .await
         .unwrap_or_default();
 
-        // Engine phase (real HTTP latency + bandwidth) when an engine is set.
-        // Each node fires a progress tick so the bar keeps advancing through this
-        // stage too. Offsets place http/bw ticks after the TCP segment of the bar.
+        // Engine phase (real HTTP latency) when an engine is set. Each node
+        // fires a progress tick so the bar keeps advancing through this stage.
         let (http, bw) = {
             let tx_http = tx.clone();
-            let tx_bw = tx.clone();
             let http_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let bw_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let http_off = node_count as usize;
-            let bw_off = (node_count as usize) * 2;
             let ut = unit_total;
             let on_http: Option<Arc<dyn Fn(engine::EngineProgress) + Send + Sync>> = if has_engine {
                 let tx = tx_http.clone();
@@ -302,31 +300,7 @@ pub(crate) async fn run_speedtest_sse(
             } else {
                 None
             };
-            let on_bw: Option<Arc<dyn Fn(String) + Send + Sync>> = if has_engine {
-                let tx = tx_bw.clone();
-                let c = bw_counter.clone();
-                let servers = proxies.iter().map(|p| p.server.clone()).collect::<Vec<_>>();
-                Some(Arc::new(move |name: String| {
-                    let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    let server = servers.get(d as usize - 1).cloned().unwrap_or_default();
-                    let _ = tx.send(SpeedEvent::Progress(ProgressView {
-                        done: bw_off + d as usize,
-                        total: ut,
-                        name,
-                        fingerprint: None,
-                        available: false,
-                        latency_ms: None,
-                        tcp_latency_ms: None,
-                        http_latency_ms: None,
-                        bandwidth_bps: None,
-                        server,
-                        phase: "bw".to_string(),
-                    }));
-                }))
-            } else {
-                None
-            };
-            run_engine_passes(&state, &proxies, timeout_ms, concurrency, on_http, on_bw).await
+            run_engine_passes(&state, &proxies, timeout_ms, concurrency, on_http, None).await
         };
 
         let removed = persist_results(&state, &proxies, &tcp_results, &http, &bw);
@@ -336,10 +310,6 @@ pub(crate) async fn run_speedtest_sse(
         let tested = tcp_results.len();
         let reachable = tcp_results.iter().filter(|r| r.available).count();
         let with_http = http
-            .iter()
-            .filter(|x| x.as_ref().is_some_and(|i| i.is_some()))
-            .count();
-        let with_bw = bw
             .iter()
             .filter(|x| x.as_ref().is_some_and(|i| i.is_some()))
             .count();
@@ -358,7 +328,6 @@ pub(crate) async fn run_speedtest_sse(
             reachable,
             avg_latency_ms,
             with_http,
-            with_bw,
             removed,
             threshold,
         }));

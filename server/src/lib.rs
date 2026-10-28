@@ -1,13 +1,12 @@
 use axum::{
-    extract::DefaultBodyLimit,
-    response::sse::Sse,
+    extract::{DefaultBodyLimit, OriginalUri},
+    http::{header, HeaderValue, StatusCode},
+    response::{sse::Sse, IntoResponse, Response},
     routing::{delete, get, patch, post},
     Router,
 };
 
 use serde::{Deserialize, Serialize};
-// `SetResponseHeaderLayer` 的 `.layer()` 需要 tower 的 `Layer` trait 在作用域。
-use tower::Layer;
 
 use futures::stream;
 use std::collections::{HashMap, VecDeque};
@@ -318,11 +317,14 @@ pub struct ListQuery {
     /// items per page (default 50, clamped to 1..=500)
     pub page_size: Option<usize>,
 
-    /// global sort key applied BEFORE pagination: name | latency | speed | score
+    /// global sort key applied BEFORE pagination:
+    /// name | latency | tcplat | httplat | speed | score
     pub sort: Option<String>,
 
-    /// sort descending when true; ascending otherwise (default false)
-    pub desc: Option<bool>,
+    /// sort descending when true; ascending otherwise (default false).
+    /// Parsed as a string so both `desc=1` (documented) and `desc=true`
+    /// (WebUI) work — serde rejects `1` for a bool.
+    pub desc: Option<String>,
 }
 
 /// Query params for `GET /api/subscriptions`. Supports a keyword search across
@@ -436,7 +438,6 @@ struct ProgressView {
     total: usize,
     name: String,
     /// 节点 fingerprint —— 前端据此定位表格行并就地 patch（实时更新）。
-    /// `Option` 是因为旧路径（无引擎时的引擎阶段占位 tick）可能不带。
     #[serde(skip_serializing_if = "Option::is_none")]
     fingerprint: Option<String>,
     available: bool,
@@ -451,9 +452,8 @@ struct ProgressView {
     /// Node host, so the WebUI can flag loopback/localhost addresses (their
     /// bandwidth is local memory copy, not a real proxy speed).
     server: String,
-    /// Which stage produced this tick: "tcp" (TCP latency) / "http"
-    /// (engine HTTP latency) / "bw" (engine bandwidth). Lets the WebUI label
-    /// the live row correctly — the whole speedtest spans all three stages.
+    /// Which stage produced this tick: "tcp" (TCP latency) or "http"
+    /// (engine HTTP latency). Lets the WebUI label the live row correctly.
     phase: String,
 }
 
@@ -465,7 +465,6 @@ struct SummaryView {
     reachable: usize,
     avg_latency_ms: Option<u64>,
     with_http: usize,
-    with_bw: usize,
     removed: usize,
     threshold: u64,
 }
@@ -584,8 +583,9 @@ pub struct SettingsReq {
 /// file is self-contained and re-importable offline.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SubExportItem {
-    /// stable id (sequential `sub_N`); used for idempotent re-import into the
-    /// same instance. Ignored when no matching id exists (e.g. cross-machine).
+    /// Informational id (sequential `sub_N`). Import matches subscriptions by
+    /// `source` URL, never by this id, so a crafted file cannot overwrite an
+    /// unrelated subscription; a re-imported remote sub keeps its local id.
     pub id: String,
     pub name: String,
     pub source: String,
@@ -730,7 +730,7 @@ fn client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client, String> {
         }
     }
 
-    b.build().map_err(|e| format!("创建请求客户端失— {e}"))
+    b.build().map_err(|e| format!("创建请求客户端失败: {e}"))
 }
 
 /// Maximum bytes we'll buffer from a remote subscription response. A hostile or
@@ -1094,42 +1094,36 @@ fn persist_results(
                 // 同时把已测得的 http_latency_ms 抹成 None。
                 // 用户实测可复现：手动测速后 41 个节点可用，健康检查跑完后
                 // 全库 HTTP 延迟归零、所有订阅显示「无可用节点」。
-                let avail = if engine_configured {
-                    if *ran_engine {
-                        // 完整测速：以引擎实测为准，TCP 不兜底。
-                        h.is_some()
-                    } else {
-                        // TCP-only 健康检查：只允许「降级」，不允许「升级」，
-                        // 也不允许推翻上一次的引擎结论。
-                        //   - TCP 都不通 → 确实不可达，判不可用（安全下降）
-                        //   - TCP 通     → 本轮无引擎结论可依据，保留上一次
-                        //                  判定，不因「没测」就把节点判死
-                        if *tcp_avail {
-                            p.available.unwrap_or(false)
-                        } else {
-                            false
-                        }
+                // TCP-only 模式（已配置引擎，但本轮只跑了裸 TCP —— 典型来源是
+                // `run_health_check_core` 的定时健康检查）：本轮没有引擎结论，
+                // 只允许「降级」，不允许把未测节点（None）改成其它状态，也不
+                // 累加连续失败计数。否则一轮后台健康检查就会把刚导入、尚未
+                // 实测的节点统统一成不可用，并最终触发自动移除。
+                if engine_configured && !*ran_engine {
+                    p.last_tested_at = Some(now);
+                    p.tcp_latency_ms = *tcp_ms;
+                    if !*tcp_avail {
+                        p.available = Some(false);
+                        p.latency_ms = None;
+                        p.download_speed_bps = None;
+                        p.bandwidth_measured = false;
+                        p.consecutive_failures = p.consecutive_failures.saturating_add(1);
                     }
-                } else {
-                    *tcp_avail
-                };
-                p.available = Some(avail);
+                    continue;
+                }
 
+                // 完整测速：配置引擎时以引擎实测为准（TCP 不兜底），
+                // 未配置引擎时 TCP 是唯一信号。
+                let avail = if engine_configured { h.is_some() } else { *tcp_avail };
+                p.available = Some(avail);
                 p.last_tested_at = Some(now);
 
-                // 判定不可用时，清除上一轮残留的延迟/带宽，避免「旧绿数据」
-                // 继续误导（例如修复前 TCP 回退留下的假 ping / 假速度）。
-                // 仅当本次确有测量值（引擎带宽 / 延迟）时才写回；引擎探测过
-                // 却失败（ran_engine 但 h==None）的节点，带宽归零、标记未实测。
-                // TCP / HTTP 延迟是客观测量值，无论节点最终判为可用与否都如实记录：
-                // 用户要靠它们区分「节点完全不可达（TCP 都测不到）」与「TCP 能连上、
-                // 但代理隧道不通（有 TCP 延迟、无 HTTP 延迟）」这两种截然不同的状况。
-                // 此前判为不可用时一并清空，导致两列全空、无从诊断。
+                // 判定不可用时清除上一轮残留的延迟/带宽，避免「旧绿数据」
+                // 继续误导。TCP / HTTP 延迟是客观测量值，仍如实记录：
+                // 用户靠它们区分「完全不可达」与「TCP 通但隧道不通」。
                 p.tcp_latency_ms = *tcp_ms;
 
-                // 只有本轮真正跑过引擎才更新 HTTP 延迟。TCP-only 的定时健康
-                // 检查必须保留上一次的实测值 —— 否则后台任务会悄悄把用户手动
-                // 测出的延迟抹成 None（即「整个订阅无可用节点」的直接表现）。
+                // 只有本轮真正跑过引擎才更新 HTTP 延迟，避免无引擎覆盖实测值。
                 if *ran_engine {
                     p.http_latency_ms = *h;
                 }
@@ -1145,18 +1139,13 @@ fn persist_results(
                         }
                         p.bandwidth_measured = *measured;
                     }
+                    // Consecutive-failure tracking for auto-remove: any
+                    // success resets the run.
+                    p.consecutive_failures = 0;
                 } else {
                     p.latency_ms = None;
                     p.download_speed_bps = None;
                     p.bandwidth_measured = false;
-                }
-
-                // Consecutive-failure tracking for the auto-remove feature.
-                // Only a *tested* failure (`Some(false)`) counts; an untested
-                // node (`None`) is left alone, and any success resets the run.
-                if avail {
-                    p.consecutive_failures = 0;
-                } else {
                     p.consecutive_failures = p.consecutive_failures.saturating_add(1);
                 }
             }
@@ -1356,6 +1345,28 @@ fn apply_mode(proxies: Vec<Proxy>, mode: &str) -> Vec<Proxy> {
     out
 }
 
+/// Parse the `desc` query parameter. The HTTP API documents `desc=1`; the
+/// WebUI sends `desc=true`. Both mean descending.
+pub(crate) fn parse_desc(v: &Option<String>) -> bool {
+    v.as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .is_some_and(|s| s == "1" || s == "true" || s == "yes")
+}
+
+/// Resolve the effective Top-N from an explicit request parameter and the
+/// global setting.
+///
+/// A present parameter always wins, including `0` (= no limit, "all nodes");
+/// only an absent parameter falls back to the global setting. Callers that
+/// documented `top_n=0` as an override depend on this distinction.
+pub(crate) fn resolve_top_n(param: Option<u64>, global: u64) -> Option<u64> {
+    match param {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => (global > 0).then_some(global),
+    }
+}
+
 fn sub_name_from_url(url: &str) -> String {
     let u = url.trim();
 
@@ -1523,6 +1534,102 @@ struct GistUploadResp {
     url: String,
     gist_id: String,
     html_url: String,
+}
+
+// ----------------------- static WebUI hosting -----------------------
+
+/// WebUI 磁盘副本位置。优先级：`SUBHUB_WEBUI_DIR` → 源码目录 → exe 同级
+/// `webui/`（含 Tauri 资源目录布局）。开发时命中源码目录，改前端重启即生效；
+/// 发行版脱离源码时返回 `None`，由内嵌副本兜底。
+fn webui_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Ok(p) = std::env::var("SUBHUB_WEBUI_DIR") {
+            let p = PathBuf::from(p);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../webui");
+        if source.is_dir() {
+            return Some(source);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+            for cand in [
+                dir.join("webui"),
+                dir.join("../webui"),
+                dir.join("resources/webui"),
+                dir.join("_up_/webui"),
+            ] {
+                if cand.is_dir() {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+// 内嵌副本保证 exe 分发到没有源码 / 资源目录的机器上时 WebUI 仍可用。
+const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../webui/index.html");
+const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../webui/app.js");
+const EMBEDDED_STYLE_CSS: &[u8] = include_bytes!("../../webui/style.css");
+
+fn asset_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_response(path: &str, bytes: Vec<u8>) -> Response {
+    let mut resp = bytes.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset_content_type(path)),
+    );
+    // WebUI 改动后重启即应生效，禁止 webview 缓存旧 app.js/style.css。
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    resp
+}
+
+/// 静态资源入口：磁盘优先（开发热更新）→ 内嵌兜底（发行版自包含）。
+async fn static_handler(OriginalUri(uri): OriginalUri) -> Response {
+    let rel = uri.path().trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    let safe = !rel.contains('\\')
+        && !rel.contains(':')
+        && !rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    if safe {
+        if let Some(dir) = webui_dir() {
+            if let Ok(bytes) = std::fs::read(dir.join(rel)) {
+                return static_response(rel, bytes);
+            }
+        }
+        let embedded: Option<&'static [u8]> = match rel {
+            "index.html" => Some(EMBEDDED_INDEX_HTML),
+            "app.js" => Some(EMBEDDED_APP_JS),
+            "style.css" => Some(EMBEDDED_STYLE_CSS),
+            _ => None,
+        };
+        if let Some(bytes) = embedded {
+            return static_response(rel, bytes.to_vec());
+        }
+    }
+    (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
 /// Standalone entry: serves the API + static WebUI on http://127.0.0.1:3005.
@@ -1832,10 +1939,6 @@ pub async fn run_server() {
         });
     }
 
-    let manifest = env!("CARGO_MANIFEST_DIR");
-
-    let static_dir = PathBuf::from(manifest).join("../webui");
-
     let app = Router::new()
         // Bound request bodies (default axum has no limit). A paste/import of a
         // gigantic subscription list would otherwise be buffered into memory
@@ -1875,19 +1978,9 @@ pub async fn run_server() {
         .route("/api/nodes/cleanup", post(cleanup_bad))
         .route("/api/nodes/top", get(nodes_top))
         .route("/api/gist/upload", post(gist_upload))
-        // 包一层 `no-cache`，避免 webview 缓存旧的 app.js/style.css，导致修改
-        // 前端后重启仍“看似没生效”。（注：把该 header 加在 Router 顶层对
-        // fallback_service 的响应不生效，必须直接包在 ServeDir 之上。）
-        .fallback_service(
-            tower_http::set_header::SetResponseHeaderLayer::overriding(
-                axum::http::HeaderName::from_static("cache-control"),
-                axum::http::HeaderValue::from_static("no-cache"),
-            )
-            .layer(
-                tower_http::services::ServeDir::new(static_dir)
-                    .append_index_html_on_directories(true),
-            ),
-        )
+        // 静态资源：磁盘优先（开发热更新）→ 内嵌兜底（发行版自包含），
+        // 响应统一带 `no-cache`，避免 webview 缓存旧 app.js/style.css。
+        .fallback(static_handler)
         .with_state(state.clone());
 
     // 取出监听地址（state 已通过上面的 clone 移入 Router，这里读取原 state 副本）。
@@ -2033,18 +2126,13 @@ mod tests {
         assert_eq!(super::redact_url("user@host"), "user@host");
     }
 
-    #[test]
-    fn auto_remove_after_consecutive_failures() {
-        // The "remove after N consecutive failures" rule: a node is dropped only
-        // once it has been found unavailable `threshold` times in a row, and a
-        // single successful test resets the counter.
+    fn test_state() -> super::AppState {
         use std::collections::VecDeque;
         use std::sync::Arc;
         use std::sync::Mutex;
-        use subhub_core::speedtest::SpeedTestResult;
         use subhub_core::Subscription;
 
-        let state = super::AppState {
+        super::AppState {
             store: Arc::new(Mutex::new(vec![Subscription::new(
                 "s".to_string(),
                 "pasted".to_string(),
@@ -2058,7 +2146,7 @@ mod tests {
             default_fetch_proxy: Arc::new(Mutex::new(None)),
             top_n: Arc::new(Mutex::new(0)),
             engine_bin: Arc::new(Mutex::new(None)),
-            remove_after_fails: Arc::new(Mutex::new(3)),
+            remove_after_fails: Arc::new(Mutex::new(0)),
             bind_addr: Arc::new(Mutex::new("127.0.0.1".to_string())),
             external_host: Arc::new(Mutex::new(None)),
             github_user: Arc::new(Mutex::new(None)),
@@ -2068,7 +2156,18 @@ mod tests {
             remove_sub_after_days: Arc::new(Mutex::new(0)),
             lan_ip: None,
             persist_lock: Arc::new(Mutex::new(())),
-        };
+        }
+    }
+
+    #[test]
+    fn auto_remove_after_consecutive_failures() {
+        // The "remove after N consecutive failures" rule: a node is dropped only
+        // once it has been found unavailable `threshold` times in a row, and a
+        // single successful test resets the counter.
+        use subhub_core::speedtest::SpeedTestResult;
+
+        let state = test_state();
+        *state.remove_after_fails.lock_ok() = 3;
 
         let mut p = Proxy::new("n".to_string(), ProxyType::Ss, "1.2.3.4".to_string(), 8388);
         p.password = Some("pw".to_string());
@@ -2135,5 +2234,96 @@ mod tests {
         super::persist_results(&state, &[p2.clone()], &[up], &[None], &[None]);
         let after = &state.store.lock_ok()[0].proxies[0];
         assert_eq!(after.consecutive_failures, 0, "success resets counter");
+    }
+
+    #[test]
+    fn tcp_only_health_check_preserves_engine_verdict() {
+        // 已配置引擎时，定时健康检查只跑 TCP：TCP 成功不得把未测节点
+        // （None）判成不可用，也不得累加失败计数；只有 TCP 失败才降级。
+        use subhub_core::speedtest::SpeedTestResult;
+
+        let state = test_state();
+        *state.engine_bin.lock_ok() = Some("dummy-engine".to_string());
+
+        let mut p = Proxy::new("n".to_string(), ProxyType::Ss, "1.2.3.4".to_string(), 8388);
+        p.password = Some("pw".to_string());
+        p.method = Some("aes-256-gcm".to_string());
+        p.http_latency_ms = Some(90);
+        p.available = None;
+        state.store.lock_ok()[0].proxies.push(p.clone());
+
+        let tcp_ok = SpeedTestResult {
+            fingerprint: p.fingerprint(),
+            name: p.name.clone(),
+            tcp_latency_ms: Some(20),
+            http_latency_ms: None,
+            available: true,
+            download_speed_bps: None,
+            error: None,
+        };
+        super::persist_results(
+            &state,
+            &[p.clone()],
+            std::slice::from_ref(&tcp_ok),
+            &[None],
+            &[None],
+        );
+        {
+            let guard = state.store.lock_ok();
+            let after = &guard[0].proxies[0];
+            assert_eq!(after.available, None, "未测节点不能因 TCP 通被判死");
+            assert_eq!(after.consecutive_failures, 0, "不应累加失败计数");
+            assert_eq!(after.tcp_latency_ms, Some(20));
+            assert_eq!(after.http_latency_ms, Some(90), "不得抹掉上次 HTTP 实测");
+        }
+
+        // 上一轮引擎判可用 → TCP 通时保持可用。
+        state.store.lock_ok()[0].proxies[0].available = Some(true);
+        super::persist_results(&state, &[p.clone()], &[tcp_ok], &[None], &[None]);
+        assert_eq!(state.store.lock_ok()[0].proxies[0].available, Some(true));
+
+        // TCP 都不通 → 安全降级为不可用，并累加一次失败。
+        let tcp_fail = SpeedTestResult {
+            fingerprint: p.fingerprint(),
+            name: p.name.clone(),
+            tcp_latency_ms: None,
+            http_latency_ms: None,
+            available: false,
+            download_speed_bps: None,
+            error: Some("conn refused".to_string()),
+        };
+        super::persist_results(&state, &[p], &[tcp_fail], &[None], &[None]);
+        let guard = state.store.lock_ok();
+        let after = &guard[0].proxies[0];
+        assert_eq!(after.available, Some(false));
+        assert_eq!(after.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn parse_desc_accepts_documented_and_webui_forms() {
+        assert!(super::parse_desc(&Some("1".into())));
+        assert!(super::parse_desc(&Some("true".into())));
+        assert!(super::parse_desc(&Some("TRUE".into())));
+        assert!(!super::parse_desc(&Some("0".into())));
+        assert!(!super::parse_desc(&Some("false".into())));
+        assert!(!super::parse_desc(&None));
+    }
+
+    #[test]
+    fn resolve_top_n_distinguishes_zero_override_from_absent() {
+        // 参数缺省 → 用全局；显式 0 → 全部（覆盖全局）；显式 N → N。
+        assert_eq!(super::resolve_top_n(None, 50), Some(50));
+        assert_eq!(super::resolve_top_n(None, 0), None);
+        assert_eq!(super::resolve_top_n(Some(0), 50), None);
+        assert_eq!(super::resolve_top_n(Some(0), 0), None);
+        assert_eq!(super::resolve_top_n(Some(10), 50), Some(10));
+        assert_eq!(super::resolve_top_n(Some(10), 0), Some(10));
+    }
+
+    #[test]
+    fn sse_progress_total_matches_active_stages() {
+        assert_eq!(super::sse_unit_total(0, false), 0);
+        assert_eq!(super::sse_unit_total(3, false), 3, "无引擎只有 TCP 阶段");
+        assert_eq!(super::sse_unit_total(3, true), 6, "有引擎：TCP + HTTP 两段");
     }
 }
