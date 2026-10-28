@@ -403,7 +403,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 - **B8 base64 解析深度上限**：`parse_subscription` 递归解 base64 增加深度（3 层）与解码体积（16 MiB）上限，防构造输入递归炸栈。
 - **前端 F1/F4/F5/F6**：节点列表加载失败在表格内显示错误（不再静默空白）；总数缩小后页码自动夹取到末页；仪表盘条形图 label HTML 转义（防节点名注入 XSS）；全局 Top-N 保存增加成功 / 失败反馈（不再静默失败）。
 - **重复添加 URL 幂等合并（端到端测试新抓出）**：`POST /api/subscriptions` 重复添加同一 URL 此前会产生重复订阅条目；现改为按 `source` 就地更新（refresh 语义，`incremental_update` 保留存活节点已测健康数据；拉取失败时保留旧节点列表），与 `/api/import` 的合并行为一致。
-- **脚本修复**：`docs/import_sparkle_subs.py` 字段名 `url`→`source`、`s['health']`→扁平 `SubSummary` 字段（原脚本必 KeyError）；`docs/test_subhub.py` speedtest 断言改为对象形状（`{results, removed, threshold}`），并新增跨页全局排序一致性、`top_n` 设置持久化往返、删除不存在订阅返回 404、同 URL 重复导入幂等合并、`mode=untested` 范围测速共 5 组端到端用例。
+- **脚本修复**：`docs/test_subhub.py` speedtest 断言改为对象形状（`{results, removed, threshold}`），并新增跨页全局排序一致性、`top_n` 设置持久化往返、删除不存在订阅返回 404、同 URL 重复导入幂等合并、`mode=untested` 范围测速共 5 组端到端用例。
 
 **验证**：`cargo test -p subhub-core -p subhub-server` **38 测试全过**（core 32 + server 6，本轮新增 12）；clippy 0 警告；release 构建通过。
 

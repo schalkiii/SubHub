@@ -11,6 +11,13 @@
 
 发版口径：`Cargo.toml`（workspace `version`）与 `app/tauri.conf.json` 的 `version` 同步 bump，打 `vX.Y.Z` tag，并把 `target/release/subhub-app.exe` 作为 Release 资产上传。
 
+## [安全] 凭据外泄处置（2026-10-28）
+
+- **移除并抹除**：`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 硬编码了私有订阅 token、面板分享链接与个人 Gist 地址，随早期提交进入 public 仓库。脚本本机副本移入 gitignored 的 `local/`，仓库侧从 HEAD 与**全部历史**（`git filter-repo` 重写 45 commit + `v0.1.0`/`v0.2.0` tag）移除。
+- **扫描结论**：逐 commit `git grep` 确认泄露面仅这两个路径；GitHub PAT、私钥块、`.env`/secret 类文件在历史与 HEAD 中均无命中。
+- **文档同步**：清理 `README.md` 与 `docs/competitive-analysis-and-plan.md` 中对已删脚本的死引用；`AGENTS.md` 新增「public 仓库禁止提交任何带 token 的订阅地址，一次性脚本放 `local/`」红线；详情见 `docs/AUDIT-REPORT-2026-10-28.md` 第十三节。
+- **仍未闭环**：历史重写不等于凭据失效（GitHub 服务端缓存、既有 clone/fork 副本）。**必须在服务商侧轮换那两个订阅 token / 分享链接**，这是唯一真正的修复。
+
 ## [P28] 第七轮复核增强（解析保真 / 引擎健壮性 / 处理器一致性）
 
 按模块分头复核了此前几轮没细看的三块：`parse.rs`（订阅格式识别与字段还原）、`engine.rs`（外部引擎编排）、`handlers/*`（HTTP 处理器）。结论以单测 + 真实 `verge-mihomo.exe` 实跑为准。

@@ -552,3 +552,26 @@
 - `proxy-providers:` 的惰性拉取（Provider 只声明 URL，展开需要网络与二次解析，属功能设计而非缺陷）。
 - `hysteria://`（v1，参数为 `auth=`）按 HY2 形状解析的兼容层——这类节点仍会被丢弃，需要真实样本再定；`decode_form` 的 `+`→空格语义会改动已通过测试的 name 编码，暂不动以免引入回归。
 - 引擎测速就绪等待（两个端口串行轮询）改并行、geo/解锁多 channel 并发：需要真实节点样本反复实测，收益在手动操作路径上，风险在可用性判定上，留待有实测条件时再做。
+
+## 十三、凭据外泄处置（2026-10-28，收尾阶段发现）
+
+### 13.1 事实
+
+`docs/import_sparkle_subs.py`、`docs/patch_sparkle_names.py` 是早期一次性批量导入脚本，硬编码了**私有订阅链接**（含 `subscribe?token=` 形式的面板 token、`/api/v1/share/node/` 形式的分享链接）与**个人 Gist 原始地址**。它们随 `611e85b` 进入仓库，此后一直存在于每一版历史中，而仓库是 public——等于凭据公开可读。
+
+本次全历史扫描（逐 commit `git grep`）确认：泄露面**只有这两个文件**，且只在这两个路径上出现；另外单独扫过 GitHub PAT（`ghp_` / `github_pat_`）、私钥块（`BEGIN PRIVATE KEY` / `CERTIFICATE`）与 `.env` / secret 类文件，历史与当前 HEAD 均无命中。
+
+### 13.2 处置
+
+1. 两个脚本复制到 gitignored 的 `local/`（`.gitignore` 新增 `/local` 与说明），本机继续可用，仓库不再持有。
+2. 从 `docs/` 删除并从**全部历史**抹除：`git filter-repo --invert-paths` 重写 45 个 commit 与 `v0.1.0` / `v0.2.0` 两个 tag，随后强推 `master` 与 tag。
+3. 清理文档死引用：`README.md`、`docs/competitive-analysis-and-plan.md` 中对 `import_sparkle_subs.py` 的「脚本修复」描述已删除，仅保留 `docs/test_subhub.py` 的部分。
+4. `AGENTS.md` 增加红线：**仓库是 public，任何带 token 的订阅地址、面板分享链接、Gist/代理凭据一律不得提交**；一次性脚本放 `local/`（已 ignore）。
+5. 顺带删除根目录 `data/subhub.db`（8 月 31 日的陈旧副本，本来就被 `*.db` ignore；现役库在 `target/release/data/`，未动）。
+
+### 13.3 仍然存在的风险（如实记录）
+
+**强推 + 历史重写不等于凭据失效。** GitHub 对已推送对象有服务端缓存与 GC 延迟，且 fork / 已 clone 的副本、任何按旧 SHA 访问过的人都可能已经拿到。因此：
+
+- **真正的修复是轮换（rotate）那两个私有订阅 token / 分享链接**，以及把个人 Gist 中若含同样链接的内容改掉或设为 secret。这一步只能在面板服务商侧完成，AI 无法代做。
+- 历史重写后，仓库内已无这些字符串（`git grep` 全 refs 验证），但如果服务商侧不轮换，泄露后果不会因为这次清理而消失。

@@ -12,6 +12,9 @@ nul
 .workbuddy
 .codebuddy
 
+# 仅本机使用的脚本：内含私有订阅 token / 面板分享链接，严禁提交
+/local
+
 # OS / editor junk
 .DS_Store
 Thumbs.db
