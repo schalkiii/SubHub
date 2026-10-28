@@ -369,3 +369,33 @@
 - 本地 / 粘贴类订阅备份恢复非幂等（每次新增一条），需内容指纹或受控 id 匹配的设计取舍。
 - 无 CI、无全量 `cargo fmt`、无 LICENSE；`nul` 与 `docs/review-round-*.html` 仍为待确认删除候选。
 - 默认监听 `0.0.0.0` 且 API 无鉴权：这是为局域网 `/sub` 设计的既有行为，若在不可信网络使用建议设置 `SUBHUB_BIND=127.0.0.1` 或加防火墙。
+
+---
+
+## 九、第四轮收尾（2026-10-28 完成全部待处理项）
+
+本轮按用户要求拉取 mihomo / sing-box / Xray 官方协议文档作为参考实现，建立字段索引，并补齐剩余可映射参数与工程门禁。
+
+### 9.1 处置结果
+
+| ID | 项 | 处置 | 验证 |
+|---|---|---|---|
+| E1 | 通用 ALPN | 模型 `alpn: Vec<String>`；URI/clash/sing-box 解析，clash/v2ray/sing-box 导出 | `tuic_advanced_fields_*`、`hysteria2_up_down_alpn_parsed`、`vless_alpn_exported_*` |
+| E2 | TUIC 高级参数 | `congestion_control` / `udp_relay_mode` / `udp_over_stream` / `zero_rtt_handshake`；mihomo 与 sing-box 双命名映射 | `tuic_advanced_fields_parsed_from_uri_clash_and_singbox` / `tuic_advanced_fields_exported` |
+| E3 | Hysteria2 上下行 | `up_mbps` / `down_mbps`；mihomo `"N Mbps"` ↔ sing-box 数字 | `hysteria2_up_down_alpn_parsed` / `hysteria2_up_down_and_alpn_exported` |
+| E4 | 本地备份非幂等 | 新增 `Subscription.uid`，导出/导入携带；本地按 uid 幂等、旧备份按唯一同名兜底；启动回填旧库 | `subscription_uid_is_stable_and_backfilled`；端到端重复恢复断言 |
+| E5 | 协议参考索引缺失 | 新增 `docs/protocol-reference-index.md`，记录来源链接、模型↔客户端字段映射、已覆盖测试与未覆盖字段 | 文档审查 |
+| E6 | CI / fmt / LICENSE / 历史残留 | 新增 `.github/workflows/ci.yml`（test/clippy/fmt）；`cargo fmt --all`；MIT LICENSE；review HTML 归档到 `docs/history/`；删除 `nul` | `cargo fmt --check`、clippy、本地测试 |
+| E7 | 默认绑定 / 无鉴权 | 保持既有局域网 `/sub` 设计，在 README/审计中明确风险与 `SUBHUB_BIND=127.0.0.1` 建议；不在本轮引入鉴权以免破坏 `/sub` 客户端兼容 | 文档 |
+
+### 9.2 最终验证
+
+- `cargo test -p subhub-core -p subhub-server`：**125 个测试全通过**（core 104 + server 21）。
+- `cargo fmt --all -- --check` 通过；clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端 ALL CHECKS PASSED（含 uid 幂等、插件/高级参数导出、错误脱敏、Gist 代理、调度 clamp、刷新 404）。
+- release 构建 `cargo build --release -p subhub-app` 通过。
+
+### 9.3 仍明确不做的字段（已在索引中登记）
+
+- Hysteria2 `ports` / `hop-interval` 端口跳跃与 Gecko 包大小；TUIC `heartbeat` / `fast-open` / `disable-sni` / `max-open-streams`；SS 外部插件（shadow-tls / kcptun）；VLESS `packet-encoding` / ECH。
+- 这些字段在 mihomo 与 sing-box 间的单位/结构差异较大，贸然透传会产生“看似成功、实际错误”的配置；索引中已记录原因与后续入口。

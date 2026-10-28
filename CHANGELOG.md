@@ -2,6 +2,23 @@
 
 本项目遵循阶段式交付，每个 P 阶段对应一组功能闭环，每轮代码审计（Round）记录具体改动。
 
+## [P25] 第四轮增强（高级协议参数 / 备份幂等 / 参考索引 / 工程收尾）
+
+### Added
+
+- **通用 ALPN**：模型新增 `alpn`，支持 vmess / vless / trojan / hysteria2 / tuic 的 URI（逗号分隔）、clash（序列或字符串）与 sing-box（`tls.alpn`）解析；导出到 clash、v2ray `tlsSettings.alpn`、sing-box `tls.alpn`。
+- **TUIC 高级参数**：`congestion_control` / `udp_relay_mode` / `udp_over_stream` / `zero_rtt_handshake`；在 clash 侧映射为 `congestion-controller` / `udp-relay-mode` / `udp-over-stream` / `reduce-rtt`，sing-box 侧保持下划线命名。
+- **Hysteria2 上下行**：模型 `up_mbps` / `down_mbps`；URI `up/down`、clash `"30 Mbps"` 字符串、sing-box `up_mbps/down_mbps` 数字互相转换。
+- **本地备份幂等**：`Subscription.uid`（稳定随机标识）随导出/导入携带；本地/粘贴订阅按 uid 幂等更新，旧备份无 uid 时按唯一同名兜底；旧数据库启动时自动回填 uid 并落库。`SubExportDoc` 升级到 `version: 3`。
+- **协议参考索引**：新增 `docs/protocol-reference-index.md`，逐字段对照 mihomo / sing-box / Xray 官方文档并记录链接、映射与已覆盖测试。
+- **工程门禁**：新增 GitHub Actions（test / clippy / fmt）；全量 `cargo fmt`；新增 MIT `LICENSE`；历史 review HTML 归档到 `docs/history/`；删除根目录 0 字节 `nul`。
+
+### Verification
+
+- `cargo test -p subhub-core -p subhub-server`：**125 个测试全通过**（core 104 + server 21）。
+- `cargo fmt --all -- --check` 通过；clippy `-D warnings` 0 警告。
+- 隔离 DB 端到端：`docs/test_subhub.py` ALL CHECKS PASSED（新增本地备份 uid 幂等用例）。
+
 ## [P24] 第三轮复核增强（插件协议 / 隐私脱敏 / Gist 代理 / 调度边界）
 
 ### Added

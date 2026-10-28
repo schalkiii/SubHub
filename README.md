@@ -9,7 +9,7 @@
 
 ## 状态
 
-**P0 ~ P24 全部完成并端到端验证。** 更晚的 P16–P24（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY/SS 插件/Hysteria2 obfs 支持与三轮复核修复/增强等）见 [`CHANGELOG.md`](CHANGELOG.md)。
+**P0 ~ P25 全部完成并端到端验证。** 更晚的 P16–P25（无可用订阅自动清理、配置备份导入导出、订阅使用量展示、base64 链接导入、测速引擎参数/模式修复、地区筛选与导出一致性、REALITY/SS 插件/Hysteria2/TUIC 高级参数、备份幂等与工程收尾等）见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -32,6 +32,7 @@
 | **P22** | **复核修复：刷新空结果保护 · 增量刷新保留延迟/失败计数 · 重复添加只测新增 · TCP-only 健康检查不误判 · SSE 进度修正 · SS cipher 跨格式回退 · Hysteria2/TUIC 强制 TLS · VLESS REALITY 解析/导出 · WebUI 内嵌兜底** | ✅ |
 | **P23** | **第二轮增强：导出名去重与既有后缀冲突 · Top-N 只选可用节点 · 备份保留健康/用量元数据 · Gist 按格式命名与 owner · h2/HTTP 传输 · VMess 端口/aid 校验 · 订阅列表错误态与分享 URL 重复筛选** | ✅ |
 | **P24** | **第三轮增强：SS obfs/v2ray-plugin · Hysteria2 obfs · 用量 info 块 · 错误 URL 脱敏 · Gist 走拉取代理 + 公开确认 · 刷新 404 · 调度最小 60s · Surge 名清洗** | ✅ |
+| **P25** | **第四轮增强：ALPN / TUIC 拥塞与中继参数 / Hysteria2 上下行 · 本地备份 uid 幂等 · 协议参考索引 · CI/fmt/LICENSE/历史归档** | ✅ |
 
 ## 架构
 
@@ -143,8 +144,8 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | GET  | `/api/subscriptions/:id/speedtest` | **对单个订阅单独重测**（不碰其他订阅）：返回 SSE 流，事件与全局 `/api/speedtest` 同构（`progress`/`done`），只测该订阅的节点；订阅不存在或无节点返回 404。订阅页卡片的「测速」按钮即调用此端点（区别于「刷新」——刷新不重测已有节点，此端点强制重测该订阅全部节点） |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
 | PATCH | `/api/subscriptions/:id` | **重命名订阅来源**（body: `{"name":"新名字"}`），仅更新展示名，不影响其节点与测速数据 |
-| GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`=2/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`，以及 `last_checked_at`/`last_updated_at`/`last_healthy_at`/`last_error`/`upload`/`download`/`total`/`expire` 健康与用量元数据），用于整机备份或跨实例迁移 |
-| POST | `/api/subscriptions/import` | **从备份恢复订阅**：按源 URL 幂等合并（重导入同一实例或跨实例的远程订阅不重复），保留内嵌节点结果（不重新抓取 / 测速），本地 / 粘贴类无 URL 订阅互不冲突 |
+| GET  | `/api/subscriptions/export` | **备份 / 可移植导出全部订阅**：返回 `SubExportDoc`（`kind`/`version`=3/`exported_at`/`engine_bin`/`subscriptions[]`，每条含 `id`/`uid`/`name`/`source`/`source_type`/`fetch_proxy`/`health_enabled`/`proxies`，以及 `last_checked_at`/`last_updated_at`/`last_healthy_at`/`last_error`/`upload`/`download`/`total`/`expire` 健康与用量元数据），用于整机备份或跨实例迁移。`uid` 是本地订阅的稳定幂等键 |
+| POST | `/api/subscriptions/import` | **从备份恢复订阅**：远程按源 URL、本地/粘贴类按稳定 `uid` 幂等合并（同一份备份重复导入不会产生重复订阅；旧备份无 uid 时按唯一同名本地订阅兜底），保留内嵌节点结果与健康/用量元数据（不重新抓取 / 测速） |
 | POST | `/api/subscriptions/prune` | **清理长期无可用订阅**：立即删除所有「连续 N 天没有任何可用节点」的订阅（N 取自设置项 `remove_sub_after_days`，0 = 关闭），返回 `{status,removed}`。定时刷新与节点重测运行时也会自动执行 |
 | GET  | `/api/settings`      | 读取当前全局设置（`use_proxy` / `auto_refresh_sec` / `node_health_check_sec` / `default_fetch_proxy` / `top_n` / `engine_bin` / `remove_after_fails` / `remove_sub_after_days` / `bind_addr` / `external_host` / `github_user` / `has_github_token` / `lan_ip`） |
 | POST | `/api/settings`      | 更新并**持久化**全局设置到 `meta` 表（重启不丢）；`default_fetch_proxy` 仅在代理 URL 校验通过后才写入 |
@@ -259,8 +260,8 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 | VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ws / grpc / h2 / tls / SNI |
 | VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | 含 **REALITY**（`pbk` / `sid`）与 ws / grpc / h2；缺公钥的 REALITY 节点视为不完整、不导出 |
 | Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | 始终 TLS |
-| Hysteria2 | ✅ | ✅ | — | ✅ | — | 支持 obfs（salamander）；v2ray-core 无法表示；sing-box 强制 TLS |
-| TUIC | ✅ | ✅ | — | ✅ | — | 同上 |
+| Hysteria2 | ✅ | ✅ | — | ✅ | — | obfs（salamander）、上下行带宽、ALPN；v2ray-core 无法表示；sing-box 强制 TLS |
+| TUIC | ✅ | ✅ | — | ✅ | — | 拥塞控制 / UDP 中继模式 / UDP-over-Stream / 0-RTT / ALPN；v2ray-core 无法表示 |
 | SOCKS5 / HTTP(S) | ✅ | ✅ | — | ✅ | — | HTTP 443 端口按 TLS 处理 |
 | WireGuard | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出 |
 | AnyTLS | ✅ | ✅ | — | — | — | 仅 clash-meta 可导出 |
@@ -270,9 +271,11 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 已知限制（暂不支持，遇到时会丢字段/整节点）：
 
 - SS 的 `v2ray-plugin` 只能导出到 clash / sing-box；v2ray 与 Surge 不支持该插件，导出时会跳过并打日志（obfs 在 Surge 中可用）。
-- Hysteria2 的 `alpn`、TUIC 的拥塞控制 / `alpn` 等高级参数未解析。
+- Hysteria2 的 `ports` / `hop-interval`（端口跳跃）与 Gecko 包大小、TUIC 的 `heartbeat` / `fast-open` / `disable-sni` / `max-open-streams` 等少数调优参数尚未解析。
 - sing-box 导出跳过 WireGuard / AnyTLS；v2ray 导出跳过 Hysteria2 / TUIC / SOCKS5 / HTTP / WireGuard / AnyTLS（会打印跳过数量）。
 - `base64` 格式是 **clash-meta YAML 的 base64**，不是 v2rayN 的 URI 列表 base64。
+
+字段级映射（模型 ↔ mihomo ↔ sing-box ↔ Xray）与参考实现链接见 [`docs/protocol-reference-index.md`](docs/protocol-reference-index.md)。
 
 ## 节点地区识别（region 与 outbound_country）
 
@@ -385,3 +388,14 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 ## 复用的第三方引擎（可选）
 测速与真实连通性验证不重写协议，调用本地 **mihomo (clash-meta)** 或 **sing-box** 作为连接引擎 —— 与 BestSub 思路一致。通过 `SUBHUB_ENGINE_BIN` 开启。
 存活探测走 gstatic `generate_204`（接受 2xx/3xx）、出口地区走 7 个 geo-IP 通道、流媒体解锁（TikTok `region` 解析 + Netflix/Disney/YouTube/ChatGPT 启发式）、带宽测速端点保留 OVH / Tele2 / Hetzner 分片（当前版本默认关闭带宽探测）—— 这些探测目标与判定逻辑均**直接移植 / 借鉴自 BestSub 成熟实现**（见 `core/src/resources.rs` 文件头署名）；逐个订阅健康度与坏节点熔断清理借鉴 **Resin**；合并导出算子管道借鉴 **sub-store**。
+
+## 开发与质量门禁
+
+- CI：`.github/workflows/ci.yml`，在 push / PR 时运行 `cargo test`、`cargo clippy -D warnings`、`cargo fmt --check`（仅 core + server，不含 Tauri 打包）。
+- 本地检查：`cargo fmt --all -- --check && cargo clippy --release -p subhub-core -p subhub-server --all-targets -- -D warnings && cargo test -p subhub-core -p subhub-server`。
+- 协议字段参考与映射：[`docs/protocol-reference-index.md`](docs/protocol-reference-index.md)。
+- 端到端脚本：`docs/test_subhub.py`（需以隔离 `SUBHUB_DB` 启动 server）。
+
+## License
+
+MIT，见 [`LICENSE`](LICENSE)。
