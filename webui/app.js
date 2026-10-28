@@ -593,19 +593,28 @@ function relTime(ms) {
 
 async function loadSubs(targetId, withManage, compact) {
   let list = [];
+  let loadError = null;
   try {
     const params = new URLSearchParams();
     const sq = document.getElementById("sub-q");
     if (sq && sq.value.trim()) params.set("q", sq.value.trim());
     const qs = params.toString();
     list = await api("/api/subscriptions" + (qs ? "?" + qs : ""));
-  } catch {
-    list = [];
+  } catch (err) {
+    loadError = err;
+  }
+  const el = document.getElementById(targetId);
+  // Distinguish "request failed" from "no subscriptions": showing the empty
+  // state on a server error hides a real problem (and looks like data loss).
+  if (loadError) {
+    el.innerHTML = `<div class="empty err">订阅列表加载失败：${escapeHtml(
+      loadError.message || String(loadError)
+    )}（可切换页面或刷新重试）</div>`;
+    return;
   }
   // Sort by health degree (health_pct) descending — healthiest first.
   // Untracked subscriptions (health_pct == null) sink to the bottom.
   list.sort((a, b) => (b.health_pct ?? -1) - (a.health_pct ?? -1));
-  const el = document.getElementById(targetId);
   if (!list.length) {
     el.innerHTML = `<div class="empty">还没有订阅，先在「订阅管理」添加或粘贴。</div>`;
     return;
@@ -1651,6 +1660,10 @@ function buildSubParams() {
   const params = new URLSearchParams();
   params.set("format", format);
   let unsupported = false;
+  // GET /sub accepts one value per key; a repeated q/region/type would produce
+  // a query string the server cannot deserialize (400). Keep the first and
+  // flag the rest instead of generating a broken subscribe URL.
+  const seenFilterKeys = new Set();
   document.querySelectorAll("#filters .filter-row").forEach((r) => {
     const f = r.querySelector(".f-field").value;
     const mode = r.querySelector(".f-mode").value;
@@ -1663,10 +1676,20 @@ function buildSubParams() {
       unsupported = true;
       return;
     }
-    if (f === "name" && m === "contains") params.append("q", v);
-    else if (f === "region" && m === "contains") params.append("region", v);
-    else if (f === "type" && m === "exact") params.append("type", v);
-    else unsupported = true;
+    let key = null;
+    if (f === "name" && m === "contains") key = "q";
+    else if (f === "region" && m === "contains") key = "region";
+    else if (f === "type" && m === "exact") key = "type";
+    if (!key) {
+      unsupported = true;
+      return;
+    }
+    if (seenFilterKeys.has(key)) {
+      unsupported = true;
+      return;
+    }
+    seenFilterKeys.add(key);
+    params.set(key, v);
   });
   const sortKey = document.getElementById("op-sort-key").value;
   if (sortKey) {
@@ -1701,7 +1724,7 @@ document.getElementById("btn-gen-url").addEventListener("click", () => {
   const { url, unsupported } = buildShareUrl();
   document.getElementById("sub-url").value = url;
   document.getElementById("sub-url-info").textContent = unsupported
-    ? "已生成（注意：排除 / 正则类筛选无法编码进网址，需改用「合并并导出」手动导出）"
+    ? "已生成（注意：排除 / 正则类筛选、或同一字段的多条筛选无法完整编码进网址；后者只保留第一条，需完整效果请改用「合并并导出」）"
     : "已生成。把此地址填到客户端「订阅」即可直接拉取。";
 });
 

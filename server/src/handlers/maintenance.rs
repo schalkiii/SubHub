@@ -9,7 +9,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     Json,
 };
-use subhub_core::{apply_transform, export_str, region_fixup_for_export, Proxy};
+use subhub_core::{apply_transform, export_str, region_fixup_for_export};
 /// Resin circuit-breaker style cleanup: drop nodes that have been tested and
 /// found unavailable (`available == Some(false)`) across all subscriptions.
 /// Returns how many were removed. Keeps `untested` (None) nodes untouched.
@@ -93,6 +93,10 @@ pub(crate) async fn nodes_top(
     let mut all: Vec<serde_json::Value> = Vec::new();
     for sub in guard.iter() {
         for p in &sub.proxies {
+            // Top-N 列表只展示可导出且未判死的节点，与导出/订阅口径一致。
+            if !p.is_usable() {
+                continue;
+            }
             let mut v = serde_json::to_value(p).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("sub_id".into(), serde_json::Value::String(sub.id.clone()));
@@ -148,16 +152,9 @@ pub(crate) async fn merge_export(
     let global_top = *state.top_n.lock_ok();
     let top_n = resolve_top_n(req.top_n, global_top);
     let mut transformed = if let Some(n) = top_n {
-        let mut scored: Vec<(f64, Proxy)> = transformed
-            .into_iter()
-            .map(|p| (score_proxy(&p), p))
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .take(n as usize)
-            .map(|(_, p)| p)
-            .collect()
+        // Top-N 只从「可导出且未判死」的节点里选，避免死节点/未知类型
+        // 占用名额后又被 export_filter 丢掉，导致最终不足 N 个。
+        subhub_core::top_n_by_score(&transformed, usize::try_from(n).unwrap_or(usize::MAX))
     } else {
         transformed
     };
@@ -235,16 +232,8 @@ pub(crate) fn build_sub_content(
     let global_top = *state.top_n.lock_ok();
     let top_n = resolve_top_n(url_top, global_top);
     let mut transformed = if let Some(n) = top_n {
-        let mut scored: Vec<(f64, Proxy)> = transformed
-            .into_iter()
-            .map(|p| (score_proxy(&p), p))
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .take(n as usize)
-            .map(|(_, p)| p)
-            .collect()
+        // 同上：Top-N 名额只分配给可导出且未判死的节点。
+        subhub_core::top_n_by_score(&transformed, usize::try_from(n).unwrap_or(usize::MAX))
     } else {
         transformed
     };

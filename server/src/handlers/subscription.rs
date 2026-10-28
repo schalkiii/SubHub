@@ -264,11 +264,19 @@ pub(crate) async fn export_subscriptions(State(state): State<AppState>) -> Json<
             fetch_proxy: s.fetch_proxy.clone(),
             health_enabled: s.health.enabled,
             proxies: s.proxies.clone(),
+            last_checked_at: s.health.last_checked_at,
+            last_updated_at: s.health.last_updated_at,
+            last_healthy_at: s.health.last_healthy_at,
+            last_error: s.health.last_error.clone(),
+            upload: s.health.upload,
+            download: s.health.download,
+            total: s.health.total,
+            expire: s.health.expire,
         })
         .collect();
     Json(SubExportDoc {
         kind: "subhub-subscriptions",
-        version: 1,
+        version: 2,
         exported_at: now_ms(),
         engine_bin: engine_bin_of(&state),
         subscriptions: items,
@@ -319,8 +327,16 @@ pub(crate) async fn import_subscriptions(
                 } else {
                     it.source_type.clone()
                 };
-            sub.health.last_checked_at = Some(now);
-            sub.health.last_updated_at = Some(now);
+            // 新备份携带健康/用量元数据，原样恢复；旧备份缺这些字段时
+            // 回退到“刚刚检查/更新”的旧行为。
+            sub.health.last_checked_at = it.last_checked_at.or(Some(now));
+            sub.health.last_updated_at = it.last_updated_at.or(Some(now));
+            sub.health.last_healthy_at = it.last_healthy_at;
+            sub.health.last_error = it.last_error.clone();
+            sub.health.upload = it.upload;
+            sub.health.download = it.download;
+            sub.health.total = it.total;
+            sub.health.expire = it.expire;
             if let Some(idx) = target {
                 // keep the original id so refresh/delete links stay valid
                 sub.id = guard[idx].id.clone();

@@ -202,6 +202,10 @@ pub struct EngineProbe {
 pub struct EngineProgress {
     pub fingerprint: String,
     pub name: String,
+    /// Node host, carried alongside the event so SSE consumers never have to
+    /// map a callback counter back onto the input list (which drifts once a
+    /// non-exportable node is skipped and emits no callback).
+    pub server: String,
     /// `Some(Some(ms))` = HTTP 探测成功；`Some(None)` = 探测失败；`None` = 未探测。
     pub http_latency: Option<Option<u64>>,
 }
@@ -448,17 +452,18 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
         let target = subhub_core::resources::ALIVE_TARGET.to_string();
         let fp = proxies[i].fingerprint();
         let disp_name = proxies[i].name.clone();
+        let disp_server = proxies[i].server.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             let res = delay_via_api(&client, ctrl_port, &name, &target, probe_timeout).await;
-            (i, fp, disp_name, res)
+            (i, fp, disp_name, disp_server, res)
         }));
     }
 
     let t_probe = Instant::now();
     let mut ok_cnt = 0usize;
     for t in tasks {
-        if let Ok((i, fp, disp_name, res)) = t.await {
+        if let Ok((i, fp, disp_name, disp_server, res)) = t.await {
             if res.is_some() {
                 ok_cnt += 1;
             }
@@ -467,6 +472,7 @@ async fn probe_shared_batch(task: ProbeTask<'_>) -> Vec<EngineProbe> {
                 cb(EngineProgress {
                     fingerprint: fp,
                     name: disp_name,
+                    server: disp_server,
                     http_latency: out[i].http_latency,
                 });
             }
@@ -706,6 +712,7 @@ async fn probe_one(
 ) -> EngineProbe {
     let name = p.name.clone();
     let fp = p.fingerprint();
+    let server = p.server.clone();
     // client 超时取本节点所需探测项的最大值：带宽下载需要长超时，而它只是异常时
     // 的上限，不会拖慢本就快速返回的存活 / geo / 解锁探测。
     let client_timeout_ms = if plan.bandwidth {
@@ -721,6 +728,7 @@ async fn probe_one(
                 cb(EngineProgress {
                     fingerprint: fp.clone(),
                     name: name.clone(),
+                    server: server.clone(),
                     http_latency: out.http_latency,
                 });
             }

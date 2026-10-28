@@ -581,6 +581,10 @@ pub struct SettingsReq {
 /// One subscription as stored in an export file. `proxies` carries the full
 /// node list (including any previously measured latency/bandwidth), so the
 /// file is self-contained and re-importable offline.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SubExportItem {
     /// Informational id (sequential `sub_N`). Import matches subscriptions by
@@ -591,8 +595,30 @@ pub struct SubExportItem {
     pub source: String,
     pub source_type: String,
     pub fetch_proxy: Option<String>,
+    #[serde(default = "default_true")]
     pub health_enabled: bool,
     pub proxies: Vec<Proxy>,
+
+    // Health / usage metadata. Optional so backups produced by older versions
+    // (which only carried nodes) still import; when present it is restored so
+    // the usage card, last-error state and "days without a healthy node" clock
+    // survive a backup/restore cycle.
+    #[serde(default)]
+    pub last_checked_at: Option<u64>,
+    #[serde(default)]
+    pub last_updated_at: Option<u64>,
+    #[serde(default)]
+    pub last_healthy_at: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub upload: Option<u64>,
+    #[serde(default)]
+    pub download: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub expire: Option<u64>,
 }
 
 /// Top-level document returned by `GET /api/subscriptions/export`.
@@ -2325,5 +2351,31 @@ mod tests {
         assert_eq!(super::sse_unit_total(0, false), 0);
         assert_eq!(super::sse_unit_total(3, false), 3, "无引擎只有 TCP 阶段");
         assert_eq!(super::sse_unit_total(3, true), 6, "有引擎：TCP + HTTP 两段");
+    }
+
+    #[test]
+    fn sub_export_item_round_trips_health_metadata() {
+        // 旧备份（仅节点）缺健康字段时：enabled 默认 true，其余为 None。
+        let old = r#"{"id":"sub_1","name":"A","source":"pasted","source_type":"local","proxies":[]}"#;
+        let item: super::SubExportItem = serde_json::from_str(old).unwrap();
+        assert!(item.health_enabled, "旧备份缺省应视为启用");
+        assert!(item.last_checked_at.is_none());
+        assert!(item.upload.is_none());
+
+        // 新备份必须原样保留健康/用量字段。
+        let json = r#"{
+            "id":"sub_2","name":"B","source":"https://b.example/sub","source_type":"remote",
+            "health_enabled":true,"proxies":[],
+            "last_checked_at":111,"last_updated_at":222,"last_healthy_at":333,
+            "last_error":"boom","upload":1,"download":2,"total":3,"expire":4
+        }"#;
+        let item: super::SubExportItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.last_checked_at, Some(111));
+        assert_eq!(item.last_healthy_at, Some(333));
+        assert_eq!(item.last_error.as_deref(), Some("boom"));
+        assert_eq!(item.upload, Some(1));
+        assert_eq!(item.expire, Some(4));
+        let back = serde_json::to_value(&item).unwrap();
+        assert_eq!(back["download"], 2);
     }
 }

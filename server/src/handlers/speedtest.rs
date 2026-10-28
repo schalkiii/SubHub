@@ -35,7 +35,9 @@ pub(crate) async fn gist_upload(
         min_bw: req.min_bw.clone(),
         max_lat: req.max_lat.clone(),
     };
+    let fmt = req.format.clone().unwrap_or_else(|| "clash-meta".to_string());
     let (content, _ct) = build_sub_content(&state, &q)?;
+    let file_name = gist_file_name(&fmt);
 
     // 2) 解析 GitHub 凭据（请求体 > 持久化设置）。
     let user = req
@@ -76,14 +78,19 @@ pub(crate) async fn gist_upload(
             format!("创建 HTTP 客户端失败：{e}"),
         )
     })?;
+    let mut files = serde_json::Map::new();
+    files.insert(
+        file_name.to_string(),
+        serde_json::json!({ "content": content }),
+    );
     let body = serde_json::json!({
         "description": "SubHub subscription",
         "public": true,
-        "files": { "subscription.yaml": { "content": content } }
+        "files": files
     });
 
     let mut id_opt = state.gist_id.lock_ok().clone();
-    let (final_id, html_url) = loop {
+    let (final_id, html_url, owner) = loop {
         let (path, is_patch) = match &id_opt {
             Some(id) => (format!("https://api.github.com/gists/{id}"), true),
             None => ("https://api.github.com/gists".to_string(), false),
@@ -130,7 +137,15 @@ pub(crate) async fn gist_upload(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        break (id, hu);
+        // raw 地址必须使用 Gist 实际所有者；配置里的用户名可能和 token
+        // 所属账号不同（多账号 / 组织 token）。
+        let owner = j
+            .get("owner")
+            .and_then(|o| o.get("login"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        break (id, hu, owner);
     };
 
     // 4) 持久化 gist_id，保证下次更新同一 Gist。
@@ -139,11 +154,12 @@ pub(crate) async fn gist_upload(
         db.meta_set("gist_id", &final_id);
     }
 
-    // 带上文件名，让 GitHub 直接以 subscription.yaml 返回（正确的 text/yaml
-    // Content-Type、且不必经过裸 /raw 的 302 跳转），避免部分移动端客户端
-    // （如 FIClash）不跟随跳转 / 无法从裸 URL 识别格式而拉到空订阅。
-    let raw_url =
-        format!("https://gist.githubusercontent.com/{user}/{final_id}/raw/subscription.yaml");
+    // 带上与格式匹配的文件名（yaml/json/conf/txt），让 GitHub 直接以正确
+    // 扩展名返回，避免部分移动端客户端无法从裸 URL 识别格式而拉到空订阅。
+    let owner = owner.unwrap_or(user);
+    let raw_url = format!(
+        "https://gist.githubusercontent.com/{owner}/{final_id}/raw/{file_name}"
+    );
     Ok(Json(GistUploadResp {
         ok: true,
         url: raw_url,
@@ -273,11 +289,11 @@ pub(crate) async fn run_speedtest_sse(
             let on_http: Option<Arc<dyn Fn(engine::EngineProgress) + Send + Sync>> = if has_engine {
                 let tx = tx_http.clone();
                 let c = http_counter.clone();
-                let servers = proxies.iter().map(|p| p.server.clone()).collect::<Vec<_>>();
                 Some(Arc::new(move |prog: engine::EngineProgress| {
                     let d = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    // 计数器按输入顺序递增，可与 proxies 一一对应取到 server。
-                    let server = servers.get(d as usize - 1).cloned().unwrap_or_default();
+                    // server 由引擎回调直接携带，避免跳过不可导出节点后
+                    // 用计数器索引输入列表导致 host 错位。
+                    let server = prog.server;
                     // 引擎 HTTP 探测结果：Some(Some(ms)) = 探测成功（节点可用），
                     // Some(None) = 探测失败（节点不可用）。据此实时设置 available，
                     // 让前端在引擎阶段就能看到节点逐个亮起/变红。
@@ -402,5 +418,30 @@ pub(crate) async fn proxy_test(Json(req): Json<ProxyTestReq>) -> Json<serde_json
         Ok(Err(e)) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
 
         Err(_) => Json(serde_json::json!({ "ok": false, "error": "代理连接超时 (15s)" })),
+    }
+}
+
+/// Gist 文件名按格式选择扩展名：JSON / surge / base64 不应伪装成 yaml。
+fn gist_file_name(format: &str) -> &'static str {
+    match format {
+        "v2ray" | "sing-box" | "singbox" => "subscription.json",
+        "surge" => "subscription.conf",
+        "base64" => "subscription.txt",
+        _ => "subscription.yaml",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gist_file_name;
+
+    #[test]
+    fn gist_file_name_matches_format() {
+        assert_eq!(gist_file_name("clash-meta"), "subscription.yaml");
+        assert_eq!(gist_file_name("clash"), "subscription.yaml");
+        assert_eq!(gist_file_name("v2ray"), "subscription.json");
+        assert_eq!(gist_file_name("sing-box"), "subscription.json");
+        assert_eq!(gist_file_name("surge"), "subscription.conf");
+        assert_eq!(gist_file_name("base64"), "subscription.txt");
     }
 }

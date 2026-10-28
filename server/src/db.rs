@@ -81,7 +81,9 @@ impl Db {
             None => return Vec::new(),
         };
 
-        let mut stmt = match conn.prepare("SELECT data FROM subscriptions") {
+        // Stable insertion order: without ORDER BY SQLite may return rows in
+        // any order, which would reshuffle the subscription list after restart.
+        let mut stmt = match conn.prepare("SELECT data FROM subscriptions ORDER BY rowid") {
             Ok(s) => s,
 
             Err(_) => return Vec::new(),
