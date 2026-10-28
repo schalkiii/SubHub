@@ -20,9 +20,11 @@
 - `server/`：axum HTTP + WebUI 托管 + 路由（`lib.rs`）+ `handlers/*`。
 - `app/`：Tauri v2 原生窗口壳。
 - `webui/`：原生 JS（`app.js` + `index.html` + `style.css`）。
-- 数据一致性：任何写操作后 `persist_all()`；`Db` 只持文件路径不持 `Connection`（非 Send）。
+- 数据一致性：任何写操作后 `persist_all()`；`Db` 只持文件路径不持 `Connection`（非 Send）。改了 `sub.proxies` 之后先 `health.recompute()` 再落库，否则过期的派生计数会被写进 SQLite。
+- 跑端到端/基准要**整个目录删掉**再起服务：`subhub.db-wal` / `-shm` 会把上一轮数据重放回来，只删 `.db` 等于没清库（曾把它误判成行为回归）。
+- 网络类单测不要「按节点数 accept N 次再 join」：测速有端点级缓存，同 `host:port` 的多个节点只拨号一次，固定次数的 accept 循环会在 Linux 上永久挂住 runner（CI 实测挂死 1 小时）。accept 用无限循环且不 join。
 
 ## 深层经验 / 踩坑
-- 所有非显然的架构决策、测速根因、踩坑记录在 `.codebuddy/memory/MEMORY.md`（跨会话长期记忆，优先读它再动手）。
+- 所有非显然的架构决策、测速根因、踩坑记录在 `.codebuddy/memory/MEMORY.md`（跨会话长期记忆，优先读它再动手）。注意该目录被 `.gitignore` 排除，**是本地 Agent 记忆、不随仓库分发**；克隆到另一台机器时它不存在，此时以本文件 + `CHANGELOG.md` + `docs/AUDIT-REPORT-*.md` 为准。
 - 改 SS 相关逻辑时务必同时看 `core/src/model.rs::is_exportable` 与 `core/src/export.rs::to_clash_meta` 两处。
 - 测速引擎单节点配置必须用 `mode: rule` + `rules: - MATCH,PROXY`，严禁 `mode: global`。

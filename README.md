@@ -166,7 +166,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 |---|---|---|
 | GET  | `/api/health`        | 健康检查 |
 | GET  | `/api/subscriptions` | 订阅来源列表（**含逐个健康度**：`status` / `source_type` / `node_count` / `healthy_node_count` / `unknown_node_count` / `avg_latency_ms` / `best_latency_ms` / `last_checked_at` / `last_updated_at` / `last_error`） |
-| POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加经代理访问 Google 204 的 HTTP 延迟；当前版本不采集下载带宽）；**支持以 base64 形式粘贴的订阅链接集合（自动解码展开为多行 URL）** |
+| POST | `/api/subscriptions` | 批量添加订阅（body: `{"urls":[...],"fetch_proxy":"http://127.0.0.1:7890"}`）。服务端**抓取后解析，并立即对每个节点自动做健康度检测 + 测速**（TCP 延迟 / 可用性；配 `SUBHUB_ENGINE_BIN` 时再加经代理访问 Google 204 的 HTTP 延迟；当前版本不采集下载带宽）；**支持以 base64 形式粘贴的订阅链接集合（自动解码展开为多行 URL，单次最多 50 个地址，超出直接 400**——每个地址串行抓取、单个最长 20s） |
 | POST | `/api/subscriptions/:id/refresh` | **刷新单个订阅**（Resin 风格）：重拉源 → 重算节点 → 更新健康时间戳，返回 `{status, nodes, source}`；订阅不存在返回 404。**注意：刷新只重测新增节点，已有节点沿用旧测速数据，不会重测；远端返回 0 节点时按失败处理并保留旧节点** |
 | GET  | `/api/subscriptions/:id/speedtest` | **对单个订阅单独重测**（不碰其他订阅）：返回 SSE 流，事件与全局 `/api/speedtest` 同构（`progress`/`done`），只测该订阅的节点；订阅不存在或无节点返回 404。订阅页卡片的「测速」按钮即调用此端点（区别于「刷新」——刷新不重测已有节点，此端点强制重测该订阅全部节点） |
 | DELETE | `/api/subscriptions/:id` | 删除某个订阅来源（不存在的 id 返回 404） |
@@ -178,7 +178,7 @@ macOS / Linux 同理生成对应平台包。三端共用同一份 Rust 代码与
 | POST | `/api/settings`      | 更新并**持久化**全局设置到 `meta` 表（重启不丢）；`default_fetch_proxy` 仅在代理 URL 校验通过后才写入 |
 | GET  | `/api/settings/export` | **导出配置备份**：返回完整全局设置 JSON 文件（带下载头），用于备份或迁移到另一台机器。出于安全，**不含** GitHub token 明文（仅回传「是否已配置」） |
 | POST | `/api/settings/import` | **导入配置备份**：接受导出的设置 JSON 做部分更新（只应用提供的字段，未提供字段保持不变）；可附带 `github_token` 写回凭据 |
-| POST | `/api/import`        | 粘贴订阅内容直接导入（body: `{"content":"..."}`，支持 clash yaml / sing-box json / base64 / 各类 URI 混合） |
+| POST | `/api/import`        | 粘贴订阅内容直接导入（body: `{"content":"..."}`，支持 clash yaml / sing-box json / **v2ray-Xray json（含裸数组）** / base64 / 各类 URI 混合）。**一个节点都没解析出来时返回 400**（不再悄悄落一条空订阅），WebUI 显示「导入失败：HTTP 400: …」 |
 | POST | `/api/geo-detect`    | **出口地区探测**（BestSub 风格）：经 `SUBHUB_ENGINE_BIN` 起引擎，逐节点跑 geo-IP 通道，写回 `Proxy.outbound_country`（无引擎时安全返回空） |
 | POST | `/api/unlock-detect` | **流媒体解锁判定**（BestSub 风格）：经引擎逐节点探测 TikTok / Netflix / Disney+ / YouTube Premium / ChatGPT，写回 `Proxy.unlock`（无引擎时安全返回空矩阵） |
 | POST | `/api/nodes/cleanup` | **坏节点熔断清理**（Resin 风格）：删除所有 `available==false` 的节点（保留未测节点），返回 `{status,removed}` |
@@ -411,7 +411,7 @@ http://127.0.0.1:3005/sub?format=clash-meta&sort=latency&desc=1&rename_pat=.*HK-
 
 - **`engine.rs` 复查（结论：已加固，无需大改）**：逐一核对引擎进程管理——RAII `EngineGuard` 保证子进程与临时目录在所有退出路径（含 `spawn` 之后的早退 `?`）均被清理；`EngineDirSeq` 计数器 + pid 保证并发拉起目录互不覆盖；`engine_ready` 在引擎进程自行退出时立即返回（不再傻等整段超时）。**引擎配置 YAML 注入已安全**：节点 `name` 经 `to_clash_meta` 由 `serde_yaml` 序列化（自动引号转义），`proxy-groups` 引用处再叠加 `escape_yaml_scalar` 双保险，攻击者控制的节点名无法逃逸标量注入任意配置。
 - **Per-sub 刷新错误上抛（结论：已满足）**：复查确认 `do_refresh_one` 失败时写入 `health.last_error` 并由 `refresh_subscription` 持久化，前端 `loadSubs` 重渲染经 `.sub-err` 红字展示，因此「webui 错误上抛」缺口实际已闭合，无需额外改动。
-- **幂等合并提取为可单测纯函数（R2）**：此前「重复 URL 按 source 就地合并」逻辑只存在于 server 的 `add_subscriptions` 闭包内、仅由端到端覆盖。现抽出为 `subhub_core::ops::merge_subscriptions_by_source`（单一真相源，同时被 `/api/subscriptions` 与 `/api/subscriptions/import` 复用），并修复返回 `added` 计数在「重复添加（实为 refresh）」时被整份节点数虚高的小瑕疵——现在只统计**真正新建**订阅的节点数。核心新增 4 个单测覆盖：新建计数、重复添加不重不漏、拉取失败时保留旧节点、refresh 保留存活节点已测健康。
+- **幂等合并提取为可单测纯函数（R2）**：此前「重复 URL 按 source 就地合并」逻辑只存在于 server 的 `add_subscriptions` 闭包内、仅由端到端覆盖。现抽出为 `subhub_core::ops::merge_subscriptions_by_source`（单一真相源，被 `/api/subscriptions` 使用；`/api/subscriptions/import` 是备份恢复，按 source URL / 备份 `uid` 自己匹配，不走这里），并修复返回 `added` 计数在「重复添加（实为 refresh）」时被整份节点数虚高的小瑕疵——现在只统计**真正新建**订阅的节点数。核心新增 4 个单测覆盖：新建计数、重复添加不重不漏、拉取失败时保留旧节点、refresh 保留存活节点已测健康。
 
 **验证**：`cargo clippy --release -p subhub-core -p subhub-server` 0 警告；`cargo test -p subhub-core -p subhub-server` **42 测试全过**（core 36 + server 6，本轮新增 4）；release 构建通过；`docs/test_subhub.py` 隔离库端到端 **ALL CHECKS PASSED**（含同 URL 重复导入幂等合并用例）。
 

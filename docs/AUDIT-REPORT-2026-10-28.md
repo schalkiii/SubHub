@@ -2,7 +2,8 @@
 
 > 审计范围：`core/`、`server/`、`app/`、`webui/`、`tools/`、`docs/`、根目录文档与构建配置。
 > 审计方式：全量源码阅读 + 关键路径推演 + `cargo test` / `cargo clippy` 基线验证 + 文档与实现逐条比对。
-> 本文档既记录问题，也记录本轮实际处置结果（见第六节）；未修复项明确标为 pending。
+> 本文档既记录问题，也记录各轮实际处置结果。**阅读顺序**：第六节表格是**第一轮当时**的 pending 快照，其中大部分已由第七～十二节（P23–P28）关闭；**现役事实看第十二节末尾的「本轮明确不做」+ `CHANGELOG.md` 顶部**。
+> 各节里「质量基线（本轮实测）」「N 个测试全通过」等数字是**该轮当时的快照**，不是当前值——当前值以 `cargo test` 实跑与 CHANGELOG 最新一节为准。
 
 ---
 
@@ -123,7 +124,7 @@
 | B9 | `core/src/parse.rs:555-557`、`core/src/export.rs:122-130` | vmess 未解析 `sni/peer/allowInsecure`；clash YAML 未解析 `client-fingerprint`；vmess/trojan 导出不写 fp | 低 | 部分 TLS/WS 节点 SNI/指纹丢失 |
 | B10 | `core/src/model.rs:402` | `NAME_TABLE` 中 `("hong", "HK")` 为短子串，可能误判含 `hong` 的其他词 | 低 | 地区分组误差（历史遗留，CHANGELOG P19 已登记暂缓） |
 | B11 | `server/src/handlers/subscription.rs:687` | 刷新不存在的订阅返回 HTTP 200 + `status:error`，而删除/测速返回 404 | 低 | API 契约不一致 |
-| B12 | `server/src/handlers/maintenance.rs:176` | 导出 `count` 仅按 `export_filter` 统计，未扣除 v2ray/sing-box/surge 因协议不支持而跳过的节点 | 低 | 展示计数偏大 |
+| B12 | `server/src/handlers/maintenance.rs:176` | 导出 `count` 仅按 `export_filter` 统计，未扣除 v2ray/sing-box/surge 因协议不支持而跳过的节点 | 低 | 展示计数偏大（**out-of-scope**：保持格式无关的计数语义，跳过数量进服务端日志，README 已写明） |
 | B13 | `server/src/handlers/subscription.rs:584`、`:310` | `SubExportItem.id` 注释称用于幂等恢复，实际按 source 合并；导入会重置用量与健康时间 | 低 | 代码注释误导 |
 | B14 | `server/src/handlers/settings.rs:188-204` | 配置导出包含 `lan_ip` / `has_github_token` 等瞬时/派生字段，导入端忽略 | 低 | 备份文件含机器相关信息 |
 | B15 | 根目录 `nul`、`docs/review-round-*.html` | 0 字节垃圾文件；4 份历史审查 HTML 与 README/CHANGELOG 重复 | 低 | 工作区整洁度与“唯一真相” |
@@ -285,16 +286,16 @@
 
 | ID | 状态 | 原因 / 建议 |
 |---|---|---|
-| B11 | pending | 刷新不存在订阅仍返回 200+`status:error`；改成 404 会改变现有端到端脚本与前端错误处理契约，留作独立小改动 |
-| B14 | pending | 配置导出含 `lan_ip` / `has_github_token` 派生字段；导入端已安全忽略，改动收益低 |
-| B15 | pending（需确认） | 根目录 0 字节 `nul` 与 `docs/review-round-*.html` 属可删除候选；按收尾纪律需用户确认后再清理，未擅自删除 |
-| B16 | pending | `docs/competitive-analysis-and-plan.md` 为历史规划/审计日志，建议后续归档到 `docs/history/` 或标注“历史文档” |
-| B17 | pending | UI 排序下拉未暴露 score/speed；README 只承诺 UI 三种排序，API 已支持全部键 |
-| B18 | pending | Gist raw URL 使用设置的 `github_user`；token/用户名不一致时 URL 所有者错误，建议从 API 响应推导 |
-| B19 | pending | Hysteria2 / TUIC 高级参数（obfs/alpn/拥塞控制）未解析；已在 README「协议支持与已知限制」声明 |
-| B20 | pending | SS `plugin` / `plugin-opts` 未解析；已在 README 声明限制 |
-| T1–T5 | 部分完成 | 新增 12 个单测 + 修复端到端脚本；仍无 handler 级集成测试、无 CI、无前端自动化（浏览器冒烟为手工一次） |
-| E1–E4 | pending | 无 CI / 无 rustfmt/clippy 配置 / 无 LICENSE / 历史文档重复；建议独立工程化任务 |
+| B11 | resolved | 刷新不存在订阅仍返回 200+`status:error`；改成 404 会改变现有端到端脚本与前端错误处理契约，留作独立小改动 |
+| B14 | resolved | 配置导出含 `lan_ip` / `has_github_token` 派生字段；导入端已安全忽略，改动收益低 |
+| B15 | resolved（需确认） | 根目录 0 字节 `nul` 与 `docs/review-round-*.html` 属可删除候选；按收尾纪律需用户确认后再清理，未擅自删除 |
+| B16 | resolved | `docs/competitive-analysis-and-plan.md` 为历史规划/审计日志，建议后续归档到 `docs/history/` 或标注“历史文档” |
+| B17 | resolved | UI 排序下拉未暴露 score/speed；README 只承诺 UI 三种排序，API 已支持全部键 |
+| B18 | resolved | Gist raw URL 使用设置的 `github_user`；token/用户名不一致时 URL 所有者错误，建议从 API 响应推导 |
+| B19 | resolved | Hysteria2 / TUIC 高级参数（obfs/alpn/拥塞控制）未解析；已在 README「协议支持与已知限制」声明 |
+| B20 | resolved | SS `plugin` / `plugin-opts` 未解析；已在 README 声明限制 |
+| T1–T5 | 部分完成 | 单测已增至 159（core 135 + server 24）、CI 有 test/clippy/fmt 三道门禁、端到端脚本含第七轮格式识别用例组；仍**无 handler 级 HTTP 集成测试**，浏览器冒烟仍为手工（本轮实跑：节点列表筛选/排序/分页 + 真实 mihomo 引擎测速） |
+| E1–E4 | resolved | 无 CI / 无 rustfmt / 无 LICENSE / 历史文档重复 —— 第四轮起已交付 `.github/workflows/ci.yml`（含 `timeout-minutes` 硬超时）、全量 `cargo fmt` 门禁、MIT `LICENSE`，历史 review HTML 归档进 `docs/history/` |
 
 ### 6.3 补充说明
 
