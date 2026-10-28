@@ -51,13 +51,24 @@ pub fn export_filter(proxies: &[Proxy]) -> Vec<Proxy> {
 /// each is unique: the first occurrence keeps its original name; later
 /// collisions get a ` #2`, ` #3` … suffix.
 fn ensure_unique_names(proxies: &mut [Proxy]) {
-    use std::collections::HashMap;
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    use std::collections::HashSet;
+    let mut used: HashSet<String> = HashSet::new();
     for p in proxies.iter_mut() {
-        let count = seen.entry(p.name.clone()).or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            p.name = format!("{} #{}", p.name, *count);
+        if used.insert(p.name.clone()) {
+            continue;
+        }
+        // The counter must also claim the generated name: a later node whose
+        // original name already equals "A #2" would otherwise collide with the
+        // suffixed copy of an earlier "A".
+        let base = p.name.clone();
+        let mut i = 2;
+        loop {
+            let candidate = format!("{base} #{i}");
+            if used.insert(candidate.clone()) {
+                p.name = candidate;
+                break;
+            }
+            i += 1;
         }
     }
 }
@@ -241,6 +252,17 @@ fn insert_transport_opts(m: &mut Mapping, p: &Proxy) {
             Value::from(p.service_name.clone().unwrap()),
         );
         m.insert(Value::from("grpc-opts"), Value::Mapping(grpc));
+    } else if (net == "h2" || net == "http") && (has_path || has_host) {
+        // mihomo 的 HTTP/2 传输：`h2-opts.host` 是列表，`path` 是字符串。
+        let mut h2 = Mapping::new();
+        insert_opt(&mut h2, "path", &p.path);
+        if has_host {
+            h2.insert(
+                Value::from("host"),
+                Value::Sequence(vec![Value::from(p.host.clone().unwrap())]),
+            );
+        }
+        m.insert(Value::from("h2-opts"), Value::Mapping(h2));
     }
 }
 
@@ -322,6 +344,16 @@ fn v2ray_stream(p: &Proxy) -> serde_json::Value {
             if let Some(svc) = &p.service_name {
                 s["grpcSettings"] = json!({ "serviceName": svc, "multiMode": false });
             }
+        }
+        "h2" | "http" => {
+            let mut h2 = json!({});
+            if let Some(path) = &p.path {
+                h2["path"] = json!(path);
+            }
+            if let Some(host) = &p.host {
+                h2["host"] = json!([host]);
+            }
+            s["httpSettings"] = h2;
         }
         _ => {}
     }
@@ -407,6 +439,20 @@ fn singbox_transport(p: &Proxy) -> Option<serde_json::Value> {
             }
             t
         }),
+        "h2" | "http" => {
+            // sing-box 把 HTTP/2 传输命名为 `http`，host 是数组。
+            let mut t = json!({ "type": "http" });
+            if let Some(path) = &p.path {
+                t["path"] = json!(path);
+            }
+            if let Some(host) = &p.host {
+                t["host"] = json!([host]);
+            }
+            if let Some(sni) = &p.sni {
+                t["server_name"] = json!(sni);
+            }
+            Some(t)
+        }
         _ => None,
     }
 }
@@ -871,6 +917,37 @@ mod tests {
     }
 
     #[test]
+    fn h2_transport_exported_to_all_formats() {
+        let mut p = mk(ProxyType::Vless, "h2.example.com", 443);
+        p.uuid = Some("u".into());
+        p.network = Some("h2".into());
+        p.tls = Some(true);
+        p.host = Some("h2.example.com".into());
+        p.path = Some("/h2".into());
+
+        let clash = super::to_clash_meta(std::slice::from_ref(&p));
+        assert!(clash.contains("h2-opts"), "clash 缺 h2-opts: {clash}");
+        assert!(clash.contains("path: /h2"));
+        assert!(clash.contains("h2.example.com"));
+
+        let v2 = super::to_v2ray_json(std::slice::from_ref(&p));
+        let vv: serde_json::Value = serde_json::from_str(&v2).unwrap();
+        assert_eq!(vv[0]["streamSettings"]["httpSettings"]["path"], "/h2");
+        assert_eq!(
+            vv[0]["streamSettings"]["httpSettings"]["host"][0],
+            "h2.example.com"
+        );
+
+        let sb = super::to_singbox_json(std::slice::from_ref(&p));
+        let sv: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        assert_eq!(sv["outbounds"][0]["transport"]["type"], "http");
+        assert_eq!(
+            sv["outbounds"][0]["transport"]["host"][0],
+            "h2.example.com"
+        );
+    }
+
+    #[test]
     fn duplicate_display_names_are_made_unique_on_export() {
         // 两个不同节点（不同服务器）却共享显示名「US美国」（常见于地区重命名规则
         // 把同地区节点都改成同一名字，或不同订阅里本就重名）。导出若不处理，clash
@@ -895,6 +972,33 @@ mod tests {
         // 两个节点的服务器地址都应出现在产物中（都保留了，只是名字不同）。
         assert!(yaml.contains("1.1.1.1"), "原节点 A 必须保留");
         assert!(yaml.contains("2.2.2.2"), "原节点 B 必须保留");
+    }
+
+    #[test]
+    fn unique_names_avoid_collision_with_existing_suffix() {
+        // ["A", "A", "A #2"] 的第三个节点原名恰好等于前一个被改出的后缀名，
+        // 旧的计数实现会让两个 "A #2" 同时存在。修复后必须全部唯一。
+        let mut a = mk(ProxyType::Ss, "1.1.1.1", 8388);
+        a.name = "A".into();
+        a.method = Some("aes-256-gcm".into());
+        a.password = Some("p1".into());
+        let mut b = mk(ProxyType::Ss, "2.2.2.2", 8388);
+        b.name = "A".into();
+        b.method = Some("aes-256-gcm".into());
+        b.password = Some("p2".into());
+        let mut c = mk(ProxyType::Ss, "3.3.3.3", 8388);
+        c.name = "A #2".into();
+        c.method = Some("aes-256-gcm".into());
+        c.password = Some("p3".into());
+
+        let yaml = super::export_str(&[a, b, c], "clash-meta");
+        let names: Vec<&str> = yaml
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- name: "))
+            .collect();
+        assert_eq!(names.len(), 3);
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "导出名必须唯一，实际: {names:?}");
     }
 
     #[test]

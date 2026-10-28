@@ -267,6 +267,22 @@ pub fn apply(proxies: &[Proxy], t: &Transform) -> Result<Vec<Proxy>, String> {
     Ok(out)
 }
 
+/// Select up to `n` nodes with the highest composite score.
+///
+/// Only *usable* nodes (`is_usable`: exportable and not confirmed dead) take
+/// part. Exporting filters those out afterwards anyway; picking Top-N from the
+/// full list would let dead/unsupported entries consume slots and yield fewer
+/// than N nodes in the final output.
+pub fn top_n_by_score(proxies: &[Proxy], n: usize) -> Vec<Proxy> {
+    let mut scored: Vec<(f64, Proxy)> = proxies
+        .iter()
+        .filter(|p| p.is_usable())
+        .map(|p| (crate::score::score_proxy(p), p.clone()))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(n).map(|(_, p)| p).collect()
+}
+
 fn keep(p: &Proxy, rule: &FilterRule, re: &Option<Regex>) -> bool {
     let val = field_val(p, &rule.field);
     let matched = match rule.match_.as_str() {
@@ -703,6 +719,41 @@ mod tests {
             "available must outrank dead even with lower speed"
         );
         assert_eq!(out[1].name, "Dead");
+    }
+
+    #[test]
+    fn top_n_selects_only_usable_nodes() {
+        // 死节点虽然可能带着旧的超低延迟，也不能占用 Top-N 名额；Other 类型
+        // 同样会在导出前被过滤，不应参与选取。
+        let mut dead = node("Dead", "10.0.0.1", 1);
+        dead.password = Some("pw".into());
+        dead.method = Some("aes-256-gcm".into());
+        dead.available = Some(false);
+        dead.latency_ms = Some(1);
+        let mut alive_fast = node("AliveFast", "10.0.0.2", 2);
+        alive_fast.password = Some("pw".into());
+        alive_fast.method = Some("aes-256-gcm".into());
+        alive_fast.available = Some(true);
+        alive_fast.latency_ms = Some(50);
+        let mut alive_slow = node("AliveSlow", "10.0.0.3", 3);
+        alive_slow.password = Some("pw".into());
+        alive_slow.method = Some("aes-256-gcm".into());
+        alive_slow.available = Some(true);
+        alive_slow.latency_ms = Some(500);
+        let mut other = node("Other", "10.0.0.4", 4);
+        other.type_ = ProxyType::Other;
+
+        let picked = top_n_by_score(&[dead, other, alive_slow, alive_fast], 2);
+        assert_eq!(picked.len(), 2, "应取到 2 个可用节点");
+        assert_eq!(picked[0].name, "AliveFast", "评分高的排前");
+        assert_eq!(picked[1].name, "AliveSlow");
+
+        // n 大于可用节点数时返回全部可用节点，不报错。
+        let mut single = node("a", "1.1.1.1", 1);
+        single.password = Some("pw".into());
+        single.method = Some("aes-256-gcm".into());
+        let all = top_n_by_score(&[single], 10);
+        assert_eq!(all.len(), 1);
     }
 
     #[test]

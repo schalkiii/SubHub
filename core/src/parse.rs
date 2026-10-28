@@ -293,21 +293,37 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
         .or_else(|| as_str(v, "servername"))
         .map(str::to_string);
     p.skip_cert_verify = v.get("skip-cert-verify").and_then(|x| x.as_bool());
+    // h2/http 传输的 host 在 clash 里是列表（也可能被写成标量）。
+    let h2_host = v.get("h2-opts").and_then(|h| h.get("host")).and_then(|x| {
+        x.as_str().map(str::to_string).or_else(|| {
+            x.as_sequence()
+                .and_then(|seq| seq.first())
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+    });
     p.path = as_str(v, "path")
         .or_else(|| {
             v.get("ws-opts")
                 .and_then(|w| w.get("path"))
                 .and_then(|x| x.as_str())
         })
+        .or_else(|| {
+            v.get("h2-opts")
+                .and_then(|h| h.get("path"))
+                .and_then(|x| x.as_str())
+        })
         .map(str::to_string);
     p.host = as_str(v, "host")
+        .map(str::to_string)
         .or_else(|| {
             v.get("ws-opts")
                 .and_then(|w| w.get("headers"))
                 .and_then(|h| h.get("Host"))
                 .and_then(|x| x.as_str())
+                .map(str::to_string)
         })
-        .map(str::to_string);
+        .or(h2_host);
     p.service_name = v
         .get("grpc-opts")
         .and_then(|g| g.get("grpc-service-name"))
@@ -324,10 +340,9 @@ fn from_clash_value(v: &serde_yaml::Value) -> Option<Proxy> {
             .get("short-id")
             .and_then(|x| x.as_str())
             .map(str::to_string);
-        // REALITY is always carried over TLS; some providers omit `tls: true`.
-        if p.tls.is_none() {
-            p.tls = Some(true);
-        }
+        // REALITY is always carried over TLS; force it even when the source
+        // explicitly says `tls: false` (that combination is invalid).
+        p.tls = Some(true);
     }
     Some(p)
 }
@@ -411,16 +426,20 @@ fn parse_singbox_json(s: &str) -> Result<Vec<Proxy>, serde_json::Error> {
                             .and_then(|x| x.as_str())
                             .map(str::to_string);
                     }
-                    "h2" => {
+                    "h2" | "http" => {
                         p.network = Some("h2".to_string());
                         p.path = transport
                             .get("path")
                             .and_then(|x| x.as_str())
                             .map(str::to_string);
-                        p.host = transport
-                            .get("host")
-                            .and_then(|x| x.as_str())
-                            .map(str::to_string);
+                        p.host = transport.get("host").and_then(|x| {
+                            x.as_str().map(str::to_string).or_else(|| {
+                                x.as_array()
+                                    .and_then(|a| a.first())
+                                    .and_then(|x| x.as_str())
+                                    .map(str::to_string)
+                            })
+                        });
                     }
                     _ => {}
                 }
@@ -526,15 +545,11 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     let server = v.get("add")?.as_str()?.to_string();
     let port: u16 = v.get("port").and_then(|x| {
-        x.as_str().and_then(|s| s.parse().ok()).or_else(|| {
-            x.as_u64().and_then(|n| {
-                if (1..=65535).contains(&n) {
-                    Some(n as u16)
-                } else {
-                    None
-                }
-            })
-        })
+        let n = x
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| x.as_u64());
+        n.filter(|n| (1..=65535).contains(n)).map(|n| n as u16)
     })?;
     let pname = name.unwrap_or_else(|| {
         v.get("ps")
@@ -546,8 +561,12 @@ fn parse_vmess(body: &str, name: Option<String>) -> Option<Proxy> {
     p.uuid = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
     p.alter_id = v
         .get("aid")
-        .and_then(|x| x.as_str())
-        .and_then(|s| s.parse().ok());
+        .and_then(|x| {
+            x.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| x.as_u64())
+        })
+        .and_then(|n| u32::try_from(n).ok());
     p.cipher = v
         .get("scy")
         .or_else(|| v.get("cipher"))
@@ -1079,6 +1098,50 @@ mod tests {
         assert_eq!(p.reality_public_key.as_deref(), Some("PK"));
         assert_eq!(p.reality_short_id.as_deref(), Some("ab12"));
         assert_eq!(p.fingerprint.as_deref(), Some("chrome"));
+    }
+
+    #[test]
+    fn clash_h2_opts_are_parsed() {
+        let yaml = "proxies:\n  - name: H2\n    type: vless\n    server: 1.2.3.4\n    port: 443\n    uuid: u\n    network: h2\n    tls: true\n    h2-opts:\n      host:\n        - h2.example.com\n      path: /h2\n";
+        let out = parse_subscription(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].network.as_deref(), Some("h2"));
+        assert_eq!(out[0].host.as_deref(), Some("h2.example.com"));
+        assert_eq!(out[0].path.as_deref(), Some("/h2"));
+    }
+
+    #[test]
+    fn singbox_http_transport_is_parsed() {
+        let json = r#"{
+            "outbounds": [
+                { "type": "vless", "tag": "H", "server": "1.2.3.4", "server_port": 443, "uuid": "u",
+                  "tls": {}, "transport": { "type": "http", "host": ["h.example.com"], "path": "/p" } }
+            ]
+        }"#;
+        let out = parse_singbox_json(json).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].network.as_deref(), Some("h2"));
+        assert_eq!(out[0].host.as_deref(), Some("h.example.com"));
+        assert_eq!(out[0].path.as_deref(), Some("/p"));
+    }
+
+    #[test]
+    fn vmess_port_and_numeric_aid_are_validated() {
+        // port 为字符串 "0" 时旧代码会直接 parse 成 0；必须丢弃。
+        let zero = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"add":"1.2.3.4","port":"0","id":"uuid","aid":"0"}"#);
+        assert!(
+            parse_subscription(&format!("vmess://{zero}")).is_empty(),
+            "vmess port 0 必须丢弃"
+        );
+
+        // aid 为数字时也要保留（旧代码只读字符串）。
+        let numeric_aid = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"add":"1.2.3.4","port":443,"id":"uuid","aid":2}"#,
+        );
+        let out = parse_subscription(&format!("vmess://{numeric_aid}"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alter_id, Some(2));
     }
 
     #[test]

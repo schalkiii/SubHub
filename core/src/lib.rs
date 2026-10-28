@@ -11,7 +11,7 @@ pub use model::{
     merge, new_sub_id, rebase_sub_counter, Proxy, ProxyType, ProxyUnlock, Subscription,
     SubscriptionHealth, UnlockResult,
 };
-pub use ops::{apply as apply_transform, region_fixup_for_export, Transform};
+pub use ops::{apply as apply_transform, region_fixup_for_export, top_n_by_score, Transform};
 pub use parse::{
     b64_decode, extract_subscription_usage, normalize_epoch, parse_clash_yaml, parse_subscription,
     parse_uri, SubscriptionUsage,
